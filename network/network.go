@@ -22,6 +22,7 @@ import (
 
 	"github.com/ebeacon/ebeacon/cache"
 	"github.com/ebeacon/ebeacon/config"
+	"github.com/ebeacon/ebeacon/debuglog"
 	"github.com/ebeacon/ebeacon/reqctx"
 	"github.com/ebeacon/ebeacon/upstream"
 	"github.com/prometheus/client_golang/prometheus"
@@ -52,30 +53,62 @@ var hopByHopHeaderSet = func() map[string]struct{} {
 	return out
 }()
 
-// pathNumericSlot extracts the first all-digit path segment from a URL path
-// (e.g. "/eth/v1/beacon/blocks/12345/root" → 12345, true).
-// It replaces a regexp-based approach to avoid per-call bitState allocations
-// inside Go's backtracking regexp engine.
+// pathNumericSlot extracts a numeric slot/state/block identifier from known
+// Beacon API routes whose numeric path component represents a slot.
 func pathNumericSlot(path string) (uint64, bool) {
-	for path != "" {
-		var seg string
-		if i := strings.IndexByte(path, '/'); i < 0 {
-			seg, path = path, ""
-		} else {
-			seg, path = path[:i], path[i+1:]
+	segments := strings.Split(strings.Trim(path, "/"), "/")
+	if len(segments) < 5 || segments[0] != "eth" || len(segments[1]) < 2 || segments[1][0] != 'v' || segments[2] != "beacon" {
+		return 0, false
+	}
+
+	parse := func(seg string) (uint64, bool) {
+		if seg == "" || len(seg) > 12 || seg[0] < '0' || seg[0] > '9' {
+			return 0, false
 		}
-		if seg == "" || len(seg) > 12 {
-			continue
+		n, err := strconv.ParseUint(seg, 10, 64)
+		if err != nil || n == 0 {
+			return 0, false
 		}
-		// Fast reject: first byte must be a digit.
-		if seg[0] < '0' || seg[0] > '9' {
-			continue
+		return n, true
+	}
+
+	switch segments[3] {
+	case "headers", "blocks", "blinded_blocks", "blobs", "blob_sidecars", "states":
+		return parse(segments[4])
+	case "rewards":
+		if len(segments) < 6 {
+			return 0, false
 		}
-		if n, err := strconv.ParseUint(seg, 10, 64); err == nil && n > 0 {
-			return n, true
+		switch segments[4] {
+		case "blocks", "sync_committee":
+			return parse(segments[5])
 		}
 	}
+
 	return 0, false
+}
+
+// pathNumericEpoch extracts an epoch parameter from cacheable epoch-scoped
+// endpoints whose responses become immutable after finalization.
+func pathNumericEpoch(path string) (uint64, bool) {
+	segments := strings.Split(strings.Trim(path, "/"), "/")
+	if len(segments) != 6 {
+		return 0, false
+	}
+	if segments[0] != "eth" || len(segments[1]) < 2 || segments[1][0] != 'v' {
+		return 0, false
+	}
+	switch {
+	case segments[2] == "beacon" && segments[3] == "rewards" && segments[4] == "attestations":
+	case segments[2] == "validator" && segments[3] == "duties" && segments[4] == "proposer":
+	default:
+		return 0, false
+	}
+	epoch, err := strconv.ParseUint(segments[5], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return epoch, true
 }
 
 // gzipPool reuses gzip.Writer objects to avoid the ~32 KB per-call allocation
@@ -130,13 +163,18 @@ type Network struct {
 	// gzip enabled
 	gzipEnabled bool
 
-	reqTotal         *prometheus.CounterVec
-	reqByMethod      *prometheus.CounterVec
-	reqByAPIKey      *prometheus.CounterVec
-	cacheByMethod    *prometheus.CounterVec
-	reqDuration      *prometheus.HistogramVec
-	cacheServed      prometheus.Counter
-	multiplexedTotal prometheus.Counter
+	reqTotal            *prometheus.CounterVec
+	reqByMethod         *prometheus.CounterVec
+	reqByPath           *prometheus.CounterVec
+	reqByAPIKey         *prometheus.CounterVec
+	reqByAPIKeyPath     *prometheus.CounterVec
+	cacheByMethod       *prometheus.CounterVec
+	cacheByPath         *prometheus.CounterVec
+	reqDuration         *prometheus.HistogramVec
+	reqDurationByMethod *prometheus.HistogramVec
+	reqDurationByPath   *prometheus.HistogramVec
+	cacheServed         prometheus.Counter
+	multiplexedTotal    prometheus.Counter
 }
 
 type compiledFailsafeOverride struct {
@@ -285,11 +323,31 @@ func New(cfg *config.NetworkConfig, globalCfg *config.Config) (*Network, error) 
 		ConstLabels: prometheus.Labels{"network": cfg.ID},
 	}, []string{"upstream"})
 
+	n.reqDurationByMethod = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:        "ebeacon_request_duration_by_method_seconds",
+		Help:        "End-to-end proxy request duration by HTTP method",
+		Buckets:     prometheus.DefBuckets,
+		ConstLabels: prometheus.Labels{"network": cfg.ID},
+	}, []string{"method"})
+
+	n.reqDurationByPath = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:        "ebeacon_request_duration_by_path_seconds",
+		Help:        "End-to-end proxy request duration by normalized Beacon API path",
+		Buckets:     prometheus.DefBuckets,
+		ConstLabels: prometheus.Labels{"network": cfg.ID},
+	}, []string{"upstream", "api_path"})
+
 	n.reqByMethod = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name:        "ebeacon_requests_by_method_total",
 		Help:        "Proxy requests by HTTP method and status class",
 		ConstLabels: prometheus.Labels{"network": cfg.ID},
 	}, []string{"method", "status_class"})
+
+	n.reqByPath = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name:        "ebeacon_requests_by_path_total",
+		Help:        "Proxy requests by normalized Beacon API path and status class",
+		ConstLabels: prometheus.Labels{"network": cfg.ID},
+	}, []string{"api_path", "status_class"})
 
 	n.reqByAPIKey = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name:        "ebeacon_requests_by_api_key_total",
@@ -297,11 +355,23 @@ func New(cfg *config.NetworkConfig, globalCfg *config.Config) (*Network, error) 
 		ConstLabels: prometheus.Labels{"network": cfg.ID},
 	}, []string{"api_key", "method", "status_class"})
 
+	n.reqByAPIKeyPath = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name:        "ebeacon_requests_by_api_key_path_total",
+		Help:        "Proxy requests by API key, normalized Beacon API path, and status class",
+		ConstLabels: prometheus.Labels{"network": cfg.ID},
+	}, []string{"api_key", "api_path", "status_class"})
+
 	n.cacheByMethod = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name:        "ebeacon_cache_requests_by_method_total",
 		Help:        "Cache outcome by HTTP method (hit, miss, bypass_method, bypass_policy)",
 		ConstLabels: prometheus.Labels{"network": cfg.ID},
 	}, []string{"method", "cache_result"})
+
+	n.cacheByPath = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name:        "ebeacon_cache_requests_by_path_total",
+		Help:        "Cache outcome by normalized Beacon API path",
+		ConstLabels: prometheus.Labels{"network": cfg.ID},
+	}, []string{"api_path", "cache_result"})
 
 	n.cacheServed = promauto.NewCounter(prometheus.CounterOpts{
 		Name:        "ebeacon_cache_served_total",
@@ -380,6 +450,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	apiKey := reqctx.APIKeyIDFromRequest(r)
 
 	r, clientUpstream := n.rewriteClientPath(r)
+	apiPath := normalizeAPIPath(r.URL.Path)
 
 	// Intercept /eth/v1/node/health: respond synthetically so load balancers
 	// get an accurate answer without forwarding to a sick node. When a client
@@ -413,8 +484,8 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Blocked paths (evaluated on path after client-prefix normalization).
 	for _, pat := range n.blocked {
 		if pat.MatchString(r.URL.Path) {
-			n.observeMethodStatus(r.Method, http.StatusForbidden)
-			n.observeAPIKey(apiKey, r.Method, http.StatusForbidden)
+			n.observeMethodStatus(r.Method, apiPath, http.StatusForbidden)
+			n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusForbidden)
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -425,8 +496,8 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if n.routing != nil {
 		deny, ru, hit := n.routing.matchRouteRule(r.Method, r.URL.Path)
 		if hit && deny {
-			n.observeMethodStatus(r.Method, http.StatusForbidden)
-			n.observeAPIKey(apiKey, r.Method, http.StatusForbidden)
+			n.observeMethodStatus(r.Method, apiPath, http.StatusForbidden)
+			n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusForbidden)
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -436,8 +507,8 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Global rate limiter
 	if n.globalLimiter != nil && !n.globalLimiter.Allow() {
 		w.Header().Set("X-Ebeacon-Rate-Limited", "global")
-		n.observeMethodStatus(r.Method, http.StatusTooManyRequests)
-		n.observeAPIKey(apiKey, r.Method, http.StatusTooManyRequests)
+		n.observeMethodStatus(r.Method, apiPath, http.StatusTooManyRequests)
+		n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusTooManyRequests)
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
@@ -448,8 +519,8 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sess = n.sessions.Get(r)
 		if n.rl.PerIP != nil && !sess.Allow() {
 			w.Header().Set("X-Ebeacon-Rate-Limited", "per-ip")
-			n.observeMethodStatus(r.Method, http.StatusTooManyRequests)
-			n.observeAPIKey(apiKey, r.Method, http.StatusTooManyRequests)
+			n.observeMethodStatus(r.Method, apiPath, http.StatusTooManyRequests)
+			n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusTooManyRequests)
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
@@ -487,10 +558,10 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			cacheKey = buildCacheKey(n.id, r, cacheScope)
 			cachePolicy = p
 			if entry := n.cache.Get(cacheKey); entry != nil {
-				n.observeCacheByMethod(r.Method, "hit")
+				n.observeCacheByMethod(r.Method, apiPath, "hit")
 				n.cacheServed.Inc()
-				n.observeMethodStatus(r.Method, entry.Status())
-				n.observeAPIKey(apiKey, r.Method, entry.Status())
+				n.observeMethodStatus(r.Method, apiPath, entry.Status())
+				n.observeAPIKey(apiKey, r.Method, apiPath, entry.Status())
 				cachedHeaders := entry.Headers().Clone()
 				cachedHeaders.Set("X-Ebeacon-Cache", "HIT")
 				copyResponseHeaders(w.Header(), cachedHeaders)
@@ -510,22 +581,23 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				return
 			}
-			n.observeCacheByMethod(r.Method, "miss")
+			n.observeCacheByMethod(r.Method, apiPath, "miss")
 		} else {
-			n.observeCacheByMethod(r.Method, "bypass_policy")
+			n.observeCacheByMethod(r.Method, apiPath, "bypass_policy")
 		}
 	} else if n.cache != nil {
-		n.observeCacheByMethod(r.Method, "bypass_method")
+		n.observeCacheByMethod(r.Method, apiPath, "bypass_method")
 	}
 
 	// Buffer body for retry / hedge.
 	var bodyBytes []byte
-	if r.Body != nil && r.Body != http.NoBody && n.needsBodyBuffer() {
+	if r.Body != nil && r.Body != http.NoBody && (n.needsBodyBuffer() || debuglog.Default().Enabled()) {
 		var err error
 		bodyBytes, err = io.ReadAll(io.LimitReader(r.Body, 32<<20))
 		if err != nil {
-			n.observeMethodStatus(r.Method, http.StatusBadRequest)
-			n.observeAPIKey(apiKey, r.Method, http.StatusBadRequest)
+			n.observeMethodStatus(r.Method, apiPath, http.StatusBadRequest)
+			n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusBadRequest)
+			n.logFailure(r, bodyBytes, apiPath, "", http.StatusBadRequest, nil, nil, err, 0, "request_body_read_error", "", 0)
 			http.Error(w, "failed to read request body", http.StatusBadRequest)
 			return
 		}
@@ -550,7 +622,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		v, muxErr, shared := n.inflight.Do(dedupKey, func() (interface{}, error) {
-			resp, u, err := n.executeWithFailsafe(r.Context(), r, bodyBytes, preferID, requiredSelector, fs)
+			resp, u, err := n.executeWithFailsafe(r.Context(), r, bodyBytes, preferID, requiredSelector, fs, apiPath)
 			if err != nil {
 				return nil, err
 			}
@@ -582,7 +654,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			execErr = fmt.Errorf("multiplexed request failed")
 		}
 	} else {
-		resp, u, execErr = n.executeWithFailsafe(r.Context(), r, bodyBytes, preferID, requiredSelector, fs)
+		resp, u, execErr = n.executeWithFailsafe(r.Context(), r, bodyBytes, preferID, requiredSelector, fs, apiPath)
 	}
 
 	if execErr != nil {
@@ -595,16 +667,18 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"selector", selectedErr.selector,
 				"err", execErr)
 			n.reqTotal.WithLabelValues("none", "error").Inc()
-			n.observeMethodStatus(r.Method, http.StatusServiceUnavailable)
-			n.observeAPIKey(apiKey, r.Method, http.StatusServiceUnavailable)
+			n.observeMethodStatus(r.Method, apiPath, http.StatusServiceUnavailable)
+			n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusServiceUnavailable)
+			n.logFailure(r, bodyBytes, apiPath, "", http.StatusServiceUnavailable, nil, nil, execErr, time.Since(start), "selected_upstream_unavailable", selectedErr.selector, 0)
 			http.Error(w, "selected upstream unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		slog.Error("all upstreams failed",
 			"network", n.id, "method", r.Method, "path", r.URL.Path, "err", execErr)
 		n.reqTotal.WithLabelValues("none", "error").Inc()
-		n.observeMethodStatus(r.Method, http.StatusBadGateway)
-		n.observeAPIKey(apiKey, r.Method, http.StatusBadGateway)
+		n.observeMethodStatus(r.Method, apiPath, http.StatusBadGateway)
+		n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusBadGateway)
+		n.logFailure(r, bodyBytes, apiPath, "", http.StatusBadGateway, nil, nil, execErr, time.Since(start), "all_upstreams_failed", "", 0)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
@@ -624,12 +698,16 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"status", resp.StatusCode,
 			"err", err)
 		n.reqTotal.WithLabelValues(u.ID, "error").Inc()
-		n.observeMethodStatus(r.Method, http.StatusBadGateway)
-		n.observeAPIKey(apiKey, r.Method, http.StatusBadGateway)
+		n.observeMethodStatus(r.Method, apiPath, http.StatusBadGateway)
+		n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusBadGateway)
 		n.reqDuration.WithLabelValues(u.ID).Observe(time.Since(start).Seconds())
-		u.RecordScoreError()
+		n.reqDurationByMethod.WithLabelValues(strings.ToUpper(r.Method)).Observe(time.Since(start).Seconds())
+		n.reqDurationByPath.WithLabelValues(u.ID, apiPath).Observe(time.Since(start).Seconds())
+		u.RecordScoreErrorForPath(apiPath)
+		n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
 		u.RecordError()
 		u.CBFailure()
+		n.logFailure(r, bodyBytes, apiPath, u.ID, http.StatusBadGateway, resp.Header, nil, err, time.Since(start), "upstream_response_read_error", "", 0)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
@@ -642,18 +720,24 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	duration := time.Since(start)
 	n.reqTotal.WithLabelValues(u.ID, httpStatusClass(resp.StatusCode)).Inc()
-	n.observeMethodStatus(r.Method, resp.StatusCode)
-	n.observeAPIKey(apiKey, r.Method, resp.StatusCode)
+	n.observeMethodStatus(r.Method, apiPath, resp.StatusCode)
+	n.observeAPIKey(apiKey, r.Method, apiPath, resp.StatusCode)
 	n.reqDuration.WithLabelValues(u.ID).Observe(duration.Seconds())
+	n.reqDurationByMethod.WithLabelValues(strings.ToUpper(r.Method)).Observe(duration.Seconds())
+	n.reqDurationByPath.WithLabelValues(u.ID, apiPath).Observe(duration.Seconds())
 
 	// Record metrics for score-based routing
-	if resp.StatusCode < 500 {
-		u.RecordSuccess(duration)
+	if resp.StatusCode < 500 && !shouldTreatStatusAsPathError(apiPath, resp.StatusCode) {
+		u.RecordSuccessForPath(apiPath, duration)
 	} else {
-		u.RecordScoreError()
+		u.RecordScoreErrorForPath(apiPath)
 	}
 	n.pool.RefreshUpstreamScoreMetrics(u)
+	n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
 	u.RecordResponseStatus(resp.StatusCode)
+	if resp.StatusCode >= 400 {
+		n.logFailure(r, bodyBytes, apiPath, u.ID, resp.StatusCode, resp.Header, respBody, nil, duration, "proxied_error_response", "", 0)
+	}
 
 	w.Header().Set("X-Ebeacon-Upstream", ObfuscateUpstreamID(u.ID))
 	if ct := u.ClientType(); ct != "" && ct != "unknown" {
@@ -721,11 +805,11 @@ func mergeFailsafe(base, override config.FailsafeConfig) config.FailsafeConfig {
 }
 
 // executeWithFailsafe runs execute with the given failsafe config.
-func (n *Network) executeWithFailsafe(ctx context.Context, r *http.Request, bodyBytes []byte, preferID string, required requiredUpstreamSelector, fs config.FailsafeConfig) (*http.Response, *upstream.Upstream, error) {
-	return n.executeFS(ctx, r, bodyBytes, preferID, required, fs)
+func (n *Network) executeWithFailsafe(ctx context.Context, r *http.Request, bodyBytes []byte, preferID string, required requiredUpstreamSelector, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, error) {
+	return n.executeFS(ctx, r, bodyBytes, preferID, required, fs, apiPath)
 }
 
-func (n *Network) executeSelectedFS(ctx context.Context, r *http.Request, bodyBytes []byte, required requiredUpstreamSelector, fs config.FailsafeConfig) (*http.Response, *upstream.Upstream, error) {
+func (n *Network) executeSelectedFS(ctx context.Context, r *http.Request, bodyBytes []byte, required requiredUpstreamSelector, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, error) {
 	if required.upstreamID != "" {
 		u := n.pool.ByID(required.upstreamID)
 		if u == nil {
@@ -738,6 +822,8 @@ func (n *Network) executeSelectedFS(ctx context.Context, r *http.Request, bodyBy
 		resp, err := n.forward(ctx, u, r, body)
 		if err != nil {
 			u.CBFailure()
+			u.RecordScoreErrorForPath(apiPath)
+			n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
 			u.RecordError()
 			return nil, nil, &selectedUpstreamUnavailableError{selector: required.label(), err: err}
 		}
@@ -755,25 +841,25 @@ func (n *Network) executeSelectedFS(ctx context.Context, r *http.Request, bodyBy
 		if fs.Retry != nil {
 			maxAttempts = fs.Retry.MaxAttempts
 		}
-		ups := n.pool.SelectByGlob(required.glob, maxAttempts)
+		ups := n.pool.SelectByGlobForPath(required.glob, apiPath, maxAttempts)
 		if len(ups) == 0 {
 			return nil, nil, &selectedUpstreamUnavailableError{selector: required.label()}
 		}
-		return n.executeSelectedCandidatesFS(ctx, r, bodyBytes, required, fs, ups)
+		return n.executeSelectedCandidatesFS(ctx, r, bodyBytes, required, fs, ups, apiPath)
 	}
 
 	maxAttempts := 1
 	if fs.Retry != nil {
 		maxAttempts = fs.Retry.MaxAttempts
 	}
-	ups := n.pool.SelectByClientType(required.clientType, maxAttempts)
+	ups := n.pool.SelectByClientTypeForPath(required.clientType, apiPath, maxAttempts)
 	if len(ups) == 0 {
 		return nil, nil, &selectedUpstreamUnavailableError{selector: required.label()}
 	}
-	return n.executeSelectedCandidatesFS(ctx, r, bodyBytes, required, fs, ups)
+	return n.executeSelectedCandidatesFS(ctx, r, bodyBytes, required, fs, ups, apiPath)
 }
 
-func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Request, bodyBytes []byte, required requiredUpstreamSelector, fs config.FailsafeConfig, ups []*upstream.Upstream) (*http.Response, *upstream.Upstream, error) {
+func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Request, bodyBytes []byte, required requiredUpstreamSelector, fs config.FailsafeConfig, ups []*upstream.Upstream, apiPath string) (*http.Response, *upstream.Upstream, error) {
 	var lastResp *http.Response
 	var lastUpstream *upstream.Upstream
 	var lastErr error
@@ -803,6 +889,10 @@ func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Reque
 		}
 
 		u.CBFailure()
+		if err != nil || i < len(ups)-1 {
+			u.RecordScoreErrorForPath(apiPath)
+			n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
+		}
 		u.RecordError()
 		if err != nil {
 			lastErr = err
@@ -844,10 +934,13 @@ func (n *Network) effectiveCacheTTL(policyTTL time.Duration, path string) time.D
 	if slot, ok := pathNumericSlot(path); ok && slot <= finalizedSlot {
 		return 0 // finalized → cache forever
 	}
+	if epoch, ok := pathNumericEpoch(path); ok && epoch <= finalizedSlot/32 {
+		return 0 // finalized epoch → cache forever
+	}
 	return policyTTL
 }
 
-func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []byte, preferID string, required requiredUpstreamSelector, fs config.FailsafeConfig) (*http.Response, *upstream.Upstream, error) {
+func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []byte, preferID string, required requiredUpstreamSelector, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, error) {
 	var timeoutCancel context.CancelFunc
 	if fs.Timeout != nil {
 		ctx, timeoutCancel = context.WithTimeout(ctx, fs.Timeout.Duration)
@@ -859,7 +952,7 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 	}
 
 	if required.enabled() {
-		resp, u, err := n.executeSelectedFS(ctx, r, bodyBytes, required, fs)
+		resp, u, err := n.executeSelectedFS(ctx, r, bodyBytes, required, fs, apiPath)
 		if err != nil {
 			cancelTimeout()
 			return nil, nil, err
@@ -869,7 +962,7 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 
 	// Consensus policy: send to N upstreams, require M agreement
 	if n.consensus != nil {
-		ups := n.pool.Select(n.consensus.MaxParticipants)
+		ups := n.pool.SelectForPath(apiPath, n.consensus.MaxParticipants)
 		if len(ups) >= n.consensus.AgreementThreshold {
 			resp, u, err := n.consensus.Execute(ctx, ups, func(u *upstream.Upstream) (*http.Request, error) {
 				dest := u.URL + pathAndQueryForUpstream(r.URL)
@@ -903,9 +996,9 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 	// Hedge: fire parallel requests after a delay.
 	if fs.Hedge != nil {
 		count := fs.Hedge.MaxCount + 1
-		ups := n.pool.Select(count)
+		ups := n.pool.SelectForPath(apiPath, count)
 		if len(ups) > 1 {
-			resp, u, err := n.executeHedgeFS(ctx, ups, r, bodyBytes, preferID, fs)
+			resp, u, err := n.executeHedgeFS(ctx, ups, r, bodyBytes, preferID, fs, apiPath)
 			if err != nil {
 				cancelTimeout()
 				return nil, nil, err
@@ -915,7 +1008,7 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 	}
 
 	// Sequential retry across upstreams.
-	ups := n.pool.Select(maxAttempts)
+	ups := n.pool.SelectForPath(apiPath, maxAttempts)
 	if len(ups) == 0 {
 		cancelTimeout()
 		return nil, nil, fmt.Errorf("no upstreams available")
@@ -940,6 +1033,7 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 			body = bytes.NewReader(bodyBytes)
 		}
 
+		attemptStarted := time.Now()
 		resp, err := n.forward(ctx, u, r, body)
 		if err == nil && resp.StatusCode < 500 {
 			u.CBSuccess()
@@ -948,13 +1042,22 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 
 		if err != nil {
 			slog.Warn("upstream error", "network", n.id, "upstream", u.ID, "attempt", i+1, "err", err)
+			n.logFailure(r, bodyBytes, apiPath, u.ID, 0, nil, nil, err, time.Since(attemptStarted), "upstream_attempt_failed", "", i+1)
 			lastErr = err
 		} else {
 			slog.Warn("upstream bad status", "network", n.id, "upstream", u.ID, "attempt", i+1, "status", resp.StatusCode)
+			failedBody, readErr := readAndFinalizeResponseBody(resp)
 			resp.Body.Close() //nolint:errcheck
+			if readErr != nil {
+				n.logFailure(r, bodyBytes, apiPath, u.ID, resp.StatusCode, resp.Header, nil, readErr, time.Since(attemptStarted), "upstream_attempt_failed", "", i+1)
+			} else {
+				n.logFailure(r, bodyBytes, apiPath, u.ID, resp.StatusCode, resp.Header, failedBody, nil, time.Since(attemptStarted), "upstream_attempt_failed", "", i+1)
+			}
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 		}
 		u.CBFailure()
+		u.RecordScoreErrorForPath(apiPath)
+		n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
 		u.RecordError()
 	}
 
@@ -989,7 +1092,7 @@ func trimUpstreamSlice(ups []*upstream.Upstream, maxLen int) []*upstream.Upstrea
 	return ups
 }
 
-func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, r *http.Request, bodyBytes []byte, preferID string, fs config.FailsafeConfig) (*http.Response, *upstream.Upstream, error) {
+func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, r *http.Request, bodyBytes []byte, preferID string, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, error) {
 	hedge := fs.Hedge
 	maxFire := hedge.MaxCount + 1
 	if maxFire > len(ups) {
@@ -998,10 +1101,11 @@ func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, 
 	ups = ensurePreferredUpstreamFirst(n.pool, ups, preferID, maxFire)
 
 	type result struct {
-		resp *http.Response
-		u    *upstream.Upstream
-		err  error
-		idx  int
+		resp     *http.Response
+		u        *upstream.Upstream
+		err      error
+		idx      int
+		duration time.Duration
 	}
 
 	resultCh := make(chan result, maxFire)
@@ -1016,8 +1120,9 @@ func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, 
 			if bodyBytes != nil {
 				body = bytes.NewReader(bodyBytes)
 			}
+			started := time.Now()
 			resp, err := n.forward(reqCtx, u, r, body)
-			resultCh <- result{resp: resp, u: u, err: err, idx: idx}
+			resultCh <- result{resp: resp, u: u, err: err, idx: idx, duration: time.Since(started)}
 		}(idx)
 	}
 
@@ -1054,12 +1159,21 @@ func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, 
 				return res.resp, res.u, nil
 			}
 			if res.err != nil {
+				n.logFailure(r, bodyBytes, apiPath, res.u.ID, 0, nil, nil, res.err, res.duration, "hedged_attempt_failed", "", res.idx+1)
 				lastErr = res.err
 			} else {
+				failedBody, readErr := readAndFinalizeResponseBody(res.resp)
 				lastErr = fmt.Errorf("HTTP %d", res.resp.StatusCode)
 				res.resp.Body.Close() //nolint:errcheck
+				if readErr != nil {
+					n.logFailure(r, bodyBytes, apiPath, res.u.ID, res.resp.StatusCode, res.resp.Header, nil, readErr, res.duration, "hedged_attempt_failed", "", res.idx+1)
+				} else {
+					n.logFailure(r, bodyBytes, apiPath, res.u.ID, res.resp.StatusCode, res.resp.Header, failedBody, nil, res.duration, "hedged_attempt_failed", "", res.idx+1)
+				}
 			}
 			res.u.CBFailure()
+			res.u.RecordScoreErrorForPath(apiPath)
+			n.pool.RefreshUpstreamPathScoreMetrics(res.u, apiPath)
 			res.u.RecordError()
 			if inflight == 0 && fired >= maxFire {
 				cancelAll()
@@ -1128,6 +1242,28 @@ func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Req
 	}
 
 	return u.TrackResponse(resp), nil
+}
+
+func (n *Network) logFailure(r *http.Request, reqBody []byte, apiPath, upstreamID string, status int, responseHeaders http.Header, responseBody []byte, err error, duration time.Duration, kind, selector string, attempt int) {
+	debuglog.Default().LogEvent(debuglog.Event{
+		Kind:            kind,
+		Network:         n.id,
+		APIPath:         apiPath,
+		Method:          r.Method,
+		Path:            r.URL.Path,
+		RawQuery:        r.URL.RawQuery,
+		ClientIP:        ClientIP(r),
+		Upstream:        upstreamID,
+		Selector:        selector,
+		Status:          status,
+		Attempt:         attempt,
+		Duration:        duration,
+		Err:             err,
+		RequestHeaders:  r.Header,
+		RequestBody:     reqBody,
+		ResponseHeaders: responseHeaders,
+		ResponseBody:    responseBody,
+	})
 }
 
 type gzipReadCloser struct {
@@ -1296,15 +1432,17 @@ func retryDelay(cfg *config.RetryConfig, attempt int) time.Duration {
 	return time.Duration(delay)
 }
 
-func (n *Network) observeMethodStatus(method string, statusCode int) {
+func (n *Network) observeMethodStatus(method, apiPath string, statusCode int) {
 	n.reqByMethod.WithLabelValues(strings.ToUpper(method), httpStatusClass(statusCode)).Inc()
+	n.reqByPath.WithLabelValues(apiPath, httpStatusClass(statusCode)).Inc()
 }
 
-func (n *Network) observeAPIKey(apiKey, method string, statusCode int) {
+func (n *Network) observeAPIKey(apiKey, method, apiPath string, statusCode int) {
 	if apiKey == "" {
 		return
 	}
 	n.reqByAPIKey.WithLabelValues(apiKey, strings.ToUpper(method), httpStatusClass(statusCode)).Inc()
+	n.reqByAPIKeyPath.WithLabelValues(apiKey, apiPath, httpStatusClass(statusCode)).Inc()
 }
 
 func httpStatusClass(code int) string {
@@ -1324,8 +1462,28 @@ func httpStatusClass(code int) string {
 	}
 }
 
-func (n *Network) observeCacheByMethod(method, result string) {
+func shouldTreatStatusAsPathError(apiPath string, statusCode int) bool {
+	switch statusCode {
+	case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented:
+	default:
+		return false
+	}
+
+	switch {
+	case strings.Contains(apiPath, "/beacon/rewards/"):
+		return true
+	case strings.Contains(apiPath, "/beacon/blobs/"):
+		return true
+	case strings.Contains(apiPath, "/beacon/blob_sidecars/"):
+		return true
+	default:
+		return false
+	}
+}
+
+func (n *Network) observeCacheByMethod(method, apiPath, result string) {
 	n.cacheByMethod.WithLabelValues(strings.ToUpper(method), result).Inc()
+	n.cacheByPath.WithLabelValues(apiPath, result).Inc()
 }
 
 func finalizeResponseBody(headers http.Header, body []byte) []byte {

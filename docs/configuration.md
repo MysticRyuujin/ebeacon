@@ -7,7 +7,9 @@ eBeacon is configured with YAML. Use `ebeacon.example.yaml` as a full commented 
 | Key            | Purpose                                                       |
 | -------------- | ------------------------------------------------------------- |
 | `logLevel`     | `debug`, `info`, `warn`, `error`                              |
+| `debugLogging` | Optional rotating failure log with request/response previews  |
 | `server`       | Listener host/port, timeout, gzip behavior                    |
+| `pprof`        | Optional Go runtime profiling debug server                    |
 | `cors`         | Optional browser CORS policy for proxy and web UI routes      |
 | `failsafe`     | Global timeout/retry/hedge/circuit-breaker/consensus defaults |
 | `health`       | Polling intervals and degradation thresholds                  |
@@ -27,6 +29,12 @@ Use top-level `networks:` and optionally top-level `auth:`. Let HAProxy rewrite 
 - `server.port`: `5555`
 - `server.maxTimeout`: `60s`
 - `server.enableGzip`: defaults to enabled when omitted
+- `pprof.enabled`: `false`
+- `pprof.host`: `127.0.0.1`
+- `pprof.port`: `6060`
+- `debugLogging.maxSizeMB`: `100`
+- `debugLogging.maxBackups`: `10`
+- `debugLogging.maxBodyBytes`: `65536`
 - `cors.allowedOrigins`: `[*]` when a top-level `cors:` block is present
 - `cors.allowedMethods`: `GET`, `HEAD`, `POST`, `OPTIONS`
 - `cors.allowedHeaders`: `content-type`, `authorization`, `x-ebeacon-secret-token`, `x-api-key`
@@ -55,6 +63,7 @@ Validation examples:
 - At least one network is required.
 - Each network must have at least one upstream.
 - `server.port` must be `1..65535`.
+- `debugLogging.path` is required when `debugLogging.enabled` is `true`.
 - `cors.allowedOrigins` must contain at least one origin when `cors:` is configured.
 - `metrics.path` must start with `/`.
 - `cache.maxSize` must be `> 0`.
@@ -71,6 +80,39 @@ server:
 ```
 
 `maxTimeout` drives request timeout policy ceilings and contributes to HTTP server write timeout.
+
+## `pprof`
+
+```yaml
+pprof:
+  enabled: true
+  host: "127.0.0.1"   # listen address (default 127.0.0.1)
+  port: 6060           # listen port (default 6060)
+```
+
+When enabled, eBeacon starts a separate HTTP server exposing Go's standard `net/http/pprof` handlers. Access profiles at `http://<host>:<port>/debug/pprof/`.
+
+The default listen address is loopback-only. Use `0.0.0.0` inside containers and expose the port only on a trusted interface.
+
+## `debugLogging`
+
+```yaml
+debugLogging:
+  enabled: false
+  path: "/logs/ebeacon-debug.log"
+  maxSizeMB: 100
+  maxBackups: 10
+  maxBodyBytes: 65536
+```
+
+When enabled, eBeacon writes structured JSON log entries for failed proxy exchanges and upstream attempt failures. Each entry includes a sanitized request summary plus truncated request and response body previews.
+
+- `path` is the on-disk log file path.
+- `maxSizeMB` is the rotation threshold for a single file.
+- `maxBackups` is the number of rotated files to keep.
+- `maxBodyBytes` caps the body preview stored in each log event.
+
+For container deployments, mount a writable directory at `/logs` or change `path` to another writable location.
 
 ## `cors`
 

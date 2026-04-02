@@ -27,6 +27,7 @@
 //	-duration     Total run time; 0 means run until SIGINT (default: 30m)
 //	-report       Progress report interval (default: 1m)
 //	-auth         Bearer token for Authorization header
+//	-api-key      value for X-API-Key header
 //	-timeout      Per-request timeout (default: 15s)
 package main
 
@@ -65,18 +66,20 @@ type config struct {
 	duration     time.Duration
 	reportEvery  time.Duration
 	auth         string
+	apiKey       string
 	timeout      time.Duration
 }
 
 func loadConfig() config {
 	ebeacon := flag.String("ebeacon", "http://127.0.0.1:5555/mainnet", "eBeacon base URL including network prefix")
-	upstream := flag.String("upstream", "http://127.0.0.1:5052,http://127.0.0.2:5052,http://127.0.0.3:5052", "comma-separated direct upstream URLs")
+	upstream := flag.String("upstream", "http://localhost:5052", "comma-separated direct upstream URLs")
 	pprofAddr := flag.String("pprof", "http://localhost:6060", "eBeacon pprof base URL")
 	pprofDir := flag.String("pprof-dir", "/tmp/ebeacon-reliability", "directory for pprof output files")
 	pprofEvery := flag.Duration("pprof-every", 10*time.Minute, "interval between pprof snapshots")
 	duration := flag.Duration("duration", 30*time.Minute, "total run duration (0 = until SIGINT)")
 	reportEvery := flag.Duration("report", time.Minute, "progress report interval")
 	auth := flag.String("auth", "", "Bearer token for Authorization header")
+	apiKey := flag.String("api-key", "", "value for X-API-Key header")
 	timeout := flag.Duration("timeout", 15*time.Second, "per-request HTTP timeout")
 	flag.Parse()
 
@@ -88,6 +91,7 @@ func loadConfig() config {
 		duration:    *duration,
 		reportEvery: *reportEvery,
 		auth:        *auth,
+		apiKey:      *apiKey,
 		timeout:     *timeout,
 	}
 
@@ -97,6 +101,9 @@ func loadConfig() config {
 	}
 	if v := os.Getenv("EBEACON_AUTH"); v != "" {
 		cfg.auth = v
+	}
+	if v := os.Getenv("EBEACON_API_KEY"); v != "" {
+		cfg.apiKey = v
 	}
 
 	for _, u := range strings.Split(*upstream, ",") {
@@ -208,11 +215,12 @@ type fetchResult struct {
 type fetchOptions struct {
 	accept         string
 	auth           string
+	apiKey         string
 	acceptEncoding string
 }
 
-func fetch(ctx context.Context, client *http.Client, url, auth string) (fetchResult, error) {
-	return fetchWithOptions(ctx, client, url, fetchOptions{accept: "application/json", auth: auth})
+func fetch(ctx context.Context, client *http.Client, url, auth, apiKey string) (fetchResult, error) {
+	return fetchWithOptions(ctx, client, url, fetchOptions{accept: "application/json", auth: auth, apiKey: apiKey})
 }
 
 func fetchWithOptions(ctx context.Context, client *http.Client, url string, opts fetchOptions) (fetchResult, error) {
@@ -230,6 +238,9 @@ func fetchWithOptions(ctx context.Context, client *http.Client, url string, opts
 	}
 	if opts.auth != "" {
 		req.Header.Set("Authorization", "Bearer "+opts.auth)
+	}
+	if opts.apiKey != "" {
+		req.Header.Set("X-API-Key", opts.apiKey)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -331,7 +342,7 @@ func runImmutableChecks(ctx context.Context, cfg config, c *counters, log *misma
 
 	check := func() {
 		for _, ep := range immutableEndpoints {
-			ebRes, err := fetch(ctx, client, cfg.ebeaconBase+ep, cfg.auth)
+			ebRes, err := fetch(ctx, client, cfg.ebeaconBase+ep, cfg.auth, cfg.apiKey)
 			if err != nil || ebRes.status != http.StatusOK {
 				slog.Debug("immutable: eBeacon fetch failed", "endpoint", ep, "err", err)
 				continue
@@ -342,7 +353,7 @@ func runImmutableChecks(ctx context.Context, cfg config, c *counters, log *misma
 			}
 
 			for _, upURL := range cfg.upstreamURLs {
-				upRes, err := fetch(ctx, client, upURL+ep, "")
+				upRes, err := fetch(ctx, client, upURL+ep, "", "")
 				if err != nil || upRes.status != http.StatusOK {
 					c.upstreamErrors.Add(1)
 					continue
@@ -415,7 +426,7 @@ func runCacheAccuracyChecks(ctx context.Context, cfg config, c *counters, log *m
 		for _, ep := range cacheAccuracyEndpoints {
 			// First fetch: head endpoints have a 12s TTL so this is almost always a MISS
 			// when polled every 30s (head slot has changed by then).
-			ebRes, err := fetch(ctx, client, cfg.ebeaconBase+ep.ebeaconPath, cfg.auth)
+			ebRes, err := fetch(ctx, client, cfg.ebeaconBase+ep.ebeaconPath, cfg.auth, cfg.apiKey)
 			if err != nil || ebRes.status != http.StatusOK {
 				continue
 			}
@@ -427,7 +438,7 @@ func runCacheAccuracyChecks(ctx context.Context, cfg config, c *counters, log *m
 
 			// Immediate re-fetch: the first fetch just populated the cache, so this
 			// should be a HIT within the same TTL window (< 1s elapsed).
-			ebRes2, err := fetch(ctx, client, cfg.ebeaconBase+ep.ebeaconPath, cfg.auth)
+			ebRes2, err := fetch(ctx, client, cfg.ebeaconBase+ep.ebeaconPath, cfg.auth, cfg.apiKey)
 			if err != nil || ebRes2.status != http.StatusOK {
 				continue
 			}
@@ -447,7 +458,7 @@ func runCacheAccuracyChecks(ctx context.Context, cfg config, c *counters, log *m
 			slotStr := strconv.FormatUint(slot, 10)
 
 			upPath := fmt.Sprintf(ep.upstreamFmt, slotStr)
-			upRes, err := fetch(ctx, client, upURL+upPath, "")
+			upRes, err := fetch(ctx, client, upURL+upPath, "", "")
 			if err != nil || upRes.status != http.StatusOK {
 				c.upstreamErrors.Add(1)
 				continue
@@ -508,7 +519,7 @@ func runCacheFreshnessChecks(ctx context.Context, cfg config, c *counters, log *
 		case <-ticker.C:
 		}
 
-		res, err := fetch(ctx, client, cfg.ebeaconBase+ep, cfg.auth)
+		res, err := fetch(ctx, client, cfg.ebeaconBase+ep, cfg.auth, cfg.apiKey)
 		if err != nil || res.status != http.StatusOK {
 			continue
 		}
@@ -593,7 +604,7 @@ func runEncodingCompatibilityChecks(ctx context.Context, cfg config, c *counters
 	}
 
 	resolveStableBinaryPath := func() (string, error) {
-		res, err := fetch(ctx, client, cfg.ebeaconBase+"/eth/v1/beacon/headers/head", cfg.auth)
+		res, err := fetch(ctx, client, cfg.ebeaconBase+"/eth/v1/beacon/headers/head", cfg.auth, cfg.apiKey)
 		if err != nil {
 			return "", err
 		}
@@ -1009,7 +1020,7 @@ func main() {
 
 	// Verify eBeacon is reachable.
 	probe := newHTTPClient(10 * time.Second)
-	if r, err := fetch(context.Background(), probe, cfg.ebeaconBase+"/eth/v1/node/version", cfg.auth); err != nil || r.status != http.StatusOK {
+	if r, err := fetch(context.Background(), probe, cfg.ebeaconBase+"/eth/v1/node/version", cfg.auth, cfg.apiKey); err != nil || r.status != http.StatusOK {
 		fmt.Fprintf(os.Stderr, "ERROR: cannot reach eBeacon at %s: %v\n", cfg.ebeaconBase, err)
 		os.Exit(1)
 	}
@@ -1017,7 +1028,7 @@ func main() {
 
 	// Log which upstreams are reachable (non-fatal if some are not).
 	for _, u := range cfg.upstreamURLs {
-		r, err := fetch(context.Background(), probe, u+"/eth/v1/node/version", "")
+		r, err := fetch(context.Background(), probe, u+"/eth/v1/node/version", "", "")
 		if err != nil || r.status != http.StatusOK {
 			slog.Warn("upstream not reachable — accuracy checks will skip it", "url", u, "err", err)
 		} else {

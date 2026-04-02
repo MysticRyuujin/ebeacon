@@ -116,6 +116,109 @@ networks:
 	}
 }
 
+func TestLoad_DebugLoggingDefaultsAndEnvExpansion(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("EBEACON_DEBUG_LOG", filepath.Join(dir, "debug.log"))
+	path := filepath.Join(dir, "ebeacon.yaml")
+	content := strings.TrimSpace(`
+logLevel: warn
+debugLogging:
+  enabled: true
+  path: "${EBEACON_DEBUG_LOG}"
+server:
+  host: "127.0.0.1"
+  port: 9000
+  maxTimeout: 30s
+failsafe:
+  timeout:
+    duration: 10s
+health:
+  checkInterval: 30s
+  finalityInterval: 2m
+  maxSyncDistance: 5
+rateLimiting: {}
+metrics:
+  enabled: false
+networks:
+  - id: testnet
+    upstreams:
+      - id: a
+        url: "http://127.0.0.1:5052"
+    routing:
+      loadBalancing: round-robin
+    cache:
+      enabled: false
+`)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.DebugLogging.Enabled {
+		t.Fatal("expected debug logging to be enabled")
+	}
+	if cfg.DebugLogging.Path != filepath.Join(dir, "debug.log") {
+		t.Fatalf("debugLogging.path: got %q", cfg.DebugLogging.Path)
+	}
+	if cfg.DebugLogging.MaxSizeMB != 100 {
+		t.Fatalf("debugLogging.maxSizeMB: got %d", cfg.DebugLogging.MaxSizeMB)
+	}
+	if cfg.DebugLogging.MaxBackups != 10 {
+		t.Fatalf("debugLogging.maxBackups: got %d", cfg.DebugLogging.MaxBackups)
+	}
+	if cfg.DebugLogging.MaxBodyBytes != 64<<10 {
+		t.Fatalf("debugLogging.maxBodyBytes: got %d", cfg.DebugLogging.MaxBodyBytes)
+	}
+}
+
+func TestValidate_DebugLoggingRequiresPathWhenEnabled(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ebeacon.yaml")
+	content := strings.TrimSpace(`
+logLevel: warn
+debugLogging:
+  enabled: true
+server:
+  host: "127.0.0.1"
+  port: 9000
+  maxTimeout: 30s
+failsafe:
+  timeout:
+    duration: 10s
+health:
+  checkInterval: 30s
+  finalityInterval: 2m
+  maxSyncDistance: 5
+rateLimiting: {}
+metrics:
+  enabled: false
+networks:
+  - id: testnet
+    upstreams:
+      - id: a
+        url: "http://127.0.0.1:5052"
+    routing:
+      loadBalancing: round-robin
+    cache:
+      enabled: false
+`)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "debugLogging.path") {
+		t.Fatalf("error %q should mention debugLogging.path", err.Error())
+	}
+}
+
 func TestValidate_Errors(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

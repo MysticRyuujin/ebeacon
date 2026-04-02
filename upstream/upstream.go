@@ -94,6 +94,26 @@ var (
 		Help: "Rolling sample count used for upstream score computation",
 	}, []string{"network", "upstream"})
 
+	metricRoutingScoreByPath = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ebeacon_upstream_score_by_path",
+		Help: "Composite upstream routing score by normalized Beacon API path",
+	}, []string{"network", "upstream", "api_path"})
+
+	metricRoutingScoreErrorRateByPath = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ebeacon_upstream_score_error_rate_by_path",
+		Help: "Rolling upstream error rate by normalized Beacon API path",
+	}, []string{"network", "upstream", "api_path"})
+
+	metricRoutingScoreP90LatencyByPath = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ebeacon_upstream_score_p90_latency_seconds_by_path",
+		Help: "Rolling upstream p90 latency by normalized Beacon API path",
+	}, []string{"network", "upstream", "api_path"})
+
+	metricRoutingScoreSamplesByPath = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ebeacon_upstream_score_samples_by_path",
+		Help: "Rolling sample count by normalized Beacon API path used for upstream score computation",
+	}, []string{"network", "upstream", "api_path"})
+
 	metricFinalizedEpoch = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ebeacon_upstream_finalized_epoch",
 		Help: "Latest observed finalized epoch for each upstream",
@@ -144,11 +164,15 @@ type Upstream struct {
 	activeConns atomic.Int64
 
 	// Score tracking
-	scorer *ScoreTracker
+	scorer       *ScoreTracker
+	routeScoreMu sync.RWMutex
+	routeScorers map[string]*ScoreTracker
 
 	// Per-upstream rate limit auto-tuner
 	rateLimiter *AutoTuner
 }
+
+const minPathScopedScoreSamples = 5
 
 // New creates an Upstream for the given network and upstream config.
 func New(networkID string, cfg config.UpstreamConfig, defaultCB *config.CircuitBreakerConfig, scoreWindowSize int) *Upstream {
@@ -166,16 +190,17 @@ func New(networkID string, cfg config.UpstreamConfig, defaultCB *config.CircuitB
 	}
 
 	u := &Upstream{
-		ID:         cfg.ID,
-		NetworkID:  networkID,
-		URL:        strings.TrimRight(cfg.URL, "/"),
-		Headers:    cfg.Headers,
-		Client:     &http.Client{Transport: transport},
-		Priority:   cfg.Priority,
-		Weight:     cfg.Weight,
-		health:     HealthUp,
-		clientType: ClientUnknown,
-		scorer:     NewScoreTracker(scoreWindowSize),
+		ID:           cfg.ID,
+		NetworkID:    networkID,
+		URL:          strings.TrimRight(cfg.URL, "/"),
+		Headers:      cfg.Headers,
+		Client:       &http.Client{Transport: transport},
+		Priority:     cfg.Priority,
+		Weight:       cfg.Weight,
+		health:       HealthUp,
+		clientType:   ClientUnknown,
+		scorer:       NewScoreTracker(scoreWindowSize),
+		routeScorers: make(map[string]*ScoreTracker),
 	}
 
 	if cfg.RateLimiting != nil && cfg.RateLimiting.AutoTune {
@@ -363,14 +388,59 @@ func (u *Upstream) ScoreSnapshot() ScoreSnapshot {
 	return u.scorer.Snapshot()
 }
 
+// PathScoreSnapshot returns the raw route-scoped score inputs for this upstream.
+func (u *Upstream) PathScoreSnapshot(apiPath string) ScoreSnapshot {
+	if apiPath == "" {
+		return u.scorer.Snapshot()
+	}
+	scorer := u.routeScorer(apiPath, false)
+	if scorer == nil {
+		return ScoreSnapshot{}
+	}
+	return scorer.Snapshot()
+}
+
+// ScoreSnapshotForPath returns a route-scoped snapshot when it has enough
+// samples to be representative; otherwise it falls back to the global tracker.
+func (u *Upstream) ScoreSnapshotForPath(apiPath string) ScoreSnapshot {
+	if apiPath == "" {
+		return u.scorer.Snapshot()
+	}
+	snapshot := u.PathScoreSnapshot(apiPath)
+	if snapshot.Samples < minPathScopedScoreSamples {
+		return u.scorer.Snapshot()
+	}
+	return snapshot
+}
+
 // RecordSuccess records a successful request with its duration for scoring.
 func (u *Upstream) RecordSuccess(d time.Duration) {
+	u.RecordSuccessForPath("", d)
+}
+
+// RecordSuccessForPath records a successful request against both the global
+// tracker and the normalized API path tracker.
+func (u *Upstream) RecordSuccessForPath(apiPath string, d time.Duration) {
 	u.scorer.RecordSuccess(d)
+	if apiPath == "" {
+		return
+	}
+	u.routeScorer(apiPath, true).RecordSuccess(d)
 }
 
 // RecordScoreError records a failed request for scoring.
 func (u *Upstream) RecordScoreError() {
+	u.RecordScoreErrorForPath("")
+}
+
+// RecordScoreErrorForPath records a failed request against both the global
+// tracker and the normalized API path tracker.
+func (u *Upstream) RecordScoreErrorForPath(apiPath string) {
 	u.scorer.RecordError()
+	if apiPath == "" {
+		return
+	}
+	u.routeScorer(apiPath, true).RecordError()
 }
 
 // AllowRequest checks the auto-tuner rate limiter (returns true if no tuner configured).
@@ -421,6 +491,24 @@ func (u *Upstream) TrackResponse(resp *http.Response) *http.Response {
 // RecordError increments the error counter.
 func (u *Upstream) RecordError() {
 	metricTotalErrors.WithLabelValues(u.NetworkID, u.ID).Inc()
+}
+
+func (u *Upstream) routeScorer(apiPath string, create bool) *ScoreTracker {
+	u.routeScoreMu.RLock()
+	scorer := u.routeScorers[apiPath]
+	u.routeScoreMu.RUnlock()
+	if scorer != nil || !create || apiPath == "" {
+		return scorer
+	}
+
+	u.routeScoreMu.Lock()
+	defer u.routeScoreMu.Unlock()
+	if scorer = u.routeScorers[apiPath]; scorer != nil {
+		return scorer
+	}
+	scorer = NewScoreTracker(u.scorer.windowSize)
+	u.routeScorers[apiPath] = scorer
+	return scorer
 }
 
 // CBSuccess records a successful request; may close an open/half-open circuit.
