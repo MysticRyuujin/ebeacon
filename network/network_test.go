@@ -1988,6 +1988,71 @@ networks:
 	}
 }
 
+// TestNetwork_UseUpstreamHeaderBareClientType verifies that sending
+// X-EBEACON-Use-Upstream: lighthouse (no "client:" prefix) routes to upstreams
+// by client type, matching the behaviour of the path-based /lighthouse/eth/v1/...
+// selector.
+func TestNetwork_UseUpstreamHeaderBareClientType(t *testing.T) {
+	var lighthouseHits, tekuHits atomic.Int32
+	lh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lighthouseHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"version":"lighthouse"}}`))
+	}))
+	defer lh.Close()
+	teku := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tekuHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"version":"teku"}}`))
+	}))
+	defer teku.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, lh.URL, nil)
+	cfg.Networks[0].Upstreams = []config.UpstreamConfig{
+		{ID: "lh", URL: lh.URL},
+		{ID: "tk", URL: teku.URL},
+	}
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.Pool().ByID("lh").SetClientType("lighthouse")
+	n.Pool().ByID("tk").SetClientType("teku")
+
+	// Bare "lighthouse" header should route to the lighthouse upstream, not 503.
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+	req.Header.Set("X-Ebeacon-Use-Upstream", "lighthouse")
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d body %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "lighthouse") {
+		t.Fatalf("expected lighthouse response, got %q", rec.Body.String())
+	}
+	if lighthouseHits.Load() != 1 {
+		t.Fatalf("lighthouse hits: got %d want 1", lighthouseHits.Load())
+	}
+	if tekuHits.Load() != 0 {
+		t.Fatalf("teku hits: got %d want 0", tekuHits.Load())
+	}
+
+	// "client:lighthouse" explicit prefix should behave identically.
+	req2 := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+	req2.Header.Set("X-Ebeacon-Use-Upstream", "client:lighthouse")
+	rec2 := httptest.NewRecorder()
+	n.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("client: prefix status: got %d body %q", rec2.Code, rec2.Body.String())
+	}
+	if lighthouseHits.Load() != 2 {
+		t.Fatalf("lighthouse hits after client: prefix: got %d want 2", lighthouseHits.Load())
+	}
+}
+
 func gunzipString(t *testing.T, payload []byte) string {
 	t.Helper()
 	gr, err := gzip.NewReader(bytes.NewReader(payload))

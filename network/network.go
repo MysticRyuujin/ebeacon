@@ -533,6 +533,15 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var requiredSelector requiredUpstreamSelector
 	if directive != "" {
 		requiredSelector = requiredSelectorFromValue(directive)
+		// Bare known client-type names (e.g. "lighthouse") should behave
+		// identically to the "client:lighthouse" prefix and to the path-based
+		// /lighthouse/eth/v1/... selector. Promote to a client-type selector
+		// only when the pool actually has upstreams of that type, matching the
+		// pool-aware logic in inferClientSelectorPath.
+		if requiredSelector.upstreamID != "" && isKnownClientType(requiredSelector.upstreamID) &&
+			len(n.pool.SelectByClientType(strings.ToLower(requiredSelector.upstreamID), 1)) > 0 {
+			requiredSelector = requiredUpstreamSelector{clientType: strings.ToLower(requiredSelector.upstreamID)}
+		}
 		cacheScope = requiredSelector.label()
 	} else if ruleHit && ruleUpstream != "" {
 		preferID = ruleUpstream
