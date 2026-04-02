@@ -258,6 +258,119 @@ networks:
 	}
 }
 
+func TestNetwork_Healthz_ClientScoped(t *testing.T) {
+	// Two upstreams: one teku (healthy), one lighthouse (down).
+	// /teku/healthz should report only the teku upstream.
+	id := netID(t)
+	cfg := mustCfgText(t, fmt.Sprintf(`logLevel: error
+server: { host: "127.0.0.1", port: 5555, maxTimeout: 30s }
+failsafe: { timeout: { duration: 10s } }
+health: { checkInterval: 1h, finalityInterval: 1h, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: %s
+    upstreams:
+      - id: teku-1
+        url: "http://127.0.0.1:1"
+      - id: lighthouse-1
+        url: "http://127.0.0.1:2"
+    routing:
+      loadBalancing: round-robin
+      stickySession: false
+    cache:
+      enabled: false
+`, id))
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range n.Pool().All() {
+		switch u.ID {
+		case "teku-1":
+			u.SetClientType(upstream.ClientTeku)
+			u.SetHealth(upstream.HealthUp)
+		case "lighthouse-1":
+			u.SetClientType(upstream.ClientLighthouse)
+			u.SetHealth(upstream.HealthDown)
+		}
+	}
+
+	// /teku/healthz → scoped to teku upstream (healthy)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/teku/healthz", nil)
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("teku healthz: got %d body %q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != `{"status":"ok","upstreams":1,"healthy":1,"degraded":0,"down":0}` {
+		t.Fatalf("teku body: got %q", got)
+	}
+
+	// /lighthouse/healthz → scoped to lighthouse upstream (down)
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "/lighthouse/healthz", nil)
+	n.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusServiceUnavailable {
+		t.Fatalf("lighthouse healthz: got %d body %q", rec2.Code, rec2.Body.String())
+	}
+	if got := rec2.Body.String(); got != `{"status":"down","upstreams":1,"healthy":0,"degraded":0,"down":1}` {
+		t.Fatalf("lighthouse body: got %q", got)
+	}
+}
+
+func TestNetwork_Healthz_ClientRoute(t *testing.T) {
+	// Client route configured via clientRoutes: /a/ → upstream "a".
+	id := netID(t)
+	cfg := mustCfgText(t, fmt.Sprintf(`logLevel: error
+server: { host: "127.0.0.1", port: 5555, maxTimeout: 30s }
+failsafe: { timeout: { duration: 10s } }
+health: { checkInterval: 1h, finalityInterval: 1h, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: %s
+    upstreams:
+      - id: a
+        url: "http://127.0.0.1:1"
+      - id: b
+        url: "http://127.0.0.1:2"
+    routing:
+      loadBalancing: round-robin
+      stickySession: false
+      clientRoutes:
+        - pathPrefix: "/a/"
+          upstreamId: a
+    cache:
+      enabled: false
+`, id))
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range n.Pool().All() {
+		switch u.ID {
+		case "a":
+			u.SetHealth(upstream.HealthDegraded)
+		case "b":
+			u.SetHealth(upstream.HealthUp)
+		}
+	}
+
+	// /a/healthz → scoped to upstream "a" (degraded)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/a/healthz", nil)
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a healthz: got %d body %q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != `{"status":"degraded","upstreams":1,"healthy":0,"degraded":1,"down":0}` {
+		t.Fatalf("a body: got %q", got)
+	}
+}
+
 func TestNetwork_AllUpstreamsFail_502(t *testing.T) {
 	// Nothing listens on this port in practice for the test host.
 	badURL := "http://127.0.0.1:1"

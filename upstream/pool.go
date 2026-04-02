@@ -372,6 +372,37 @@ func (p *Pool) HealthCounts() (total, up, degraded, down int) {
 	return
 }
 
+// HealthCountsForSelector returns total, up, degraded, and down counts for
+// upstreams matching selector. Same selector format as NodeHealthStatusForSelector.
+func (p *Pool) HealthCountsForSelector(selector string) (total, up, degraded, down int) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, u := range p.upstreams {
+		var match bool
+		switch {
+		case strings.HasPrefix(selector, "client:"):
+			match = u.ClientType() == strings.TrimPrefix(selector, "client:")
+		case strings.ContainsAny(selector, "*?["):
+			match, _ = path.Match(selector, u.ID)
+		default:
+			match = u.ID == selector
+		}
+		if !match {
+			continue
+		}
+		total++
+		switch u.Health() {
+		case HealthUp:
+			up++
+		case HealthDegraded:
+			degraded++
+		default:
+			down++
+		}
+	}
+	return
+}
+
 // FinalizedSlot returns the highest finalized slot seen across all upstreams.
 // Ethereum's beacon chain organises time into epochs of exactly 32 slots each.
 // The last slot of epoch N is epoch*32 + 31. Any block at or before this slot
