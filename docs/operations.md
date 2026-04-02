@@ -70,11 +70,47 @@ Score-routing visibility metrics include:
 
 `logLevel` supports `debug`, `info`, `warn`, `error`.
 
+Optional failure debug logging writes structured JSON events to a rotating file:
+
+```yaml
+debugLogging:
+  enabled: true
+  path: "/logs/ebeacon-debug.log"
+  maxSizeMB: 100
+  maxBackups: 10
+  maxBodyBytes: 65536
+```
+
+These events include sanitized request headers, truncated request/response body previews, upstream ID, status, duration, and any proxy error string.
+
+If you run eBeacon in Docker, mount a writable directory or volume at `/logs`. The image runs as a non-root user, so the mounted directory must be writable by the container user.
+
 For troubleshooting:
 
 - use `debug` in staging for route/failsafe behavior visibility
 - use `info` in production by default
 - increase to `warn`/`error` only when you need quieter logs
+
+## Profiling
+
+Enable the pprof debug server in config:
+
+```yaml
+pprof:
+  enabled: true
+  host: \"0.0.0.0\"   # use 0.0.0.0 inside containers
+  port: 6060
+```
+
+Then collect profiles with standard Go tooling:
+
+```bash
+go tool pprof http://localhost:6060/debug/pprof/heap
+go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
+curl http://localhost:6060/debug/pprof/goroutine?debug=2
+```
+
+The reliability test script (`scripts/reliability/`) can capture periodic pprof snapshots automatically.
 
 ## Reliability Tuning
 

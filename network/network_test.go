@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/ebeacon/ebeacon/config"
+	"github.com/ebeacon/ebeacon/debuglog"
 	"github.com/ebeacon/ebeacon/upstream"
 )
 
@@ -137,6 +138,136 @@ func TestNetwork_Forward_OK(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-Ebeacon-Upstream"); got != ObfuscateUpstreamID("u1") {
 		t.Fatalf("X-Ebeacon-Upstream: got %q", got)
+	}
+}
+
+func TestShouldTreatStatusAsPathError(t *testing.T) {
+	tests := []struct {
+		name       string
+		apiPath    string
+		statusCode int
+		want       bool
+	}{
+		{name: "rewards 404", apiPath: "/eth/v1/beacon/rewards/attestations/{epoch}", statusCode: http.StatusNotFound, want: true},
+		{name: "blob sidecars 405", apiPath: "/eth/v1/beacon/blob_sidecars/{block_id}", statusCode: http.StatusMethodNotAllowed, want: true},
+		{name: "regular endpoint 404", apiPath: "/eth/v1/node/version", statusCode: http.StatusNotFound, want: false},
+		{name: "rewards 500", apiPath: "/eth/v1/beacon/rewards/blocks/{block_id}", statusCode: http.StatusInternalServerError, want: false},
+	}
+
+	for _, tt := range tests {
+		if got := shouldTreatStatusAsPathError(tt.apiPath, tt.statusCode); got != tt.want {
+			t.Fatalf("%s: got %t want %t", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestNetwork_DebugLogging_LogsSwallowedUpstream500(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"upstream boom"}`))
+	}))
+	defer up.Close()
+
+	logPath := filepath.Join(t.TempDir(), "debug.log")
+	logger, closer, err := debuglog.New(config.DebugLoggingConfig{
+		Enabled:      true,
+		Path:         logPath,
+		MaxSizeMB:    1,
+		MaxBackups:   1,
+		MaxBodyBytes: 4096,
+	})
+	if err != nil {
+		t.Fatalf("debuglog.New: %v", err)
+	}
+	defer closer.Close() //nolint:errcheck
+	prev := debuglog.SetDefault(logger)
+	defer debuglog.SetDefault(prev)
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version?secret=shh", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status: got %d body %q", rec.Code, rec.Body.String())
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	logged := string(data)
+	if !strings.Contains(logged, `"kind":"upstream_attempt_failed"`) {
+		t.Fatalf("expected upstream_attempt_failed log entry, got %s", logged)
+	}
+	if !strings.Contains(logged, `upstream boom`) {
+		t.Fatalf("expected upstream response body in log, got %s", logged)
+	}
+	if strings.Contains(logged, `secret-token`) {
+		t.Fatalf("authorization header was not redacted: %s", logged)
+	}
+	if strings.Contains(logged, `secret=shh`) {
+		t.Fatalf("query secret was not redacted: %s", logged)
+	}
+}
+
+func TestNetwork_EffectiveFailsafe_ValidatorOverrideMatchesCollectionAndItem(t *testing.T) {
+	id := netID(t)
+	cfg := mustCfgText(t, fmt.Sprintf(`logLevel: error
+server: { host: "127.0.0.1", port: 5555, maxTimeout: 300s }
+failsafe:
+  timeout: { duration: 30s }
+  retry: { maxAttempts: 3, delay: 100ms, backoff: 2.0, jitter: 50ms, maxDelay: 5s }
+  hedge: { delay: 500ms, maxCount: 1 }
+health: { checkInterval: 1h, finalityInterval: 1h, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: %s
+    upstreams:
+      - id: u1
+        url: "http://127.0.0.1:5052"
+    failsafeOverrides:
+      - pathPattern: "^/eth/v1/beacon/states/[^/]+/validators(?:/[^/]+)?$"
+        methods: [GET]
+        failsafe:
+          timeout: { duration: 300s }
+          retry: { maxAttempts: 2 }
+          hedge: { maxCount: 0 }
+    routing:
+      loadBalancing: round-robin
+      stickySession: false
+    cache:
+      enabled: false
+`, id))
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{
+		"/eth/v1/beacon/states/head/validators",
+		"/eth/v1/beacon/states/14027359/validators/1",
+	} {
+		fs := n.effectiveFailsafe(http.MethodGet, path)
+		if fs.Timeout == nil || fs.Timeout.Duration != 300*time.Second {
+			t.Fatalf("timeout for %s: got %#v", path, fs.Timeout)
+		}
+		if fs.Retry == nil || fs.Retry.MaxAttempts != 2 {
+			t.Fatalf("retry for %s: got %#v", path, fs.Retry)
+		}
+		if fs.Hedge == nil || fs.Hedge.MaxCount != 0 {
+			t.Fatalf("hedge for %s: got %#v", path, fs.Hedge)
+		}
 	}
 }
 
@@ -415,6 +546,33 @@ func TestEffectiveCacheTTL_FinalizedSlot(t *testing.T) {
 	ttl2 := n.effectiveCacheTTL(time.Minute, "/eth/v2/beacon/blocks/999999999")
 	if ttl2 != time.Minute {
 		t.Fatalf("expected policy TTL for non-finalized slot, got %v", ttl2)
+	}
+}
+
+func TestEffectiveCacheTTL_FinalizedEpoch(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n.pool.UpdateFinalizedEpoch(100)
+
+	ttl := n.effectiveCacheTTL(30*time.Second, "/eth/v1/beacon/rewards/attestations/99")
+	if ttl != 0 {
+		t.Fatalf("expected forever (0) for finalized epoch rewards, got %v", ttl)
+	}
+
+	ttl2 := n.effectiveCacheTTL(30*time.Second, "/eth/v1/validator/duties/proposer/101")
+	if ttl2 != 30*time.Second {
+		t.Fatalf("expected policy TTL for non-finalized epoch, got %v", ttl2)
 	}
 }
 

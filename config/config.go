@@ -13,7 +13,9 @@ import (
 
 type Config struct {
 	LogLevel       string             `yaml:"logLevel"`
+	DebugLogging   DebugLoggingConfig `yaml:"debugLogging"`
 	Server         ServerConfig       `yaml:"server"`
+	Pprof          PprofConfig        `yaml:"pprof"`
 	CORS           *CORSConfig        `yaml:"cors"`
 	Auth           *AuthConfig        `yaml:"auth"`         // optional global auth for network routes
 	Networks       []NetworkConfig    `yaml:"networks"`     // top-level network routing
@@ -24,6 +26,13 @@ type Config struct {
 	Metrics        MetricsConfig      `yaml:"metrics"`
 	State          StateConfig        `yaml:"state"`
 	UI             UIConfig           `yaml:"ui"`
+}
+
+// PprofConfig controls the optional pprof debug HTTP server.
+type PprofConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Host    string `yaml:"host"` // default "127.0.0.1"
+	Port    int    `yaml:"port"` // default 6060
 }
 
 // AuthConfig supports secret-based authentication with optional named API keys.
@@ -57,6 +66,14 @@ type ServerConfig struct {
 	Port       int           `yaml:"port"`
 	MaxTimeout time.Duration `yaml:"maxTimeout"`
 	EnableGzip *bool         `yaml:"enableGzip"` // nil = true
+}
+
+type DebugLoggingConfig struct {
+	Enabled      bool   `yaml:"enabled"`
+	Path         string `yaml:"path"`
+	MaxSizeMB    int    `yaml:"maxSizeMB"`
+	MaxBackups   int    `yaml:"maxBackups"`
+	MaxBodyBytes int    `yaml:"maxBodyBytes"`
 }
 
 type CORSConfig struct {
@@ -343,6 +360,7 @@ func (c *Config) applyDefaults() {
 	if c.Server.MaxTimeout == 0 {
 		c.Server.MaxTimeout = 60 * time.Second
 	}
+	applyDebugLoggingDefaults(&c.DebugLogging)
 	if c.Health.CheckInterval == 0 {
 		c.Health.CheckInterval = 15 * time.Second
 	}
@@ -400,6 +418,18 @@ func applyCORSDefaults(cors *CORSConfig) {
 	}
 }
 
+func applyDebugLoggingDefaults(dl *DebugLoggingConfig) {
+	if dl.MaxSizeMB == 0 {
+		dl.MaxSizeMB = 100
+	}
+	if dl.MaxBackups == 0 {
+		dl.MaxBackups = 10
+	}
+	if dl.MaxBodyBytes == 0 {
+		dl.MaxBodyBytes = 64 << 10
+	}
+}
+
 func applyNetworkDefaults(n *NetworkConfig) {
 	if n.Routing.LoadBalancing == "" {
 		n.Routing.LoadBalancing = "round-robin"
@@ -452,6 +482,9 @@ func (c *Config) expandSecrets() {
 
 	expandAuthConfig(c.Auth)
 	expandAuthConfig(c.UI.Auth)
+	if c.DebugLogging.Path != "" {
+		c.DebugLogging.Path = os.ExpandEnv(c.DebugLogging.Path)
+	}
 
 	if c.State.Redis != nil && c.State.Redis.Password != "" {
 		c.State.Redis.Password = os.ExpandEnv(c.State.Redis.Password)
@@ -580,6 +613,9 @@ func (c *Config) validate() error {
 	if err := validateServer(c.Server); err != nil {
 		return err
 	}
+	if err := validateDebugLogging(c.DebugLogging); err != nil {
+		return err
+	}
 	if err := validateCORS(c.CORS); err != nil {
 		return err
 	}
@@ -640,6 +676,25 @@ func validateServer(s ServerConfig) error {
 	}
 	if s.MaxTimeout <= 0 {
 		return fmt.Errorf("server.maxTimeout must be > 0")
+	}
+	return nil
+}
+
+func validateDebugLogging(dl DebugLoggingConfig) error {
+	if !dl.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(dl.Path) == "" {
+		return fmt.Errorf("debugLogging.path is required when debugLogging.enabled is true")
+	}
+	if dl.MaxSizeMB <= 0 {
+		return fmt.Errorf("debugLogging.maxSizeMB must be > 0")
+	}
+	if dl.MaxBackups <= 0 {
+		return fmt.Errorf("debugLogging.maxBackups must be > 0")
+	}
+	if dl.MaxBodyBytes <= 0 {
+		return fmt.Errorf("debugLogging.maxBodyBytes must be > 0")
 	}
 	return nil
 }

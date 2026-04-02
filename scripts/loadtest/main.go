@@ -9,10 +9,12 @@
 //
 //	EBEACON_BASE       — base URL including network prefix, e.g. http://host:port/mainnet
 //	EBEACON_AUTH       — Bearer token value (sent as "Authorization: Bearer <value>")
+//	EBEACON_API_KEY    — value sent as "X-API-Key" header
 //	CONCURRENCY        — parallel HTTP workers (default 30)
-//	SSE_WORKERS        — parallel SSE streaming workers (default 5)
+//	SSE_WORKERS        — parallel SSE streaming workers (default 1)
 //	DURATION           — seconds each worker runs (default 120)
-//	ERROR_PCT          — share of requests hitting a bogus path (default 15)
+//	ERROR_PCT          — share of requests hitting a bogus path (default 0)
+//	REQUEST_TIMEOUT    — per-request HTTP timeout in seconds (default 60)
 //	REPORT_INTERVAL    — seconds between progress prints (default 10)
 package main
 
@@ -41,30 +43,36 @@ import (
 type config struct {
 	base           string
 	auth           string
+	apiKey         string
 	concurrency    int
 	sseWorkers     int
 	duration       time.Duration
 	errorPct       int
+	requestTimeout time.Duration
 	reportInterval time.Duration
 }
 
 func loadConfig() config {
 	base := flag.String("base", "http://127.0.0.1:5555/mainnet", "eBeacon base URL including network prefix")
 	auth := flag.String("auth", "", "Bearer token for Authorization header")
+	apiKey := flag.String("api-key", "", "value for X-API-Key header")
 	concurrency := flag.Int("concurrency", 30, "parallel HTTP workers")
-	sseWorkers := flag.Int("sse-workers", 5, "parallel SSE streaming workers")
+	sseWorkers := flag.Int("sse-workers", 1, "parallel SSE streaming workers")
 	duration := flag.Int("duration", 120, "seconds to run")
-	errorPct := flag.Int("error-pct", 15, "percentage of requests sent to invalid paths")
+	errorPct := flag.Int("error-pct", 0, "percentage of requests sent to invalid paths")
+	requestTimeout := flag.Int("request-timeout", 60, "per-request HTTP timeout in seconds")
 	reportInterval := flag.Int("report-interval", 10, "seconds between progress reports")
 	flag.Parse()
 
 	cfg := config{
 		base:           *base,
 		auth:           *auth,
+		apiKey:         *apiKey,
 		concurrency:    *concurrency,
 		sseWorkers:     *sseWorkers,
 		duration:       time.Duration(*duration) * time.Second,
 		errorPct:       *errorPct,
+		requestTimeout: time.Duration(*requestTimeout) * time.Second,
 		reportInterval: time.Duration(*reportInterval) * time.Second,
 	}
 
@@ -74,6 +82,9 @@ func loadConfig() config {
 	}
 	if v := os.Getenv("EBEACON_AUTH"); v != "" {
 		cfg.auth = v
+	}
+	if v := os.Getenv("EBEACON_API_KEY"); v != "" {
+		cfg.apiKey = v
 	}
 	if v := os.Getenv("CONCURRENCY"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -93,6 +104,11 @@ func loadConfig() config {
 	if v := os.Getenv("ERROR_PCT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.errorPct = n
+		}
+	}
+	if v := os.Getenv("REQUEST_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.requestTimeout = time.Duration(n) * time.Second
 		}
 	}
 	if v := os.Getenv("REPORT_INTERVAL"); v != "" {
@@ -115,6 +131,25 @@ const (
 	methodHEAD method = "HEAD"
 )
 
+const (
+	endpointHeadersByBlockID     = "/eth/v1/beacon/headers/{block_id}"
+	endpointBlocksV2ByBlockID    = "/eth/v2/beacon/blocks/{block_id}"
+	endpointBlockRootByBlockID   = "/eth/v1/beacon/blocks/{block_id}/root"
+	endpointStateValidator       = "/eth/v1/beacon/states/{state_id}/validators/{validator_id}"
+	endpointBeaconBlobs          = "/eth/v1/beacon/blobs/{block_id}"
+	endpointNodeSyncing          = "/eth/v1/node/syncing"
+	endpointEvents               = "/eth/v1/events"
+	endpointHeadersList          = "/eth/v1/beacon/headers"
+	endpointConfigSpec           = "/eth/v1/config/spec"
+	endpointFinalityCheckpoints  = "/eth/v1/beacon/states/{state_id}/finality_checkpoints"
+	endpointRewardsSyncCommittee = "/eth/v1/beacon/rewards/sync_committee/{block_id}"
+	endpointNodeVersion          = "/eth/v1/node/version"
+	endpointRewardsBlocks        = "/eth/v1/beacon/rewards/blocks/{block_id}"
+	endpointRewardsAttestations  = "/eth/v1/beacon/rewards/attestations/{epoch}"
+	endpointBeaconBlobSidecars   = "/eth/v1/beacon/blob_sidecars/{block_id}"
+	endpointNodeHealth           = "/eth/v1/node/health"
+)
+
 type endpoint struct {
 	name   string
 	method method
@@ -128,6 +163,7 @@ type endpoint struct {
 type chainState struct {
 	headSlot       uint64
 	finalizedEpoch uint64
+	finalizedSlot  uint64
 	// prevEpoch is finalizedEpoch-1, used for duties endpoints so the epoch is
 	// guaranteed to be in the past and fully computed by the node.
 	prevEpoch uint64
@@ -135,7 +171,7 @@ type chainState struct {
 
 // fetchChainState queries the beacon node for its current head slot and
 // finalized epoch so that slot/epoch-parameterised endpoints use real values.
-func fetchChainState(ctx context.Context, baseURL string, auth string) (chainState, error) {
+func fetchChainState(ctx context.Context, baseURL string, auth string, apiKey string) (chainState, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	doGet := func(path string) ([]byte, error) {
@@ -146,6 +182,9 @@ func fetchChainState(ctx context.Context, baseURL string, auth string) (chainSta
 		req.Header.Set("Accept", "application/json")
 		if auth != "" {
 			req.Header.Set("Authorization", "Bearer "+auth)
+		}
+		if apiKey != "" {
+			req.Header.Set("X-API-Key", apiKey)
 		}
 		resp, err := client.Do(req)
 		if err != nil {
@@ -200,85 +239,55 @@ func fetchChainState(ctx context.Context, baseURL string, auth string) (chainSta
 	if prev > 1 {
 		prev--
 	}
-	return chainState{headSlot: headSlot, finalizedEpoch: finalizedEpoch, prevEpoch: prev}, nil
+	return chainState{
+		headSlot:       headSlot,
+		finalizedEpoch: finalizedEpoch,
+		finalizedSlot:  finalizedEpoch*32 + 31,
+		prevEpoch:      prev,
+	}, nil
 }
 
-// buildEndpoints constructs the endpoint list using live chain state values
-// so slot/epoch-parameterised paths resolve to real data on the node.
+// buildEndpoints constructs a RealWorld route mix that tracks observed public Beacon API
+// traffic. SSE is modeled separately via sseWorkers, so the HTTP weights below
+// intentionally exclude /eth/v1/events.
 func buildEndpoints(cs chainState) []endpoint {
-	epoch := strconv.FormatUint(cs.prevEpoch, 10)
-	slot := strconv.FormatUint(cs.headSlot-1, 10) // one slot behind head = finalized
+	finalizedSlot := strconv.FormatUint(cs.finalizedSlot, 10)
+	prevEpoch := strconv.FormatUint(cs.prevEpoch, 10)
 
 	return []endpoint{
-		// ── node / info ──────────────────────────────────────────────────────────
-		{name: "node/version", method: methodGET, path: "/eth/v1/node/version", weight: 5},
-		{name: "node/syncing", method: methodGET, path: "/eth/v1/node/syncing", weight: 4},
-		{name: "node/peer_count", method: methodGET, path: "/eth/v1/node/peer_count", weight: 4},
-		{name: "node/peers", method: methodGET, path: "/eth/v1/node/peers", weight: 2},
-		{name: "node/health", method: methodGET, path: "/eth/v1/node/health", weight: 3},
-		{name: "node/identity", method: methodGET, path: "/eth/v1/node/identity", weight: 2},
+		{name: endpointHeadersByBlockID, method: methodGET, path: "/eth/v1/beacon/headers/head", weight: 20},
+		{name: endpointHeadersByBlockID, method: methodGET, path: "/eth/v1/beacon/headers/finalized", weight: 6},
+		{name: endpointHeadersByBlockID, method: methodGET, path: "/eth/v1/beacon/headers/" + finalizedSlot, weight: 6},
 
-		// ── config ───────────────────────────────────────────────────────────────
-		{name: "config/spec", method: methodGET, path: "/eth/v1/config/spec", weight: 2},
-		{name: "config/genesis", method: methodGET, path: "/eth/v1/config/genesis", weight: 2},
-		{name: "config/fork_schedule", method: methodGET, path: "/eth/v1/config/fork_schedule", weight: 2},
-		{name: "config/deposit_contract", method: methodGET, path: "/eth/v1/config/deposit_contract", weight: 1},
+		{name: endpointBlocksV2ByBlockID, method: methodGET, path: "/eth/v2/beacon/blocks/head", weight: 14},
+		{name: endpointBlocksV2ByBlockID, method: methodGET, path: "/eth/v2/beacon/blocks/finalized", weight: 4},
+		{name: endpointBlocksV2ByBlockID, method: methodGET, path: "/eth/v2/beacon/blocks/" + finalizedSlot, weight: 4},
 
-		// ── beacon genesis ───────────────────────────────────────────────────────
-		{name: "beacon/genesis", method: methodGET, path: "/eth/v1/beacon/genesis", weight: 2},
+		{name: endpointBlockRootByBlockID, method: methodGET, path: "/eth/v1/beacon/blocks/head/root", weight: 8},
+		{name: endpointBlockRootByBlockID, method: methodGET, path: "/eth/v1/beacon/blocks/finalized/root", weight: 2},
+		{name: endpointBlockRootByBlockID, method: methodGET, path: "/eth/v1/beacon/blocks/" + finalizedSlot + "/root", weight: 2},
 
-		// ── beacon states ────────────────────────────────────────────────────────
-		{name: "beacon/states/head/root", method: methodGET, path: "/eth/v1/beacon/states/head/root", weight: 4},
-		{name: "beacon/states/head/fork", method: methodGET, path: "/eth/v1/beacon/states/head/fork", weight: 3},
-		{name: "beacon/states/head/finality_checkpoints", method: methodGET, path: "/eth/v1/beacon/states/head/finality_checkpoints", weight: 3},
-		{name: "beacon/states/finalized/root", method: methodGET, path: "/eth/v1/beacon/states/finalized/root", weight: 2},
-		{name: "beacon/states/finalized/finality_checkpoints", method: methodGET, path: "/eth/v1/beacon/states/finalized/finality_checkpoints", weight: 2},
-		{name: "beacon/states/slot/root", method: methodGET, path: "/eth/v1/beacon/states/" + slot + "/root", weight: 1},
+		// Full validator set queries are excluded — they return ~1M entries on
+		// mainnet and routinely exceed any practical loadtest duration.
 
-		// ── beacon blocks ────────────────────────────────────────────────────────
-		{name: "beacon/headers", method: methodGET, path: "/eth/v1/beacon/headers", weight: 4},
-		{name: "beacon/headers/head", method: methodGET, path: "/eth/v1/beacon/headers/head", weight: 4},
-		{name: "beacon/blocks/head/root", method: methodGET, path: "/eth/v1/beacon/blocks/head/root", weight: 4},
-		{name: "beacon/blocks/head/attestations", method: methodGET, path: "/eth/v1/beacon/blocks/head/attestations", weight: 2},
-		{name: "beacon/blinded_blocks/head (v2)", method: methodGET, path: "/eth/v2/beacon/blinded_blocks/head", weight: 1},
-		{name: "beacon/blocks/slot", method: methodGET, path: "/eth/v2/beacon/blocks/" + slot, weight: 1},
+		{name: endpointStateValidator, method: methodGET, path: "/eth/v1/beacon/states/head/validators/1", weight: 3},
+		{name: endpointStateValidator, method: methodGET, path: "/eth/v1/beacon/states/finalized/validators/1", weight: 2},
+		{name: endpointStateValidator, method: methodGET, path: "/eth/v1/beacon/states/" + finalizedSlot + "/validators/1", weight: 1},
 
-		// ── mempool / pool ────────────────────────────────────────────────────────
-		{name: "beacon/pool/attestations", method: methodGET, path: "/eth/v1/beacon/pool/attestations", weight: 3},
-		{name: "beacon/pool/attester_slashings", method: methodGET, path: "/eth/v1/beacon/pool/attester_slashings", weight: 1},
-		{name: "beacon/pool/proposer_slashings", method: methodGET, path: "/eth/v1/beacon/pool/proposer_slashings", weight: 1},
-		{name: "beacon/pool/voluntary_exits", method: methodGET, path: "/eth/v1/beacon/pool/voluntary_exits", weight: 1},
-		{name: "beacon/pool/bls_to_execution_changes", method: methodGET, path: "/eth/v1/beacon/pool/bls_to_execution_changes", weight: 1},
+		{name: endpointBeaconBlobs, method: methodGET, path: "/eth/v1/beacon/blobs/head", weight: 2},
+		{name: endpointBeaconBlobs, method: methodGET, path: "/eth/v1/beacon/blobs/finalized", weight: 1},
+		{name: endpointBeaconBlobs, method: methodGET, path: "/eth/v1/beacon/blobs/" + finalizedSlot, weight: 1},
 
-		// ── validator duties (POST with validator index list) ─────────────────────
-		{
-			name:   "validator/duties/attester (POST)",
-			method: methodPOST,
-			path:   "/eth/v1/validator/duties/attester/" + epoch,
-			body:   []string{"1", "2", "3", "100", "1000"},
-			weight: 3,
-		},
-		{
-			name:   "validator/duties/sync (POST)",
-			method: methodPOST,
-			path:   "/eth/v1/validator/duties/sync/" + epoch,
-			body:   []string{"1", "2", "3"},
-			weight: 2,
-		},
-		{name: "validator/duties/proposer", method: methodGET, path: "/eth/v1/validator/duties/proposer/" + epoch, weight: 2},
-
-		// ── HEAD requests (cache validation, staleness check) ────────────────────
-		{name: "HEAD node/version", method: methodHEAD, path: "/eth/v1/node/version", weight: 2},
-		{name: "HEAD beacon/genesis", method: methodHEAD, path: "/eth/v1/beacon/genesis", weight: 1},
-		{name: "HEAD config/spec", method: methodHEAD, path: "/eth/v1/config/spec", weight: 1},
-
-		// ── SSZ (application/octet-stream) ───────────────────────────────────────
-		// These hit the same paths as JSON variants but with a different Accept header
-		// so they exercise the separate SSZ cache key path.
-		{name: "beacon/blocks/head (SSZ)", method: methodGET, path: "/eth/v2/beacon/blocks/head", accept: "application/octet-stream", weight: 2},
-		{name: "beacon/blocks/slot (SSZ)", method: methodGET, path: "/eth/v2/beacon/blocks/" + slot, accept: "application/octet-stream", weight: 1},
-		{name: "beacon/blinded_blocks/head (SSZ)", method: methodGET, path: "/eth/v2/beacon/blinded_blocks/head", accept: "application/octet-stream", weight: 1},
-		{name: "beacon/headers/head (SSZ)", method: methodGET, path: "/eth/v1/beacon/headers/head", accept: "application/octet-stream", weight: 1},
+		{name: endpointNodeSyncing, method: methodGET, path: "/eth/v1/node/syncing", weight: 3},
+		{name: endpointHeadersList, method: methodGET, path: "/eth/v1/beacon/headers", weight: 2},
+		{name: endpointConfigSpec, method: methodGET, path: "/eth/v1/config/spec", weight: 1},
+		{name: endpointFinalityCheckpoints, method: methodGET, path: "/eth/v1/beacon/states/head/finality_checkpoints", weight: 1},
+		{name: endpointRewardsSyncCommittee, method: methodGET, path: "/eth/v1/beacon/rewards/sync_committee/" + finalizedSlot, weight: 1},
+		{name: endpointNodeVersion, method: methodGET, path: "/eth/v1/node/version", weight: 1},
+		{name: endpointRewardsBlocks, method: methodGET, path: "/eth/v1/beacon/rewards/blocks/" + finalizedSlot, weight: 1},
+		{name: endpointRewardsAttestations, method: methodGET, path: "/eth/v1/beacon/rewards/attestations/" + prevEpoch, weight: 1},
+		{name: endpointBeaconBlobSidecars, method: methodGET, path: "/eth/v1/beacon/blob_sidecars/" + finalizedSlot, weight: 1},
+		{name: endpointNodeHealth, method: methodGET, path: "/eth/v1/node/health", weight: 1},
 	}
 }
 
@@ -415,6 +424,9 @@ func buildRequest(ctx context.Context, cfg config, ep endpoint) (*http.Request, 
 	if cfg.auth != "" {
 		req.Header.Set("Authorization", "Bearer "+cfg.auth)
 	}
+	if cfg.apiKey != "" {
+		req.Header.Set("X-API-Key", cfg.apiKey)
+	}
 	return req, nil
 }
 
@@ -536,6 +548,9 @@ func sseWorker(ctx context.Context, cfg config, client *http.Client, topic strin
 			req.Header.Set("Cache-Control", "no-cache")
 			if cfg.auth != "" {
 				req.Header.Set("Authorization", "Bearer "+cfg.auth)
+			}
+			if cfg.apiKey != "" {
+				req.Header.Set("X-API-Key", cfg.apiKey)
 			}
 
 			resp, err := client.Do(req)
@@ -707,27 +722,27 @@ func printFinalReport(statMap map[string]*stats, mu *sync.RWMutex, ss *sseStats,
 func main() {
 	cfg := loadConfig()
 
-	fmt.Fprintf(os.Stderr, "eBeacon loadtest: base=%s concurrency=%d sse_workers=%d duration=%s error_pct=%d%%\n",
-		cfg.base, cfg.concurrency, cfg.sseWorkers, cfg.duration, cfg.errorPct)
+	fmt.Fprintf(os.Stderr, "eBeacon loadtest: base=%s concurrency=%d sse_workers=%d duration=%s error_pct=%d%% request_timeout=%s\n",
+		cfg.base, cfg.concurrency, cfg.sseWorkers, cfg.duration, cfg.errorPct, cfg.requestTimeout)
 
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.duration+5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.duration+cfg.requestTimeout)
 	defer cancel()
 
 	// Fetch live chain state so slot/epoch-parameterised endpoints use real values.
 	fmt.Fprintf(os.Stderr, "fetching chain state from %s ...\n", cfg.base)
-	cs, err := fetchChainState(ctx, cfg.base, cfg.auth)
+	cs, err := fetchChainState(ctx, cfg.base, cfg.auth, cfg.apiKey)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not fetch chain state (%v); epoch/slot endpoints may return 404\n", err)
 	} else {
-		fmt.Fprintf(os.Stderr, "chain state: head_slot=%d finalized_epoch=%d (using epoch=%d slot=%d for parameterised endpoints)\n",
-			cs.headSlot, cs.finalizedEpoch, cs.prevEpoch, cs.headSlot-1)
+		fmt.Fprintf(os.Stderr, "chain state: head_slot=%d finalized_epoch=%d finalized_slot=%d (using epoch=%d finalized slot for parameterised endpoints)\n",
+			cs.headSlot, cs.finalizedEpoch, cs.finalizedSlot, cs.prevEpoch)
 	}
 
 	endpoints := buildEndpoints(cs)
 
 	// Shared HTTP client for regular requests.
 	httpClient := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: cfg.requestTimeout,
 		Transport: &http.Transport{
 			MaxIdleConnsPerHost: cfg.concurrency + cfg.sseWorkers + 10,
 			IdleConnTimeout:     90 * time.Second,
@@ -788,11 +803,17 @@ func main() {
 		close(done)
 	}()
 
+	draining := false
 loop:
 	for {
 		select {
 		case <-ticker.C:
-			printProgress(statMap, &mu, ss, time.Since(start))
+			elapsed := time.Since(start)
+			printProgress(statMap, &mu, ss, elapsed)
+			if !draining && elapsed >= cfg.duration {
+				draining = true
+				fmt.Fprintf(os.Stderr, "\nduration reached, draining in-flight requests (timeout: %s)...\n\n", cfg.requestTimeout)
+			}
 		case <-done:
 			break loop
 		}

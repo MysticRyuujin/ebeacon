@@ -6,6 +6,20 @@ server:
   maxTimeout: 60s
   enableGzip: true  # gzip compression for client responses > 1KB (default true)
 
+# pprof exposes Go runtime profiling data on a separate HTTP server.
+# Useful for diagnosing memory leaks, goroutine stacks, and CPU hotspots.
+# pprof:
+#   enabled: true
+#   host: "127.0.0.1"   # default 127.0.0.1 (loopback only)
+#   port: 6060           # default 6060
+
+debugLogging:
+  enabled: false
+  path: "/logs/ebeacon-debug.log"  # mount a writable host dir or volume at /logs
+  maxSizeMB: 100
+  maxBackups: 10
+  maxBodyBytes: 65536               # request/response body preview cap per log entry
+
 # ── Global defaults ────────────────────────────────────────────────────────────
 # These apply to every network unless overridden at the network level.
 

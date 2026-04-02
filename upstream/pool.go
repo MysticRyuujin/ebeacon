@@ -110,11 +110,42 @@ func (p *Pool) effectiveScoreWeights() config.ScoreWeightsConfig {
 	return weights
 }
 
-func (p *Pool) scoreDetailsWithWeights(u *Upstream, canonicalSlot uint64, weights config.ScoreWeightsConfig) UpstreamScoreDetails {
+func (p *Pool) scoreDetailsWithWeights(u *Upstream, canonicalSlot uint64, weights config.ScoreWeightsConfig, apiPath string) UpstreamScoreDetails {
 	if u == nil {
 		return UpstreamScoreDetails{LoadBalancing: p.routing.LoadBalancing}
 	}
-	snapshot := u.ScoreSnapshot()
+	snapshot := u.ScoreSnapshotForPath(apiPath)
+	headSlot := u.HeadSlot()
+	var headLag uint64
+	if canonicalSlot > headSlot {
+		headLag = canonicalSlot - headSlot
+	}
+	syncDistance := u.SyncDistance()
+	return UpstreamScoreDetails{
+		LoadBalancing: p.routing.LoadBalancing,
+		Score: calculateScore(
+			weights.ErrorRate,
+			weights.Latency,
+			weights.HeadLag,
+			weights.SyncDistance,
+			snapshot.ErrorRate,
+			snapshot.P90Latency,
+			headLag,
+			syncDistance,
+		),
+		ErrorRate:    snapshot.ErrorRate,
+		P90Latency:   snapshot.P90Latency,
+		HeadLag:      headLag,
+		SyncDistance: syncDistance,
+		Samples:      snapshot.Samples,
+	}
+}
+
+func (p *Pool) rawPathScoreDetailsWithWeights(u *Upstream, canonicalSlot uint64, weights config.ScoreWeightsConfig, apiPath string) UpstreamScoreDetails {
+	if u == nil {
+		return UpstreamScoreDetails{LoadBalancing: p.routing.LoadBalancing}
+	}
+	snapshot := u.PathScoreSnapshot(apiPath)
 	headSlot := u.HeadSlot()
 	var headLag uint64
 	if canonicalSlot > headSlot {
@@ -151,7 +182,7 @@ func (p *Pool) setScoreMetrics(u *Upstream, details UpstreamScoreDetails) {
 
 // ScoreDetails returns the current score snapshot for one upstream.
 func (p *Pool) ScoreDetails(u *Upstream) UpstreamScoreDetails {
-	return p.scoreDetailsWithWeights(u, p.blockCache.MaxSlot(), p.effectiveScoreWeights())
+	return p.scoreDetailsWithWeights(u, p.blockCache.MaxSlot(), p.effectiveScoreWeights(), "")
 }
 
 // RefreshUpstreamScoreMetrics updates Prometheus gauges for one upstream.
@@ -159,8 +190,20 @@ func (p *Pool) RefreshUpstreamScoreMetrics(u *Upstream) {
 	if u == nil {
 		return
 	}
-	details := p.scoreDetailsWithWeights(u, p.blockCache.MaxSlot(), p.effectiveScoreWeights())
+	details := p.scoreDetailsWithWeights(u, p.blockCache.MaxSlot(), p.effectiveScoreWeights(), "")
 	p.setScoreMetrics(u, details)
+}
+
+// RefreshUpstreamPathScoreMetrics updates route-scoped Prometheus gauges for one upstream.
+func (p *Pool) RefreshUpstreamPathScoreMetrics(u *Upstream, apiPath string) {
+	if u == nil || apiPath == "" {
+		return
+	}
+	details := p.rawPathScoreDetailsWithWeights(u, p.blockCache.MaxSlot(), p.effectiveScoreWeights(), apiPath)
+	metricRoutingScoreByPath.WithLabelValues(p.networkID, u.ID, apiPath).Set(details.Score)
+	metricRoutingScoreErrorRateByPath.WithLabelValues(p.networkID, u.ID, apiPath).Set(details.ErrorRate)
+	metricRoutingScoreP90LatencyByPath.WithLabelValues(p.networkID, u.ID, apiPath).Set(details.P90Latency.Seconds())
+	metricRoutingScoreSamplesByPath.WithLabelValues(p.networkID, u.ID, apiPath).Set(float64(details.Samples))
 }
 
 // RefreshScoreMetrics updates Prometheus gauges for all upstreams in the pool.
@@ -168,7 +211,7 @@ func (p *Pool) RefreshScoreMetrics() {
 	weights := p.effectiveScoreWeights()
 	canonicalSlot := p.blockCache.MaxSlot()
 	for _, u := range p.All() {
-		p.setScoreMetrics(u, p.scoreDetailsWithWeights(u, canonicalSlot, weights))
+		p.setScoreMetrics(u, p.scoreDetailsWithWeights(u, canonicalSlot, weights, ""))
 	}
 }
 
@@ -201,6 +244,12 @@ func (p *Pool) ByID(id string) *Upstream {
 // Get returns a single upstream, preferring the one matching preferID if ready.
 // preferID may be an exact upstream ID or a glob pattern (e.g. *lighthouse*).
 func (p *Pool) Get(preferID string) (*Upstream, error) {
+	return p.GetForPath(preferID, "")
+}
+
+// GetForPath returns a single upstream, preferring the one matching preferID
+// if ready and otherwise using route-scoped score ordering when available.
+func (p *Pool) GetForPath(preferID, apiPath string) (*Upstream, error) {
 	if preferID != "" {
 		if strings.ContainsAny(preferID, "*?[") {
 			if u := p.ByGlob(preferID); u != nil && u.IsReady() {
@@ -210,7 +259,7 @@ func (p *Pool) Get(preferID string) (*Upstream, error) {
 			return u, nil
 		}
 	}
-	ups := p.Select(1)
+	ups := p.SelectForPath(apiPath, 1)
 	if len(ups) == 0 {
 		return nil, fmt.Errorf("no upstreams available for network %s", p.networkID)
 	}
@@ -220,6 +269,12 @@ func (p *Pool) Get(preferID string) (*Upstream, error) {
 // SelectByClientType returns up to n upstreams for a single client type,
 // ordered by the normal load-balancing policy and limited to that client set.
 func (p *Pool) SelectByClientType(clientType string, n int) []*Upstream {
+	return p.SelectByClientTypeForPath(clientType, "", n)
+}
+
+// SelectByClientTypeForPath returns up to n upstreams for a single client type,
+// ordered by the load-balancing policy using route-scoped score data when available.
+func (p *Pool) SelectByClientTypeForPath(clientType, apiPath string, n int) []*Upstream {
 	p.mu.RLock()
 	all := make([]*Upstream, 0, len(p.upstreams))
 	for _, u := range p.upstreams {
@@ -228,12 +283,18 @@ func (p *Pool) SelectByClientType(clientType string, n int) []*Upstream {
 		}
 	}
 	p.mu.RUnlock()
-	return p.selectFromCandidates(all, n)
+	return p.selectFromCandidatesForPath(all, n, apiPath)
 }
 
 // SelectByGlob returns up to n upstreams whose IDs match the glob pattern,
 // ordered by the normal load-balancing policy and limited to that match set.
 func (p *Pool) SelectByGlob(pattern string, n int) []*Upstream {
+	return p.SelectByGlobForPath(pattern, "", n)
+}
+
+// SelectByGlobForPath returns up to n upstreams whose IDs match the glob
+// pattern, using route-scoped score data when available.
+func (p *Pool) SelectByGlobForPath(pattern, apiPath string, n int) []*Upstream {
 	p.mu.RLock()
 	all := make([]*Upstream, 0, len(p.upstreams))
 	for _, u := range p.upstreams {
@@ -242,7 +303,7 @@ func (p *Pool) SelectByGlob(pattern string, n int) []*Upstream {
 		}
 	}
 	p.mu.RUnlock()
-	return p.selectFromCandidates(all, n)
+	return p.selectFromCandidatesForPath(all, n, apiPath)
 }
 
 // ByGlob returns the first ready upstream whose ID matches the glob pattern.
@@ -261,13 +322,19 @@ func (p *Pool) ByGlob(pattern string) *Upstream {
 // Select returns up to n ready upstreams ordered by the load-balancing policy.
 // Prefers upstreams on the canonical fork, then falls back to healthy-only, then all.
 func (p *Pool) Select(n int) []*Upstream {
+	return p.SelectForPath("", n)
+}
+
+// SelectForPath returns up to n ready upstreams ordered by the load-balancing policy.
+// Score-based routing uses route-scoped latency/error data when available.
+func (p *Pool) SelectForPath(apiPath string, n int) []*Upstream {
 	p.mu.RLock()
 	all := p.upstreams
 	p.mu.RUnlock()
-	return p.selectFromCandidates(all, n)
+	return p.selectFromCandidatesForPath(all, n, apiPath)
 }
 
-func (p *Pool) selectFromCandidates(all []*Upstream, n int) []*Upstream {
+func (p *Pool) selectFromCandidatesForPath(all []*Upstream, n int, apiPath string) []*Upstream {
 	// Prefer upstreams that are both healthy and on the canonical fork.
 	// Fall back progressively: canonical+ready → any ready → any healthy → all.
 	// The fallback chain ensures we always return something rather than dropping
@@ -294,7 +361,7 @@ func (p *Pool) selectFromCandidates(all []*Upstream, n int) []*Upstream {
 		candidates = allowed
 	}
 
-	ordered := p.order(candidates)
+	ordered := p.orderForPath(candidates, apiPath)
 	if n > len(ordered) {
 		n = len(ordered)
 	}
@@ -500,6 +567,16 @@ func newOrderRNG(seed uint64) *orderRNG {
 	if seed == 0 {
 		seed = 1 // xorshift64 must not be seeded with zero
 	}
+	// Mix the small monotonic request counter into a high-entropy 64-bit state.
+	// Raw xorshift seeded with 1,2,3... produces extremely small first outputs,
+	// which biases weighted selection toward the first upstream every time.
+	seed += 0x9e3779b97f4a7c15
+	seed = (seed ^ (seed >> 30)) * 0xbf58476d1ce4e5b9
+	seed = (seed ^ (seed >> 27)) * 0x94d049bb133111eb
+	seed ^= seed >> 31
+	if seed == 0 {
+		seed = 1
+	}
 	return &orderRNG{state: seed}
 }
 
@@ -614,13 +691,13 @@ func (p *Pool) weightedRandomWithinPriority(ups []*Upstream, rng *orderRNG) []*U
 	return weightedOrderWithoutReplacement(ups, rng, func(*Upstream) float64 { return 1 })
 }
 
-func (p *Pool) weightedScoreWithinPriority(ups []*Upstream, canonicalSlot uint64, weights config.ScoreWeightsConfig, rng *orderRNG) []*Upstream {
+func (p *Pool) weightedScoreWithinPriority(ups []*Upstream, canonicalSlot uint64, weights config.ScoreWeightsConfig, rng *orderRNG, apiPath string) []*Upstream {
 	return weightedOrderWithoutReplacement(ups, rng, func(u *Upstream) float64 {
-		return p.scoreDetailsWithWeights(u, canonicalSlot, weights).Score
+		return p.scoreDetailsWithWeights(u, canonicalSlot, weights, apiPath).Score
 	})
 }
 
-func (p *Pool) order(ups []*Upstream) []*Upstream {
+func (p *Pool) orderForPath(ups []*Upstream, apiPath string) []*Upstream {
 	out := make([]*Upstream, len(ups))
 	copy(out, ups)
 
@@ -658,7 +735,7 @@ func (p *Pool) order(ups []*Upstream) []*Upstream {
 		canonSlot := p.blockCache.MaxSlot()
 		weights := p.effectiveScoreWeights()
 		p.reorderWithinPriority(out, func(sub []*Upstream) []*Upstream {
-			return p.weightedScoreWithinPriority(sub, canonSlot, weights, rng)
+			return p.weightedScoreWithinPriority(sub, canonSlot, weights, rng, apiPath)
 		})
 
 	default: // round-robin

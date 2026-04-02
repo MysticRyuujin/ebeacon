@@ -34,9 +34,11 @@ var defaultPolicies = []config.CachePolicy{
 
 	// ── node metadata ────────────────────────────────────────────────────────
 	{Pattern: `^/eth/v\d+/node/version$`, TTL: time.Hour},
+	{Pattern: `^/eth/v\d+/node/identity$`, TTL: time.Hour},
 	{Pattern: `^/eth/v\d+/node/peer_count$`, TTL: 15 * time.Second},
 	{Pattern: `^/eth/v\d+/node/peers`, TTL: 30 * time.Second},
 	{Pattern: `^/eth/v\d+/node/syncing$`, TTL: 5 * time.Second},
+	// node/health is intentionally uncached so liveness checks remain fresh.
 
 	// ── beacon blocks & headers ──────────────────────────────────────────────
 	// Numeric slot IDs are auto-promoted to TTL=0 once finalized.
@@ -47,12 +49,34 @@ var defaultPolicies = []config.CachePolicy{
 	{Pattern: `^/eth/v\d+/beacon/blocks/[^/]+/attestations$`, TTL: 12 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/blocks/`, TTL: 12 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/blinded_blocks/`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/blobs/`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/blob_sidecars/`, TTL: 12 * time.Second},
+
+	// ── beacon rewards ───────────────────────────────────────────────────────
+	// Block-scoped rewards become immutable once the referenced slot finalizes.
+	// Epoch-scoped rewards are promoted to TTL=0 once the epoch itself is finalized.
+	{Pattern: `^/eth/v\d+/beacon/rewards/blocks/[^/]+$`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/rewards/sync_committee/[^/]+$`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/rewards/attestations/[^/]+$`, TTL: 30 * time.Second},
 
 	// ── beacon state sub-resources ───────────────────────────────────────────
 	// root/fork/finality_checkpoints change at most once per slot (~12 s).
 	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/root$`, TTL: 12 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/fork$`, TTL: 12 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/finality_checkpoints$`, TTL: 12 * time.Second},
+	// Validator lookups dominate public read traffic; keep head-relative data short
+	// while finalized numeric state_ids auto-promote to permanent entries.
+	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/validators(?:/[^/]+)?$`, TTL: 6 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/validator_balances$`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/committees$`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/sync_committees$`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/pending_deposits$`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/pending_consolidations$`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/pending_partial_withdrawals$`, TTL: 12 * time.Second},
+
+	// ── validator duties ──────────────────────────────────────────────────────
+	// Proposer duties are epoch-scoped and become immutable once the epoch finalizes.
+	{Pattern: `^/eth/v\d+/validator/duties/proposer/[^/]+$`, TTL: 30 * time.Second},
 }
 
 // Entry holds a cached HTTP response.

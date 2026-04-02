@@ -15,6 +15,7 @@ import (
 
 	"github.com/ebeacon/ebeacon/api"
 	"github.com/ebeacon/ebeacon/config"
+	"github.com/ebeacon/ebeacon/debuglog"
 	networkpkg "github.com/ebeacon/ebeacon/network"
 	"github.com/ebeacon/ebeacon/proxy"
 	"github.com/ebeacon/ebeacon/state"
@@ -24,7 +25,6 @@ import (
 
 func main() {
 	configPath := flag.String("config", "ebeacon.yaml", "path to config file")
-	pprofAddr := flag.String("pprof", "", "address for pprof debug server (e.g. localhost:6060); disabled if empty")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -34,6 +34,19 @@ func main() {
 	}
 
 	setupLogging(cfg.LogLevel)
+	debugLogCloser, err := debuglog.ConfigureDefault(cfg.DebugLogging)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to set up debug logging: %v\n", err)
+		os.Exit(1)
+	}
+	if debugLogCloser != nil {
+		defer debugLogCloser.Close() //nolint:errcheck
+		slog.Info("debug logging enabled",
+			"path", cfg.DebugLogging.Path,
+			"max_size_mb", cfg.DebugLogging.MaxSizeMB,
+			"max_backups", cfg.DebugLogging.MaxBackups,
+			"max_body_bytes", cfg.DebugLogging.MaxBodyBytes)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -58,10 +71,19 @@ func main() {
 		slog.Info("shared state: local")
 	}
 
-	if *pprofAddr != "" {
+	if cfg.Pprof.Enabled {
+		host := cfg.Pprof.Host
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		port := cfg.Pprof.Port
+		if port == 0 {
+			port = 6060
+		}
+		pprofAddr := fmt.Sprintf("%s:%d", host, port)
 		go func() {
-			slog.Info("pprof debug server starting", "addr", *pprofAddr)
-			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+			slog.Info("pprof debug server starting", "addr", pprofAddr)
+			if err := http.ListenAndServe(pprofAddr, nil); err != nil {
 				slog.Warn("pprof server stopped", "err", err)
 			}
 		}()

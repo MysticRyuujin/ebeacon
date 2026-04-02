@@ -3,7 +3,7 @@
   "title": "eBeacon Overview",
   "tags": ["ebeacon", "prometheus"],
   "schemaVersion": 39,
-  "version": 3,
+  "version": 5,
   "refresh": "30s",
   "time": {
     "from": "now-6h",
@@ -95,6 +95,58 @@
         "regex": "",
         "hide": 0,
         "label": "API Key",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": ["All"],
+          "value": ["$__all"]
+        },
+        "options": []
+      },
+      {
+        "name": "method",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(ebeacon_requests_by_method_total{network=~\"$network\"}, method)",
+        "query": {
+          "query": "label_values(ebeacon_requests_by_method_total{network=~\"$network\"}, method)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "hide": 0,
+        "label": "Method",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": ["All"],
+          "value": ["$__all"]
+        },
+        "options": []
+      },
+      {
+        "name": "api_path",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(ebeacon_requests_by_path_total{network=~\"$network\"}, api_path)",
+        "query": {
+          "query": "label_values(ebeacon_requests_by_path_total{network=~\"$network\"}, api_path)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "hide": 0,
+        "label": "API Path",
         "multi": true,
         "includeAll": true,
         "allValue": ".*",
@@ -721,7 +773,7 @@
       "title": "Upstream health timeline",
       "description": "0=down, 1=degraded, 2=up per backend over time.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 45 },
+      "gridPos": { "h": 16, "w": 24, "x": 0, "y": 45 },
       "targets": [
         {
           "refId": "A",
@@ -751,7 +803,7 @@
         "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
         "mergeValues": true,
         "showValue": "never",
-        "rowHeight": 0.9
+        "rowHeight": 0.8
       }
     },
     {
@@ -759,7 +811,7 @@
       "type": "timeseries",
       "title": "Backend latency p90",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 45 },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 61 },
       "targets": [
         {
           "refId": "A",
@@ -783,7 +835,7 @@
       "id": 34,
       "type": "row",
       "title": "Chain Tip & Slot Distance",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 52 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 68 },
       "collapsed": false,
       "panels": []
     },
@@ -793,7 +845,7 @@
       "title": "Head slot per upstream",
       "description": "Current head slot reported by each upstream. A lagging line indicates an upstream falling behind the chain tip. Divergence between upstreams can cause inconsistent responses when not using sticky routing.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 53 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 69 },
       "targets": [
         {
           "refId": "A",
@@ -820,7 +872,7 @@
       "title": "Head → finalized slot distance per upstream",
       "description": "Slots between this upstream's current head and its latest finalized checkpoint (finalized_epoch * 32). Healthy value is 32–64 slots (1–2 epochs). Spikes indicate finality is stalling. All upstreams tracking the same value confirms consensus agreement.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 53 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 69 },
       "targets": [
         {
           "refId": "A",
@@ -855,7 +907,7 @@
       "title": "Upstream head slot divergence",
       "description": "max(head_slot) − min(head_slot) across all upstreams. Zero means all upstreams agree on the chain tip. Non-zero values mean some upstreams are ahead of others; during normal propagation this can be 1–2 slots.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 61 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 77 },
       "targets": [
         {
           "refId": "A",
@@ -891,7 +943,7 @@
       "title": "Finalized epoch per upstream",
       "description": "Latest finalized epoch per upstream. All upstreams should converge on the same value within a few seconds of each other. A stalled line here indicates a finality issue on that specific node.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 61 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 77 },
       "targets": [
         {
           "refId": "A",
@@ -918,7 +970,7 @@
       "title": "Backend sync distance",
       "description": "Slots behind the network head. 0 = fully synced. Any value >0 means the node is still catching up.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 69 },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 85 },
       "targets": [
         {
           "refId": "A",
@@ -950,7 +1002,7 @@
       "id": 12,
       "type": "row",
       "title": "Cache",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 76 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 92 },
       "collapsed": false,
       "panels": []
     },
@@ -959,7 +1011,7 @@
       "type": "timeseries",
       "title": "Cache hit / miss rate",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 77 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 93 },
       "targets": [
         {
           "refId": "A",
@@ -989,7 +1041,7 @@
       "type": "piechart",
       "title": "Cache hit vs miss share",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 77 },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 93 },
       "targets": [
         {
           "refId": "A",
@@ -1020,7 +1072,7 @@
       "title": "Cache size",
       "description": "Number of distinct cached URLs (LRU entry count, not bytes). Only 2xx responses are stored.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 77 },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 93 },
       "targets": [
         {
           "refId": "A",
@@ -1053,7 +1105,7 @@
       "type": "timeseries",
       "title": "Cache served (responses served from cache)",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 85 },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 101 },
       "targets": [
         {
           "refId": "A",
@@ -1077,7 +1129,7 @@
       "id": 25,
       "type": "row",
       "title": "Request Composition",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 92 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 108 },
       "collapsed": false,
       "panels": []
     },
@@ -1086,11 +1138,11 @@
       "type": "piechart",
       "title": "Method breakdown (req/s)",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 93 },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 109 },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (method) (rate(ebeacon_requests_by_method_total{network=~\"$network\"}[5m]))",
+          "expr": "sum by (method) (rate(ebeacon_requests_by_method_total{network=~\"$network\",method=~\"$method\"}[5m]))",
           "legendFormat": "{{method}}"
         }
       ],
@@ -1111,11 +1163,11 @@
       "type": "piechart",
       "title": "Status class breakdown (req/s)",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 93 },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 109 },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (status_class) (rate(ebeacon_requests_by_method_total{network=~\"$network\"}[5m]))",
+          "expr": "sum by (status_class) (rate(ebeacon_requests_by_method_total{network=~\"$network\",method=~\"$method\"}[5m]))",
           "legendFormat": "{{status_class}}"
         }
       ],
@@ -1137,23 +1189,23 @@
       "title": "Cache hit vs non-hit by method (req/s)",
       "description": "non-hit includes cache misses and bypasses (method/policy).",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 93 },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 109 },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (method) (rate(ebeacon_cache_requests_by_method_total{network=~\"$network\",cache_result=\"hit\"}[5m]))",
+          "expr": "sum by (method) (rate(ebeacon_cache_requests_by_method_total{network=~\"$network\",method=~\"$method\",cache_result=\"hit\"}[5m]))",
           "format": "table",
           "instant": true
         },
         {
           "refId": "B",
-          "expr": "sum by (method) (rate(ebeacon_cache_requests_by_method_total{network=~\"$network\",cache_result=~\"miss|bypass_.*\"}[5m]))",
+          "expr": "sum by (method) (rate(ebeacon_cache_requests_by_method_total{network=~\"$network\",method=~\"$method\",cache_result=~\"miss|bypass_.*\"}[5m]))",
           "format": "table",
           "instant": true
         },
         {
           "refId": "C",
-          "expr": "100 * sum by (method) (rate(ebeacon_cache_requests_by_method_total{network=~\"$network\",cache_result=\"hit\"}[5m])) / clamp_min(sum by (method) (rate(ebeacon_cache_requests_by_method_total{network=~\"$network\"}[5m])), 1e-9)",
+          "expr": "100 * sum by (method) (rate(ebeacon_cache_requests_by_method_total{network=~\"$network\",method=~\"$method\",cache_result=\"hit\"}[5m])) / clamp_min(sum by (method) (rate(ebeacon_cache_requests_by_method_total{network=~\"$network\",method=~\"$method\"}[5m])), 1e-9)",
           "format": "table",
           "instant": true
         }
@@ -1199,7 +1251,7 @@
       "id": 16,
       "type": "row",
       "title": "SSE",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 100 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 116 },
       "collapsed": false,
       "panels": []
     },
@@ -1208,7 +1260,7 @@
       "type": "timeseries",
       "title": "SSE reconnects",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 101 },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 117 },
       "targets": [
         {
           "refId": "A",
@@ -1232,7 +1284,7 @@
       "id": 18,
       "type": "row",
       "title": "Multiplexing",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 108 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 124 },
       "collapsed": false,
       "panels": []
     },
@@ -1241,7 +1293,7 @@
       "type": "timeseries",
       "title": "Multiplexed requests",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 109 },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 125 },
       "targets": [
         {
           "refId": "A",
@@ -1265,7 +1317,7 @@
       "id": 20,
       "type": "row",
       "title": "API Key Breakdown",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 116 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 132 },
       "collapsed": false,
       "panels": []
     },
@@ -1275,11 +1327,11 @@
       "title": "Requests by API Key",
       "description": "Request rate broken down by API key and network",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 117 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 133 },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (api_key, network) (rate(ebeacon_requests_by_api_key_total{network=~\"$network\", api_key=~\"$api_key\"}[5m]))",
+          "expr": "sum by (api_key, network) (rate(ebeacon_requests_by_api_key_total{network=~\"$network\", api_key=~\"$api_key\", method=~\"$method\"}[5m]))",
           "legendFormat": "{{api_key}} / {{network}}"
         }
       ],
@@ -1301,11 +1353,11 @@
       "title": "Requests by API Key & Status",
       "description": "Request rate by API key and HTTP status class",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 117 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 133 },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (api_key, status_class) (rate(ebeacon_requests_by_api_key_total{network=~\"$network\", api_key=~\"$api_key\"}[5m]))",
+          "expr": "sum by (api_key, status_class) (rate(ebeacon_requests_by_api_key_total{network=~\"$network\", api_key=~\"$api_key\", method=~\"$method\"}[5m]))",
           "legendFormat": "{{api_key}} ({{status_class}})"
         }
       ],
@@ -1331,11 +1383,11 @@
       "title": "API Key Request Summary",
       "description": "Total requests per API key over selected time range",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 125 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 141 },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (api_key, network, method, status_class) (increase(ebeacon_requests_by_api_key_total{network=~\"$network\", api_key=~\"$api_key\"}[$__range]))",
+          "expr": "sum by (api_key, network, method, status_class) (increase(ebeacon_requests_by_api_key_total{network=~\"$network\", api_key=~\"$api_key\", method=~\"$method\"}[$__range]))",
           "format": "table",
           "instant": true
         }
@@ -1369,6 +1421,183 @@
           }
         }
       ]
+    },
+    {
+      "id": 101,
+      "type": "row",
+      "title": "Method & Path Detail",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 149 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 102,
+      "type": "timeseries",
+      "title": "Latency by method (p50 / p90 / p99)",
+      "description": "Histogram quantiles from end-to-end proxy latency grouped by HTTP method.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 150 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (method, le) (rate(ebeacon_request_duration_by_method_seconds_bucket{network=~\"$network\",method=~\"$method\"}[5m])))",
+          "legendFormat": "p50 {{method}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.90, sum by (method, le) (rate(ebeacon_request_duration_by_method_seconds_bucket{network=~\"$network\",method=~\"$method\"}[5m])))",
+          "legendFormat": "p90 {{method}}"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (method, le) (rate(ebeacon_request_duration_by_method_seconds_bucket{network=~\"$network\",method=~\"$method\"}[5m])))",
+          "legendFormat": "p99 {{method}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "fillOpacity": 12, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 103,
+      "type": "timeseries",
+      "title": "Latency by API path (p90)",
+      "description": "Histogram p90 latency grouped by normalized Beacon API path.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 150 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.90, sum by (api_path, le) (rate(ebeacon_request_duration_by_path_seconds_bucket{network=~\"$network\",api_path=~\"$api_path\"}[5m])))",
+          "legendFormat": "{{api_path}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "fillOpacity": 12, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 104,
+      "type": "table",
+      "title": "Request volume by API path & status",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 158 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (api_path, status_class) (rate(ebeacon_requests_by_path_total{network=~\"$network\",api_path=~\"$api_path\"}[5m]))",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 3
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Time" }, "properties": [{ "id": "custom.hidden", "value": true }] },
+          { "matcher": { "id": "byName", "options": "Value" }, "properties": [{ "id": "displayName", "value": "req/s" }] }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "req/s", "desc": true }]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true },
+            "renameByName": {
+              "api_path": "API Path",
+              "status_class": "Status",
+              "Value": "req/s"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 105,
+      "type": "table",
+      "title": "Cache outcome by API path",
+      "description": "hit_% is relative to all cache-eligible observations for the selected normalized path set.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 158 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (api_path) (rate(ebeacon_cache_requests_by_path_total{network=~\"$network\",api_path=~\"$api_path\",cache_result=\"hit\"}[5m]))",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (api_path) (rate(ebeacon_cache_requests_by_path_total{network=~\"$network\",api_path=~\"$api_path\",cache_result=~\"miss|bypass_.*\"}[5m]))",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "C",
+          "expr": "100 * sum by (api_path) (rate(ebeacon_cache_requests_by_path_total{network=~\"$network\",api_path=~\"$api_path\",cache_result=\"hit\"}[5m])) / clamp_min(sum by (api_path) (rate(ebeacon_cache_requests_by_path_total{network=~\"$network\",api_path=~\"$api_path\"}[5m])), 1e-9)",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true },
+            "renameByName": {
+              "Value #A": "hit/s",
+              "Value #B": "non_hit/s",
+              "Value #C": "hit_%",
+              "api_path": "API Path"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "inspect": false } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "hit/s" },
+            "properties": [{ "id": "unit", "value": "reqps" }, { "id": "decimals", "value": 3 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "non_hit/s" },
+            "properties": [{ "id": "unit", "value": "reqps" }, { "id": "decimals", "value": 3 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "hit_%" },
+            "properties": [{ "id": "unit", "value": "percent" }, { "id": "decimals", "value": 2 }]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "show": false }
+      }
     }
   ],
   "timepicker": {},

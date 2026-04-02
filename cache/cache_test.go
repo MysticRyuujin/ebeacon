@@ -33,6 +33,54 @@ func TestCache_Policy_DefaultGenesis(t *testing.T) {
 	}
 }
 
+func TestCache_Policy_DefaultHotPaths(t *testing.T) {
+	t.Parallel()
+	c, err := New(netLabel(t), config.CacheConfig{Enabled: true, MaxSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		path string
+		ttl  time.Duration
+	}{
+		{path: "/eth/v1/node/identity", ttl: time.Hour},
+		{path: "/eth/v1/beacon/states/head/validators", ttl: 6 * time.Second},
+		{path: "/eth/v1/beacon/states/head/validators/12345", ttl: 6 * time.Second},
+		{path: "/eth/v1/beacon/states/head/pending_deposits", ttl: 12 * time.Second},
+		{path: "/eth/v1/beacon/blobs/12345", ttl: 12 * time.Second},
+		{path: "/eth/v1/beacon/blob_sidecars/12345", ttl: 12 * time.Second},
+		{path: "/eth/v1/beacon/rewards/blocks/12345", ttl: 12 * time.Second},
+		{path: "/eth/v1/beacon/rewards/sync_committee/12345", ttl: 12 * time.Second},
+		{path: "/eth/v1/beacon/rewards/attestations/123", ttl: 30 * time.Second},
+		{path: "/eth/v1/validator/duties/proposer/123", ttl: 30 * time.Second},
+	}
+
+	for _, tt := range tests {
+		p := c.Policy(http.MethodGet, tt.path)
+		if p == nil {
+			t.Fatalf("expected policy for %s", tt.path)
+		}
+		if got := p.TTL(); got != tt.ttl {
+			t.Fatalf("TTL for %s: got %v want %v", tt.path, got, tt.ttl)
+		}
+	}
+}
+
+func TestCache_Policy_DefaultIntentionalMisses(t *testing.T) {
+	t.Parallel()
+	c, err := New(netLabel(t), config.CacheConfig{Enabled: true, MaxSize: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{"/eth/v1/config/spec", "/eth/v1/node/health"} {
+		if p := c.Policy(http.MethodGet, path); p != nil {
+			t.Fatalf("expected no default policy for %s", path)
+		}
+	}
+}
+
 func TestCache_GetSet(t *testing.T) {
 	t.Parallel()
 	c, err := New(netLabel(t), config.CacheConfig{Enabled: true, MaxSize: 10})
