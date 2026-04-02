@@ -327,9 +327,16 @@ func (n *Network) ID() string { return n.id }
 // HealthStatus returns the best health status across all upstreams in this network.
 func (n *Network) HealthStatus() upstream.HealthStatus { return n.pool.NodeHealthStatus() }
 
-func (n *Network) serveHealthz(w http.ResponseWriter) {
-	total, up, degraded, down := n.pool.HealthCounts()
-	hs := n.pool.NodeHealthStatus()
+func (n *Network) serveHealthz(w http.ResponseWriter, clientUpstream string) {
+	var total, up, degraded, down int
+	var hs upstream.HealthStatus
+	if clientUpstream != "" {
+		total, up, degraded, down = n.pool.HealthCountsForSelector(clientUpstream)
+		hs = n.pool.NodeHealthStatusForSelector(clientUpstream)
+	} else {
+		total, up, degraded, down = n.pool.HealthCounts()
+		hs = n.pool.NodeHealthStatus()
+	}
 
 	var status string
 	var code int
@@ -396,9 +403,10 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Intercept /healthz: return a simple JSON health summary for this network.
+	// Intercept /healthz: return a simple JSON health summary for this network,
+	// scoped to the client upstream when a client prefix was present.
 	if r.URL.Path == "/healthz" {
-		n.serveHealthz(w)
+		n.serveHealthz(w, clientUpstream)
 		return
 	}
 

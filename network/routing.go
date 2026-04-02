@@ -111,7 +111,7 @@ func (r *compiledRouting) applyClientPrefix(path string) (newPath string, upstre
 		}
 
 		trim := strings.TrimPrefix(rest, "/")
-		if strings.HasPrefix(trim, "eth/v") {
+		if strings.HasPrefix(trim, "eth/v") || trim == "healthz" {
 			return "/" + trim, cr.upstreamID
 		}
 		return path, cr.upstreamID
@@ -174,7 +174,7 @@ func inferClientSelectorPath(path string, pool interface {
 	if !ok || selector == "" {
 		return path, "", false
 	}
-	if !strings.HasPrefix(rest, "eth/v") {
+	if !strings.HasPrefix(rest, "eth/v") && rest != "healthz" {
 		return path, "", false
 	}
 	rewritten := "/" + rest
