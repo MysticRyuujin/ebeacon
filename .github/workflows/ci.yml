@@ -80,17 +80,13 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
 
-      - name: Install Trivy
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget gnupg lsb-release
-          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg >/dev/null
-          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $$(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update
-          sudo apt-get install -y trivy
-
       - name: Trivy filesystem scan
-        run: trivy fs --scanners vuln,secret --severity HIGH,CRITICAL --exit-code 1 --no-progress .
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          exit-code: "1"
 
   docker:
     runs-on: ubuntu-latest
@@ -102,17 +98,13 @@ jobs:
       - name: Build Docker image
         run: docker build -t ebeacon:ci .
 
-      - name: Install Trivy
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget gnupg lsb-release
-          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg >/dev/null
-          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $$(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update
-          sudo apt-get install -y trivy
-
       - name: Trivy image scan
-        run: trivy image --severity HIGH,CRITICAL --exit-code 1 --no-progress ebeacon:ci
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          image-ref: ebeacon:ci
+          severity: HIGH,CRITICAL
+          exit-code: "1"
 
       - name: Install Syft (for optional SBOM)
         if: ${{ vars.CI_GENERATE_SBOM == 'true' }}
