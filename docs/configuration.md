@@ -86,8 +86,8 @@ server:
 ```yaml
 pprof:
   enabled: true
-  host: "127.0.0.1"   # listen address (default 127.0.0.1)
-  port: 6060           # listen port (default 6060)
+  host: "127.0.0.1" # listen address (default 127.0.0.1)
+  port: 6060 # listen port (default 6060)
 ```
 
 When enabled, eBeacon starts a separate HTTP server exposing Go's standard `net/http/pprof` handlers. Access profiles at `http://<host>:<port>/debug/pprof/`.
@@ -105,12 +105,14 @@ debugLogging:
   maxBodyBytes: 65536
 ```
 
-When enabled, eBeacon writes structured JSON log entries for failed proxy exchanges and upstream attempt failures. Each entry includes a sanitized request summary plus truncated request and response body previews.
+When enabled, eBeacon writes structured JSON log entries for failed proxy exchanges and upstream attempt failures. Each entry includes the network, normalized API path, upstream ID, status code, duration, error string, sanitized request/response headers, and truncated body previews.
 
 - `path` is the on-disk log file path.
 - `maxSizeMB` is the rotation threshold for a single file.
 - `maxBackups` is the number of rotated files to keep.
-- `maxBodyBytes` caps the body preview stored in each log event.
+- `maxBodyBytes` caps the body preview stored in each log event. Gzip-encoded bodies are decoded before truncation. Set to `0` to suppress body previews entirely.
+
+Sensitive headers (`Authorization`, `X-API-Key`, `Cookie`, `X-EBEACON-Secret-Token`) and sensitive query parameters are automatically redacted before writing.
 
 For container deployments, mount a writable directory at `/logs` or change `path` to another writable location.
 
@@ -121,7 +123,8 @@ cors:
   allowedOrigins:
     - "*"
   allowedMethods: [GET, HEAD, POST, OPTIONS]
-  allowedHeaders: [content-type, authorization, x-ebeacon-secret-token, x-api-key]
+  allowedHeaders:
+    [content-type, authorization, x-ebeacon-secret-token, x-api-key]
   exposedHeaders: [X-Ebeacon-Upstream, X-Ebeacon-Client-Type, X-Ebeacon-Cache]
   allowCredentials: false
   maxAge: 3600
@@ -256,6 +259,14 @@ Where:
 - `p90Seconds` is the rolling p90 latency of successful upstream interactions, including both proxied requests and successful internal health probes.
 - `headLag` is slots behind the pool's canonical head.
 - `syncDistance` is the upstream's reported sync distance.
+
+### Path-aware scoring
+
+In addition to the global score, eBeacon maintains per-path score trackers for each upstream. Paths are normalized to stable route templates (e.g. `/eth/v1/beacon/headers/{block_id}`) before recording, so cardinality stays bounded regardless of request volume.
+
+When routing a request, the path-aware score is used in preference to the global score when enough path-specific samples exist. This means an upstream that is slow only on validator-duty lookups can be deprioritized for that endpoint class without affecting its ranking for other requests.
+
+Path-aware metrics are exposed with the `api_path` label — see [Operations: Metrics](operations.md#metrics).
 
 ### Does the highest score get all the traffic?
 
