@@ -1,0 +1,32 @@
+# Version control and CI
+.git
+.github
+.githooks
+
+# Local tooling
+.claude
+.tmp
+
+# Documentation
+docs
+*.md
+LICENSE
+NOTICE
+
+# Monitoring stack config (not part of the binary)
+monitoring
+
+# Scripts (separate binaries, not built by `go build .`)
+scripts
+
+# Local dev files
+docker-compose.yml
+.env*
+.gitignore
+.dockerignore
+ebeacon.local.yaml
+ebeacon.mainnet.yaml
+
+# Compiled local test binaries
+loadtest
+reliability

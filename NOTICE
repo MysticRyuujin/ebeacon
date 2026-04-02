@@ -1,0 +1,26 @@
+eBeacon
+Copyright 2025 eBeacon Contributors
+
+This project was built from scratch and contains no copied source code from
+other projects. However, its feature set and architectural design were
+informed by the following open-source projects:
+
+  eRPC (https://github.com/erpc/erpc)
+  Copyright 2024 Vendora Pte. Ltd.
+  Licensed under the Apache License, Version 2.0
+
+    No source code from eRPC was used. eBeacon's network-based routing,
+    secret authentication flow, upstream forcing headers
+    (X-ERPC-Use-Upstream), and response header naming (X-ERPC-Upstream)
+    were designed for compatibility with eRPC's conventions. Concepts such
+    as score-based routing, request multiplexing, rate limit auto-tuning,
+    consensus verification, and reorg-aware caching were inspired by
+    eRPC's feature set.
+
+  Dugtrio (https://github.com/ethpandaops/dugtrio)
+  By the ethPandaOps team (no license declared in repository at time of writing)
+
+    No source code from Dugtrio was used. eBeacon's client-type path
+    routing (e.g. /lighthouse/eth/v1/...), session rebalancing, and
+    canonical fork detection were inspired by Dugtrio's approach to
+    beacon API load balancing.

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! command -v rg >/dev/null 2>&1; then
+  echo "pre-commit: ripgrep (rg) is required." >&2
+  exit 1
+fi
+
+STAGED_GO_FILES="$(git diff --cached --name-only --diff-filter=ACMR | rg '\.go$' || true)"
+
+if [[ -z "${STAGED_GO_FILES}" ]]; then
+  echo "pre-commit: no staged Go files; skipping Go checks."
+  exit 0
+fi
+
+echo "pre-commit: formatting staged Go files with gofmt..."
+while IFS= read -r f; do
+  [[ -z "${f}" ]] && continue
+  gofmt -w "${f}"
+done <<< "${STAGED_GO_FILES}"
+
+echo "pre-commit: re-staging formatted files..."
+while IFS= read -r f; do
+  [[ -z "${f}" ]] && continue
+  git add "${f}"
+done <<< "${STAGED_GO_FILES}"
+
+echo "pre-commit: verifying gofmt output..."
+UNFORMATTED="$(while IFS= read -r f; do [[ -n "${f}" ]] && gofmt -l "${f}"; done <<< "${STAGED_GO_FILES}")"
+if [[ -n "${UNFORMATTED}" ]]; then
+  echo "pre-commit: gofmt check failed for:"
+  echo "${UNFORMATTED}"
+  exit 1
+fi
+
+PKGS="$(while IFS= read -r f; do [[ -n "${f}" ]] && dirname "${f}"; done <<< "${STAGED_GO_FILES}" | sort -u | sed 's#^#./#')"
+if [[ -z "${PKGS}" ]]; then
+  echo "pre-commit: no Go packages to test."
+  exit 0
+fi
+
+echo "pre-commit: running go vet on changed packages..."
+# shellcheck disable=SC2086
+go vet ${PKGS}
+
+echo "pre-commit: running package tests with race detector..."
+# shellcheck disable=SC2086
+go test -race ${PKGS}
+
+echo "pre-commit: running golangci-lint on changed packages..."
+if command -v golangci-lint >/dev/null 2>&1; then
+  # shellcheck disable=SC2086
+  golangci-lint run ${PKGS}
+else
+  echo "pre-commit: golangci-lint not installed; skipping local lint."
+  echo "            CI will still enforce golangci-lint."
+fi
+
+echo "pre-commit: passed."

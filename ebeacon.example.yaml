@@ -1,0 +1,302 @@
+logLevel: info  # debug | info | warn | error
+
+server:
+  host: "0.0.0.0"
+  port: 5555
+  maxTimeout: 60s
+  enableGzip: true  # gzip compression for client responses > 1KB (default true)
+
+# ── Global defaults ────────────────────────────────────────────────────────────
+# These apply to every network unless overridden at the network level.
+
+failsafe:
+  timeout:
+    duration: 30s
+  retry:
+    maxAttempts: 3
+    delay: 100ms
+    backoff: 2.0
+    jitter: 50ms
+    maxDelay: 5s
+  hedge:
+    delay: 500ms      # fire a parallel request to the next upstream after this delay
+    maxCount: 1       # max additional parallel requests (1 = two total in-flight)
+  circuitBreaker:
+    failureThreshold: 5   # consecutive failures needed to open the breaker
+    successThreshold: 2   # successes in half-open state to close the breaker
+    halfOpenAfter: 30s    # cooldown before probing a tripped upstream
+  # consensus:            # query N upstreams and require M agreement (safety-critical)
+  #   enabled: false
+  #   maxParticipants: 3
+  #   agreementThreshold: 2
+
+health:
+  checkInterval: 15s       # poll /eth/v1/node/syncing and /eth/v1/beacon/headers/head
+  finalityInterval: 60s    # poll /eth/v1/beacon/states/head/finality_checkpoints
+  maxSyncDistance: 10      # slots behind head before marking an upstream degraded
+  followDistance: 32       # how many slots of block headers to track for fork detection
+  maxHeadDistance: 2       # max slots behind canonical head before excluding from routing
+
+rateLimiting:
+  perIP:
+    limit: 100    # requests per second per client IP
+    burst: 1000   # token-bucket burst size
+  # global:       # shared across all IPs
+  #   limit: 10000
+  #   burst: 50000
+
+ui:
+  enabled: true
+  basePath: /webui   # web UI at /webui/, JSON API at /webui/api/*
+  auth:              # required when ui.enabled is true
+    keys:
+      - id: dashboard
+        secret: "${EBEACON_UI_SECRET}"
+
+# CORS for browser clients. When enabled, eBeacon handles preflight OPTIONS
+# locally and injects Access-Control-* headers after cache/proxy handling.
+# cors:
+#   allowedOrigins:
+#     - "*"                      # or list explicit origins like https://app.example.com
+#   # allowedMethods:            # default: GET, HEAD, POST, OPTIONS
+#   #   - GET
+#   #   - HEAD
+#   #   - POST
+#   #   - OPTIONS
+#   # allowedHeaders:            # default includes Content-Type, Authorization,
+#   #   - Content-Type           # X-EBEACON-Secret-Token, and X-API-Key
+#     - Authorization
+#   #   - X-EBEACON-Secret-Token
+#   #   - X-API-Key
+#   # exposedHeaders:
+#   #   - X-Ebeacon-Upstream
+#   #   - X-Ebeacon-Client-Type
+#   #   - X-Ebeacon-Cache
+#   # allowCredentials: false
+#   # maxAge: 3600
+
+metrics:
+  enabled: true
+  path: /metrics    # served on the same port as the proxy
+
+# ── Shared state (horizontal scaling) ─────────────────────────────────────────
+state:
+  driver: local     # local | redis
+  # redis:
+  #   url: "redis://localhost:6379"
+  #   username: "${REDIS_USERNAME}"   # optional; overrides URL username
+  #   password: "${REDIS_PASSWORD}"   # optional; overrides URL password
+  #   db: 0                           # optional; overrides URL database index
+  #   maxRetries: 3
+
+# ── Authentication ─────────────────────────────────────────────────────────────
+# Recommended auth for top-level `networks:` mode.
+# This works with one or many networks and keeps DNS concerns in HAProxy.
+#
+# Supported credential sources (tried in order):
+#   1. X-EBEACON-Secret-Token header
+#   2. X-API-Key header                (generic standard header)
+#   3. Authorization: Bearer <token>
+#   4. ?secret= query parameter
+#   5. URL path segment                (when header auth is not possible — see below)
+#
+# Path-embedded API key (header-free clients):
+#   /{apiKey}/{network}/eth/v1/...
+#
+# Tiers allow grouping keys with a shared rate-limit budget (free / premium / enterprise).
+# Per-key rateLimiting takes precedence over the tier budget.
+# auth:
+#   # Simple shared secret (backward compat — id defaults to "default").
+#   secret: "${EBEACON_SECRET}"
+#
+#   # Named API keys with optional tier assignment.
+#   keys:
+#     - id: validator-client
+#       description: "Validator client — premium plan"
+#       secret: "${EBEACON_KEY_VALIDATOR}"
+#       tier: premium                    # inherits premium tier rate limits
+#     - id: monitoring
+#       description: "Read-only monitoring queries"
+#       secret: "${EBEACON_KEY_MONITORING}"
+#       tier: free
+#     - id: internal-tool
+#       description: "Internal high-throughput tool"
+#       secret: "${EBEACON_KEY_INTERNAL}"
+#       # per-key override — ignores tier budget entirely
+#       rateLimiting:
+#         limit: 5000   # req/s
+#         burst: 10000
+#
+#   # Tier definitions (rate limits applied to all keys in the tier).
+#   tiers:
+#     - name: free
+#       description: "Public / unauthenticated access"
+#       rateLimiting:
+#         limit: 10     # req/s
+#         burst: 50
+#     - name: premium
+#       description: "Paid plan"
+#       rateLimiting:
+#         limit: 500
+#         burst: 2000
+
+# ── Networks ───────────────────────────────────────────────────────────────────
+# Each network gets its own upstream pool, cache, and request routing.
+# Requests are routed by URL prefix:  /{networkId}/eth/v1/...
+# If only one network is configured, prefix-free URLs also work: /eth/v1/...
+
+networks:
+  - id: mainnet
+    upstreams:
+      - id: lighthouse
+        url: "http://lh-mainnet:5052"
+        priority: 0      # lower = preferred (default 0)
+        weight: 3         # relative traffic share within the same priority tier
+        # rateLimiting:   # auto-tune send rate based on 429 responses
+        #   autoTune: true
+        #   initialRate: 100
+        #   minRate: 10
+        #   maxRate: 1000
+        #   adjustmentPeriod: 1m
+        #   errorRateThreshold: 0.1
+      - id: prysm
+        url: "http://prysm-mainnet:3500"
+      - id: teku
+        url: "http://teku-mainnet:5051"
+        priority: 1       # lower priority = tried after priority-0 upstreams
+        weight: 1         # only matters when multiple upstreams share priority 1
+        headers:
+          Authorization: "Bearer my-api-key"
+        failsafe:
+          circuitBreaker:
+            failureThreshold: 10
+            halfOpenAfter: 60s
+
+    routing:
+      loadBalancing: round-robin  # round-robin | random | least-conn | score
+      stickySession: true         # pin a client IP to one upstream while it's healthy
+      stickyTimeout: 10m
+      rebalanceInterval: 30s      # how often to redistribute sticky sessions
+      rebalanceThreshold: 1.5     # sessions on upstream > 1.5x mean triggers redistribution
+      rebalanceMaxSweep: 10       # max sessions moved per rebalance tick
+
+      # Routing order is: candidate health/fork filter -> priority -> loadBalancing strategy.
+      # Lower priority numbers always win over higher ones. Use priority 0 for local/self-hosted
+      # nodes and priority 1+ for public or paid backup providers.
+
+      # Score-based routing weights (used when loadBalancing: score)
+      # Live score visibility:
+      #   - Web UI: /webui -> Upstreams table
+      #   - Prometheus/Grafana: ebeacon_upstream_score and related score_* metrics
+      # Inside a priority tier, weight now biases traffic share. In score mode, the raw
+      # score and configured weight are combined to decide which upstream gets primary
+      # traffic. Retries and hedges can still send traffic to later entries in the list.
+      # scoreWeights:
+      #   errorRate: 4.0     # weight for error rate (higher = more impact)
+      #   latency: 8.0       # weight for p90 latency
+      #   headLag: 2.0       # weight for slots behind canonical head
+      #   syncDistance: 1.0   # weight for sync distance
+      # scoreWindowSize: 100  # rolling window size for score computation
+
+      # Dugtrio-style: URL prefix pins traffic to one upstream.
+      # This fits naturally with HAProxy rewriting
+      #   mainnet.beacon.example.com/lighthouse/... -> /mainnet/lighthouse/...
+      # Supports client:<type> syntax for auto-detected client types.
+      # clientRoutes:
+      #   - pathPrefix: "/lighthouse/"
+      #     upstreamId: lighthouse           # by upstream ID
+      #   - pathPrefix: "/teku/"
+      #     upstreamId: "client:teku"        # by auto-detected client type
+      #   - pathPrefix: "/nimbus/"
+      #     upstreamId: "client:nimbus"
+      #
+      # Header/query upstream selector (use when path prefix is impractical):
+      #   X-EBEACON-Use-Upstream: lighthouse
+      #   ?use-upstream=<id-or-glob>  e.g. /eth/v1/node/version?use-upstream=*lighthouse*
+      # Stripped before the request is forwarded to the upstream node.
+
+      # Ordered rules (first match): regex on path; optional HTTP methods list.
+      # routeRules:
+      #   - pathPattern: "^/eth/v1/debug/.*"
+      #     deny: true
+      #   - pathPattern: "^/eth/v1/beacon/blocks$"
+      #     methods: [POST]
+      #     upstreamId: teku
+
+      blockedPaths:
+        - "^/eth/v[0-9]+/debug/.*"
+        - "^/eth/v[0-9]+/beacon/pool/attestations"
+        - "^/eth/v[0-9]+/beacon/pool/attester_slashings"
+        - "^/eth/v[0-9]+/beacon/pool/proposer_slashings"
+        - "^/eth/v[0-9]+/beacon/pool/sync_committees"
+        - "^/eth/v[0-9]+/beacon/pool/voluntary_exits"
+        - "^/eth/v[0-9]+/beacon/pool/bls_to_execution_changes"
+
+    # Per-network failsafe override: replaces global failsafe defaults for this network only.
+    # failsafe:
+    #   retry:
+    #     maxAttempts: 2
+    #   circuitBreaker:
+    #     failureThreshold: 10
+    #     halfOpenAfter: 60s
+
+    # Per-path failsafe overrides: different timeouts/retries for specific endpoints.
+    # failsafeOverrides:
+    #   - pathPattern: "^/eth/v1/beacon/states/.*/validators"
+    #     failsafe:
+    #       timeout:
+    #         duration: 120s    # validator set queries are heavy
+    #       retry:
+    #         maxAttempts: 2
+    #   - pathPattern: "^/eth/v1/node/"
+    #     failsafe:
+    #       timeout:
+    #         duration: 5s      # node endpoints are fast
+
+    cache:
+      enabled: true
+      maxSize: 4096     # max entries (LRU eviction)
+      driver: memory    # memory | redis
+      # redis:
+      #   url: "redis://localhost:6379"   # rediss:// enables TLS
+      #   username: "${REDIS_USERNAME}"   # optional; overrides URL username
+      #   password: "${REDIS_PASSWORD}"   # optional; overrides URL password
+      #   db: 0                           # optional; overrides URL database index
+      #   keyPrefix: "ebeacon:cache:mainnet:"
+      #   maxRetries: 3
+      # policies:            # custom per-path TTLs; built-in defaults are used when omitted
+      #   - pattern: "^/eth/v1/node/version$"
+      #     ttl: 1h
+      #     methods: [GET]
+      #   - pattern: "^/eth/v1/beacon/blocks/.*"
+      #     ttl: 0           # 0 = cache forever (immutable by slot)
+
+    # Per-network rate limiting (overrides global rateLimiting).
+    # rateLimiting:
+    #   perIP:
+    #     limit: 200
+    #     burst: 2000
+
+  - id: hoodi
+    upstreams:
+      - id: lh-hoodi
+        url: "http://lh-hoodi:5052"
+      - id: prysm-hoodi
+        url: "http://prysm-hoodi:3500"
+    routing:
+      loadBalancing: round-robin
+      stickySession: true
+    cache:
+      enabled: true
+    health:
+      maxSyncDistance: 32
+
+  - id: sepolia
+    upstreams:
+      - id: lh-sepolia
+        url: "http://lh-sepolia:5052"
+    routing:
+      loadBalancing: round-robin
+    cache:
+      enabled: true
+
