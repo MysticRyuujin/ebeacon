@@ -762,6 +762,9 @@ func streamSSE(ctx context.Context, cfg config, url string, onEvent func(sseEven
 	if cfg.auth != "" {
 		req.Header.Set("Authorization", "Bearer "+cfg.auth)
 	}
+	if cfg.apiKey != "" {
+		req.Header.Set("X-API-Key", cfg.apiKey)
+	}
 
 	client := &http.Client{} // no timeout on the outer client for SSE
 	resp, err := client.Do(req)

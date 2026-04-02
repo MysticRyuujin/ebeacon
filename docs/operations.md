@@ -66,6 +66,15 @@ Score-routing visibility metrics include:
 - `ebeacon_upstream_score_head_lag`
 - `ebeacon_upstream_score_samples`
 
+Per-path score metrics (labelled by `api_path`) include:
+
+- `ebeacon_upstream_score_by_path`
+- `ebeacon_upstream_score_error_rate_by_path`
+- `ebeacon_upstream_score_p90_latency_seconds_by_path`
+- `ebeacon_upstream_score_samples_by_path`
+
+The `api_path` label is a normalized route template (e.g. `/eth/v1/beacon/headers/{block_id}`) rather than a raw URL, so cardinality stays bounded regardless of request volume. These metrics let you see whether a specific endpoint class (validator duties, state queries, blob sidecars, etc.) is driving latency or errors on a particular upstream before the global score reflects it.
+
 ## Logging
 
 `logLevel` supports `debug`, `info`, `warn`, `error`.
@@ -81,7 +90,25 @@ debugLogging:
   maxBodyBytes: 65536
 ```
 
-These events include sanitized request headers, truncated request/response body previews, upstream ID, status, duration, and any proxy error string.
+Each event is a JSON object written to the log file (one per line) and includes:
+
+| Field         | Description                                                          |
+| ------------- | -------------------------------------------------------------------- |
+| `kind`        | Event type, e.g. `proxy_error`, `upstream_error`                     |
+| `network`     | Network ID                                                           |
+| `api_path`    | Normalized route template (e.g. `/eth/v1/beacon/headers/{block_id}`) |
+| `method`      | HTTP method                                                          |
+| `client_ip`   | Originating client IP (when available)                               |
+| `upstream`    | Upstream ID that handled or failed the request                       |
+| `selector`    | Client-route selector, if any                                        |
+| `status`      | HTTP status code returned                                            |
+| `attempt`     | Retry attempt number                                                 |
+| `duration_ms` | Round-trip duration in milliseconds                                  |
+| `error`       | Proxy or upstream error string                                       |
+| `request`     | Sanitized request headers and truncated body preview                 |
+| `response`    | Sanitized response headers and truncated body preview                |
+
+Sensitive headers (`Authorization`, `X-API-Key`, `Cookie`, `X-EBEACON-Secret-Token`) and sensitive query parameters (`token`, `key`, `api_key`, etc.) are redacted before logging. Body previews are capped at `maxBodyBytes` and gzip-decoded where possible.
 
 If you run eBeacon in Docker, mount a writable directory or volume at `/logs`. The image runs as a non-root user, so the mounted directory must be writable by the container user.
 
@@ -98,7 +125,7 @@ Enable the pprof debug server in config:
 ```yaml
 pprof:
   enabled: true
-  host: \"0.0.0.0\"   # use 0.0.0.0 inside containers
+  host: \"0.0.0.0\" # use 0.0.0.0 inside containers
   port: 6060
 ```
 
@@ -172,10 +199,10 @@ cache:
   enabled: true
   driver: redis
   redis:
-    url: "redis://redis:6379"       # rediss:// enables TLS
-    username: "${REDIS_USERNAME}"   # optional; overrides URL username
-    password: "${REDIS_PASSWORD}"   # optional; overrides URL password
-    db: 0                           # optional; database index
+    url: "redis://redis:6379" # rediss:// enables TLS
+    username: "${REDIS_USERNAME}" # optional; overrides URL username
+    password: "${REDIS_PASSWORD}" # optional; overrides URL password
+    db: 0 # optional; database index
     keyPrefix: "ebeacon:cache:mainnet:"
     maxRetries: 3
 ```
@@ -186,10 +213,10 @@ For shared state across replicas:
 state:
   driver: redis
   redis:
-    url: "redis://redis:6379"       # rediss:// enables TLS
-    username: "${REDIS_USERNAME}"   # optional; overrides URL username
-    password: "${REDIS_PASSWORD}"   # optional; overrides URL password
-    db: 0                           # optional; database index
+    url: "redis://redis:6379" # rediss:// enables TLS
+    username: "${REDIS_USERNAME}" # optional; overrides URL username
+    password: "${REDIS_PASSWORD}" # optional; overrides URL password
+    db: 0 # optional; database index
     maxRetries: 3
 ```
 
@@ -217,8 +244,29 @@ Use the runtime harnesses against a deployed instance:
 
 ```bash
 go run ./scripts/loadtest/ -base http://127.0.0.1:5555/mainnet -concurrency 50 -duration 60
+
+# Basic reliability test
 go run ./scripts/reliability/ -ebeacon http://127.0.0.1:5555/mainnet -duration 10m -report 1m
+
+# With API key auth (also accepted via EBEACON_API_KEY env var)
+EBEACON_API_KEY=<key> go run ./scripts/reliability/ \
+  -ebeacon http://127.0.0.1:5555/mainnet \
+  -upstream http://beacon-node:5052 \
+  -duration 30m -report 1m
 ```
+
+The reliability script validates three properties continuously:
+
+1. **Correctness** — eBeacon responses for immutable data (genesis, config) are byte-identical to direct upstream responses.
+2. **Cache accuracy** — when eBeacon returns a cache HIT for a specific slot, the body matches what the upstream returns for that same slot.
+3. **SSE health** — long-running event-stream connections receive head/finality events at expected intervals with monotonically increasing slot numbers.
+
+Auth flags apply to all requests including the SSE connection:
+
+| Flag       | Env var           | Description                                 |
+| ---------- | ----------------- | ------------------------------------------- |
+| `-api-key` | `EBEACON_API_KEY` | Sets `X-API-Key` header                     |
+| `-auth`    | `EBEACON_AUTH`    | Sets `Authorization: Bearer <token>` header |
 
 ## Cache Encoding Semantics
 
