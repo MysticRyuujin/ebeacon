@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "pre-push: gofmt verification..."
+UNFORMATTED="$(gofmt -l $(rg --files -g '*.go'))"
+if [[ -n "${UNFORMATTED}" ]]; then
+  echo "pre-push: gofmt check failed for:"
+  echo "${UNFORMATTED}"
+  exit 1
+fi
+
+echo "pre-push: go vet..."
+go vet ./...
+
+echo "pre-push: race tests..."
+go test -race ./...
+
+echo "pre-push: passed."

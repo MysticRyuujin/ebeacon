@@ -1,0 +1,26 @@
+# Ignore MacOS system files
+.DS_Store
+
+# Local build artifacts
+/ebeacon
+/scripts/loadtest/loadtest
+/scripts/reliability/reliability
+*.test
+
+# Coverage and profiling outputs
+/coverage.out
+*.coverprofile
+*.pprof
+*.prof
+
+# IDE and editor files
+.idea/
+.vscode/
+.claude/
+
+# Local config files with private IPs/secrets (use ebeacon.example.yaml as template)
+ebeacon.*.yaml
+!ebeacon.example.yaml
+
+# Local environment variables (use .env.example as template)
+.env
