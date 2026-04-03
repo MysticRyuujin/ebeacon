@@ -45,9 +45,11 @@ func TestCache_Policy_DefaultHotPaths(t *testing.T) {
 		ttl  time.Duration
 	}{
 		{path: "/eth/v1/node/identity", ttl: time.Hour},
-		{path: "/eth/v1/beacon/states/head/validators", ttl: 6 * time.Second},
-		{path: "/eth/v1/beacon/states/head/validators/12345", ttl: 6 * time.Second},
-		{path: "/eth/v1/beacon/states/head/pending_deposits", ttl: 12 * time.Second},
+		// Named state IDs get 4 s (slot-boundary aligned when genesisTime is set).
+		{path: "/eth/v1/beacon/states/head/validators", ttl: 4 * time.Second},
+		{path: "/eth/v1/beacon/states/head/validators/12345", ttl: 4 * time.Second},
+		{path: "/eth/v1/beacon/states/head/pending_deposits", ttl: 4 * time.Second},
+		// Numeric slot IDs keep the 12 s TTL and are finality-promoted.
 		{path: "/eth/v1/beacon/blobs/12345", ttl: 12 * time.Second},
 		{path: "/eth/v1/beacon/blob_sidecars/12345", ttl: 12 * time.Second},
 		{path: "/eth/v1/beacon/rewards/blocks/12345", ttl: 12 * time.Second},
