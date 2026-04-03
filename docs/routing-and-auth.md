@@ -10,7 +10,7 @@ That keeps eBeacon focused on only four inputs:
 
 - Network path prefix: `/{networkId}/eth/v1/...`
 - Optional client route prefix after the network: `/{networkId}/{clientRoute}/eth/v1/...`
-- Optional path auth prefix: `/{apiKey}/{networkId}/eth/v1/...`
+- Optional path auth prefix: `/{apiKey}/{networkId}/eth/v1/...` or `/{networkId}/{apiKey}/eth/v1/...`
 - Optional upstream override header: `X-EBEACON-Use-Upstream: <upstreamId-or-glob>`
 
 If you have HAProxy in front, translate DNS and host-based routing into those simple path/header forms before forwarding to eBeacon.
@@ -19,7 +19,7 @@ If you have HAProxy in front, translate DNS and host-based routing into those si
 
 - Primary path: `/{networkId}/eth/v1/...`
 - If exactly one network exists, prefix-free `"/eth/v1/..."` also works.
-- Path-auth variant: `/{apiKey}/{networkId}/eth/v1/...`
+- Path-auth variant: `/{apiKey}/{networkId}/eth/v1/...` or `/{networkId}/{apiKey}/eth/v1/...`
 - Client-route variant: `/{networkId}/{clientRoute}/eth/v1/...`
 
 The client-route form also applies to the synthetic node health endpoint. For example, `/{networkId}/lighthouse/eth/v1/node/health` reports health for only the upstreams selected by that route.
@@ -32,7 +32,7 @@ When top-level `auth` is configured, clients can authenticate with any of:
 - `X-API-Key: <secret>`
 - `Authorization: Bearer <secret>`
 - Query parameter `?secret=<secret>`
-- URL path segment via `/{apiKey}/{networkId}/eth/v1/...`
+- URL path segment via `/{apiKey}/{networkId}/eth/v1/...` or `/{networkId}/{apiKey}/eth/v1/...`
 
 Secret values support environment expansion in config, for example:
 
@@ -43,13 +43,14 @@ auth:
 
 ## Path-embedded API Keys
 
-For clients where setting HTTP headers is not possible, the API key can be embedded in the URL path:
+For clients where setting HTTP headers is not possible, the API key can be embedded in the URL path in either position relative to the network prefix:
 
 ```text
 /{apiKey}/{networkId}/eth/v1/...
+/{networkId}/{apiKey}/eth/v1/...
 ```
 
-The embedded segment is stripped before the request is routed to the upstream.
+eBeacon detects the key by checking whether the candidate segment matches a configured secret. The embedded segment is stripped before the request is routed to the upstream.
 
 ## HAProxy Mapping
 
@@ -98,10 +99,16 @@ Public request with path-auth:
 GET https://sepolia.beacon.example.com/premium-local-test-key/eth/v1/node/version
 ```
 
-Forward to eBeacon as:
+Forward to eBeacon as (key before network):
 
 ```text
 GET http://ebeacon:5555/premium-local-test-key/sepolia/eth/v1/node/version
+```
+
+Or equivalently (key after network):
+
+```text
+GET http://ebeacon:5555/sepolia/premium-local-test-key/eth/v1/node/version
 ```
 
 Public request with a hostname-selected upstream:
@@ -154,9 +161,8 @@ frontend fe_ebeacon
   http-request set-var(txn.network) req.hdr(host),lower,map(/etc/haproxy/ebeacon-network.map)
   http-request deny unless { var(txn.network) -m found }
 
-  # Rewrite /<apiKey>/<rest> -> /<apiKey>/<network>/<rest>
-  acl has_two_segments path_reg ^/[^/]+/.+
-  http-request replace-path ^/([^/]+)/(.*)$ /\1/%[var(txn.network)]/\2 if has_two_segments
+  # Prepend the network: /<apiKey>/<rest> -> /<network>/<apiKey>/<rest>
+  http-request set-path /%[var(txn.network)]%[path]
   default_backend be_ebeacon
 
 backend be_ebeacon
@@ -166,9 +172,9 @@ backend be_ebeacon
 With this config:
 
 - `https://sepolia.beacon.example.com/premium-local-test-key/eth/v1/node/version`
-  becomes `http://ebeacon:5555/premium-local-test-key/sepolia/eth/v1/node/version`
+  becomes `http://ebeacon:5555/sepolia/premium-local-test-key/eth/v1/node/version`
 
-Do not rewrite path-auth into `/sepolia/<apiKey>/...`; eBeacon expects `/{apiKey}/{network}/...`.
+eBeacon accepts the API key either before or after the network segment: `/{apiKey}/{network}/...` or `/{network}/{apiKey}/...`.
 
 ### Hostname-selected upstream example
 
