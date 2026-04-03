@@ -41,15 +41,25 @@ var defaultPolicies = []config.CachePolicy{
 	// node/health is intentionally uncached so liveness checks remain fresh.
 
 	// ── beacon blocks & headers ──────────────────────────────────────────────
-	// Numeric slot IDs are auto-promoted to TTL=0 once finalized.
-	// Named block_ids (head, finalized, genesis) use the short TTL literally.
-	{Pattern: `^/eth/v\d+/beacon/headers$`, TTL: 4 * time.Second},
-	{Pattern: `^/eth/v\d+/beacon/headers/`, TTL: 12 * time.Second},
+	// Named block_ids (head, finalized, justified) use a short TTL that
+	// effectiveCacheTTL() further shrinks to the remaining time in the current
+	// Ethereum slot when genesisTime is configured on the network — ensuring
+	// cached head data never crosses a slot boundary.
+	//
+	// Numeric slot IDs keep the full 12 s TTL and are auto-promoted to TTL=0
+	// by effectiveCacheTTL() once the slot is finalized.
+	{Pattern: `^/eth/v\d+/beacon/headers$`, TTL: 4 * time.Second},                                 // bare /headers = head
+	{Pattern: `^/eth/v\d+/beacon/headers/(head|finalized|justified)$`, TTL: 4 * time.Second},      // named
+	{Pattern: `^/eth/v\d+/beacon/headers/`, TTL: 12 * time.Second},                                // numeric (finality-promoted)
+	{Pattern: `^/eth/v\d+/beacon/blocks/(head|finalized|justified)(/.*)?$`, TTL: 4 * time.Second}, // named
 	{Pattern: `^/eth/v\d+/beacon/blocks/[^/]+/root$`, TTL: 12 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/blocks/[^/]+/attestations$`, TTL: 12 * time.Second},
-	{Pattern: `^/eth/v\d+/beacon/blocks/`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/blocks/`, TTL: 12 * time.Second},                                         // numeric (finality-promoted)
+	{Pattern: `^/eth/v\d+/beacon/blinded_blocks/(head|finalized|justified)(/.*)?$`, TTL: 4 * time.Second}, // named
 	{Pattern: `^/eth/v\d+/beacon/blinded_blocks/`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/blobs/(head|finalized|justified)(/.*)?$`, TTL: 4 * time.Second}, // named
 	{Pattern: `^/eth/v\d+/beacon/blobs/`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/blob_sidecars/(head|finalized|justified)(/.*)?$`, TTL: 4 * time.Second}, // named
 	{Pattern: `^/eth/v\d+/beacon/blob_sidecars/`, TTL: 12 * time.Second},
 
 	// ── beacon rewards ───────────────────────────────────────────────────────
@@ -60,18 +70,29 @@ var defaultPolicies = []config.CachePolicy{
 	{Pattern: `^/eth/v\d+/beacon/rewards/attestations/[^/]+$`, TTL: 30 * time.Second},
 
 	// ── beacon state sub-resources ───────────────────────────────────────────
-	// root/fork/finality_checkpoints change at most once per slot (~12 s).
+	// Named state IDs (head, finalized, justified) get a short TTL subject to
+	// slot-boundary alignment. Numeric state IDs get 12 s and are finality-promoted.
+	{Pattern: `^/eth/v\d+/beacon/states/(head|finalized|justified)/root$`, TTL: 4 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/root$`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/(head|finalized|justified)/fork$`, TTL: 4 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/fork$`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/(head|finalized|justified)/finality_checkpoints$`, TTL: 4 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/finality_checkpoints$`, TTL: 12 * time.Second},
 	// Validator lookups dominate public read traffic; keep head-relative data short
 	// while finalized numeric state_ids auto-promote to permanent entries.
+	{Pattern: `^/eth/v\d+/beacon/states/(head|finalized|justified)/validators(?:/[^/]+)?$`, TTL: 4 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/validators(?:/[^/]+)?$`, TTL: 6 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/(head|finalized|justified)/validator_balances$`, TTL: 4 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/validator_balances$`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/(head|finalized|justified)/committees$`, TTL: 4 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/committees$`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/(head|finalized|justified)/sync_committees$`, TTL: 4 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/sync_committees$`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/(head|finalized|justified)/pending_deposits$`, TTL: 4 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/pending_deposits$`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/(head|finalized|justified)/pending_consolidations$`, TTL: 4 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/pending_consolidations$`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/(head|finalized|justified)/pending_partial_withdrawals$`, TTL: 4 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/pending_partial_withdrawals$`, TTL: 12 * time.Second},
 
 	// ── validator duties ──────────────────────────────────────────────────────

@@ -169,6 +169,7 @@ Network-level and upstream-level failsafe config overrides global values.
 ```yaml
 networks:
   - id: mainnet
+    genesisTime: 1606824023   # optional; enables slot-boundary TTL alignment
     upstreams:
       - id: lighthouse
         url: "http://lh-mainnet:5052"
@@ -181,6 +182,22 @@ networks:
 - `weight` biases routing inside a priority tier. Higher weight means more traffic share for `round-robin`, `random`, and `score`, and more effective capacity for `least-conn`.
 - Optional per-upstream `rateLimiting.autoTune` adapts to upstream `429` responses.
 - Top-level `auth:` applies here, including path-auth `/{apiKey}/{networkId}/eth/v1/...`.
+
+### `genesisTime` and slot-boundary TTL alignment
+
+When `genesisTime` is set, eBeacon aligns the cache TTL for head-relative requests (`/head`, `/finalized`, `/justified`, and bare `/eth/v1/beacon/headers`) to expire at the next Ethereum slot boundary rather than after a fixed duration.
+
+**Why this matters:** Ethereum produces a block every 12 seconds. A response cached 11 seconds into a slot would otherwise remain fresh for its full configured TTL, serving stale data well into the following slot. With slot alignment, the TTL is capped to the time remaining in the current slot (minimum 1 s), so cached data never crosses a slot boundary.
+
+**Known genesis timestamps:**
+
+| Network  | `genesisTime` |
+| -------- | ------------- |
+| Mainnet  | `1606824023`  |
+| Sepolia  | `1655733600`  |
+| Hoodi    | `1742212800`  |
+
+These values are permanent chain constants and never change.
 
 ### Preferred local + backup public provider
 

@@ -88,6 +88,7 @@ type CORSConfig struct {
 // NetworkConfig represents a single beacon chain network (e.g. mainnet, hoodi, sepolia).
 type NetworkConfig struct {
 	ID                string              `yaml:"id"`
+	GenesisTime       int64               `yaml:"genesisTime"` // unix timestamp of network genesis; enables slot-boundary TTL alignment
 	Upstreams         []UpstreamConfig    `yaml:"upstreams"`
 	Failsafe          *FailsafeConfig     `yaml:"failsafe"` // overrides global
 	FailsafeOverrides []FailsafeOverride  `yaml:"failsafeOverrides"`

@@ -2084,3 +2084,112 @@ func gunzipBytes(t *testing.T, payload []byte) []byte {
 	}
 	return out
 }
+
+func TestPathHasNamedSlotID(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		path string
+		want bool
+	}{
+		// bare /headers implies head
+		{"/eth/v1/beacon/headers", true},
+		// named block IDs
+		{"/eth/v1/beacon/headers/head", true},
+		{"/eth/v1/beacon/headers/finalized", true},
+		{"/eth/v1/beacon/headers/justified", true},
+		{"/eth/v2/beacon/blocks/head", true},
+		{"/eth/v1/beacon/blobs/head", true},
+		{"/eth/v1/beacon/blob_sidecars/head", true},
+		{"/eth/v1/beacon/blinded_blocks/finalized", true},
+		{"/eth/v1/beacon/states/head/validators", true},
+		{"/eth/v1/beacon/states/finalized/root", true},
+		{"/eth/v1/beacon/states/justified/finality_checkpoints", true},
+		// numeric slot IDs — not named
+		{"/eth/v1/beacon/headers/12345", false},
+		{"/eth/v1/beacon/blocks/12345", false},
+		{"/eth/v1/beacon/blobs/12345", false},
+		{"/eth/v1/beacon/states/12345/validators", false},
+		// genesis is not in the named set (it's a known constant, handled separately)
+		{"/eth/v1/beacon/headers/genesis", false},
+		// unrelated paths
+		{"/eth/v1/node/syncing", false},
+		{"/eth/v1/config/genesis", false},
+		{"/eth/v1/validator/duties/proposer/123", false},
+	}
+	for _, tt := range tests {
+		if got := pathHasNamedSlotID(tt.path); got != tt.want {
+			t.Errorf("pathHasNamedSlotID(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
+func TestEffectiveCacheTTL_SlotAlignment(t *testing.T) {
+	t.Parallel()
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+
+	// Build a network with genesisTime set to mainnet genesis.
+	cfgWith := mustCfgText(t, fmt.Sprintf(`
+logLevel: error
+server: { host: "127.0.0.1", port: 5555, maxTimeout: 30s }
+failsafe: { timeout: { duration: 10s } }
+health: { checkInterval: 1h, finalityInterval: 1h, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: %s
+    genesisTime: 1606824023
+    upstreams:
+      - id: u1
+        url: %q
+    cache: { enabled: false }
+`, id, up.URL))
+	nWith, err := New(&cfgWith.Networks[0], cfgWith)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// With genesisTime, named slot paths must get a TTL in (0, policyTTL].
+	ttl := nWith.effectiveCacheTTL(4*time.Second, "/eth/v1/beacon/headers")
+	if ttl <= 0 || ttl > 4*time.Second {
+		t.Errorf("named path with genesisTime: expected 0 < ttl <= 4s, got %v", ttl)
+	}
+	ttl2 := nWith.effectiveCacheTTL(4*time.Second, "/eth/v1/beacon/headers/head")
+	if ttl2 <= 0 || ttl2 > 4*time.Second {
+		t.Errorf("named path /head with genesisTime: expected 0 < ttl <= 4s, got %v", ttl2)
+	}
+
+	// Numeric slot paths must pass through unchanged (no slot alignment).
+	if got := nWith.effectiveCacheTTL(12*time.Second, "/eth/v1/beacon/headers/12345"); got != 12*time.Second {
+		t.Errorf("numeric slot with genesisTime: expected 12s passthrough, got %v", got)
+	}
+
+	// Build a network without genesisTime — TTL must pass through unchanged.
+	id2 := netID(t)
+	cfgWithout := mustCfgText(t, fmt.Sprintf(`
+logLevel: error
+server: { host: "127.0.0.1", port: 5555, maxTimeout: 30s }
+failsafe: { timeout: { duration: 10s } }
+health: { checkInterval: 1h, finalityInterval: 1h, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: %s
+    upstreams:
+      - id: u1
+        url: %q
+    cache: { enabled: false }
+`, id2, up.URL))
+	nWithout, err := New(&cfgWithout.Networks[0], cfgWithout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nWithout.effectiveCacheTTL(4*time.Second, "/eth/v1/beacon/headers"); got != 4*time.Second {
+		t.Errorf("named path without genesisTime: expected 4s passthrough, got %v", got)
+	}
+}

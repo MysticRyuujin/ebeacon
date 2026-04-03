@@ -88,6 +88,40 @@ func pathNumericSlot(path string) (uint64, bool) {
 	return 0, false
 }
 
+// namedSlotIDs is the set of non-numeric Beacon API block/state identifiers
+// that refer to a chain-tip-relative position. Their cached responses become
+// stale at the next slot boundary, so they benefit from slot-aligned TTLs.
+var namedSlotIDs = map[string]bool{
+	"head":      true,
+	"finalized": true,
+	"justified": true,
+}
+
+// pathHasNamedSlotID reports whether the path's block/state ID component is a
+// named identifier (head, finalized, justified) rather than a numeric slot or
+// state root. Bare /eth/v1/beacon/headers (no block_id) also returns true
+// because the omitted block_id defaults to head.
+func pathHasNamedSlotID(path string) bool {
+	segments := strings.Split(strings.Trim(path, "/"), "/")
+	if len(segments) < 4 || segments[0] != "eth" || len(segments[1]) < 2 ||
+		segments[1][0] != 'v' || segments[2] != "beacon" {
+		return false
+	}
+	switch segments[3] {
+	case "headers":
+		if len(segments) < 5 {
+			return true // bare /headers implies head
+		}
+		return namedSlotIDs[segments[4]]
+	case "blocks", "blinded_blocks", "blobs", "blob_sidecars", "states":
+		if len(segments) < 5 {
+			return false
+		}
+		return namedSlotIDs[segments[4]]
+	}
+	return false
+}
+
 // pathNumericEpoch extracts an epoch parameter from cacheable epoch-scoped
 // endpoints whose responses become immutable after finalization.
 func pathNumericEpoch(path string) (uint64, bool) {
@@ -934,17 +968,38 @@ func dedupKey(networkID, method string, u *url.URL, body []byte, scope string) s
 	return key
 }
 
-// effectiveCacheTTL returns TTL=0 (forever) when the request references a finalized slot.
+// effectiveCacheTTL returns the TTL to use when caching the response for path.
+//
+// Finality promotion: a numeric slot/epoch that is at or below the current
+// finalized checkpoint gets TTL=0 (cached forever) regardless of the policy.
+//
+// Slot-boundary alignment: when the network has a genesisTime configured and
+// the path references a named slot ID (head, finalized, justified), the TTL is
+// capped to the time remaining in the current Ethereum slot. This prevents a
+// response cached late in slot N from being served as fresh data in slot N+1.
 func (n *Network) effectiveCacheTTL(policyTTL time.Duration, path string) time.Duration {
 	finalizedSlot := n.pool.FinalizedSlot()
-	if finalizedSlot == 0 {
-		return policyTTL
+	if finalizedSlot != 0 {
+		if slot, ok := pathNumericSlot(path); ok && slot <= finalizedSlot {
+			return 0 // finalized → cache forever
+		}
+		if epoch, ok := pathNumericEpoch(path); ok && epoch <= finalizedSlot/32 {
+			return 0 // finalized epoch → cache forever
+		}
 	}
-	if slot, ok := pathNumericSlot(path); ok && slot <= finalizedSlot {
-		return 0 // finalized → cache forever
-	}
-	if epoch, ok := pathNumericEpoch(path); ok && epoch <= finalizedSlot/32 {
-		return 0 // finalized epoch → cache forever
+	if policyTTL > 0 && n.cfg.GenesisTime != 0 && pathHasNamedSlotID(path) {
+		const slotSeconds = int64(12)
+		elapsed := (time.Now().Unix() - n.cfg.GenesisTime) % slotSeconds
+		if elapsed < 0 {
+			elapsed += slotSeconds
+		}
+		remaining := time.Duration(slotSeconds-elapsed) * time.Second
+		if remaining < time.Second {
+			remaining = time.Second
+		}
+		if remaining < policyTTL {
+			return remaining
+		}
 	}
 	return policyTTL
 }
