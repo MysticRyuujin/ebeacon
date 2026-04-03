@@ -162,7 +162,7 @@ state:
 networks:
   - id: mainnet
     # genesisTime: 1606824023  # unix timestamp of network genesis; enables slot-boundary TTL alignment
-    #                          # Mainnet: 1606824023 | Sepolia: 1655733600 | Hoodi: 1742212800
+    #                          # Mainnet: 1606824023 | Sepolia: 1655733600 | Hoodi: 1742213400
     upstreams:
       - id: lighthouse
         url: "http://lh-mainnet:5052"
