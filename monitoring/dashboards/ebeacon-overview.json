@@ -1353,7 +1353,7 @@
       "type": "timeseries",
       "title": "Multiplexed requests",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 125 },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 132 },
       "targets": [
         {
           "refId": "A",
@@ -1377,7 +1377,7 @@
       "id": 20,
       "type": "row",
       "title": "API Key Breakdown",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 132 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 139 },
       "collapsed": false,
       "panels": []
     },
@@ -1387,7 +1387,7 @@
       "title": "Requests by API Key",
       "description": "Request rate broken down by API key and network",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 133 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 140 },
       "targets": [
         {
           "refId": "A",
@@ -1413,7 +1413,7 @@
       "title": "Requests by API Key & Status",
       "description": "Request rate by API key and HTTP status class",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 133 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 140 },
       "targets": [
         {
           "refId": "A",
@@ -1443,7 +1443,7 @@
       "title": "API Key Request Summary",
       "description": "Total requests per API key over selected time range",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 141 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 148 },
       "targets": [
         {
           "refId": "A",
@@ -1486,7 +1486,7 @@
       "id": 101,
       "type": "row",
       "title": "Method & Path Detail",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 149 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 156 },
       "collapsed": false,
       "panels": []
     },
@@ -1496,7 +1496,7 @@
       "title": "Latency by method (p50 / p90 / p99)",
       "description": "Histogram quantiles from end-to-end proxy latency grouped by HTTP method.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 150 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 157 },
       "targets": [
         {
           "refId": "A",
@@ -1532,7 +1532,7 @@
       "title": "Latency by API path (p90)",
       "description": "Histogram p90 latency grouped by normalized Beacon API path.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 150 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 157 },
       "targets": [
         {
           "refId": "A",
@@ -1557,7 +1557,7 @@
       "type": "table",
       "title": "Request volume by API path & status",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 158 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 165 },
       "targets": [
         {
           "refId": "A",
@@ -1600,7 +1600,7 @@
       "title": "Cache outcome by API path",
       "description": "hit_% is relative to all cache-eligible observations for the selected normalized path set.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 158 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 165 },
       "targets": [
         {
           "refId": "A",
