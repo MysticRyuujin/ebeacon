@@ -328,7 +328,6 @@ func extractSlot(body []byte) (uint64, bool) {
 // These endpoints must return byte-identical JSON across eBeacon and all upstreams.
 
 var immutableEndpoints = []string{
-	"/eth/v1/config/genesis",
 	"/eth/v1/beacon/genesis",
 	// config/spec, config/fork_schedule, and config/deposit_contract are excluded:
 	// different consensus clients return different field sets or address formats,

@@ -24,7 +24,7 @@ func TestCache_Policy_DefaultGenesis(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := c.Policy(http.MethodGet, "/eth/v1/config/genesis")
+	p := c.Policy(http.MethodGet, "/eth/v1/beacon/genesis")
 	if p == nil {
 		t.Fatal("expected policy for genesis")
 	}
