@@ -1340,7 +1340,7 @@ func TestNetwork_CachedLargeResponseCompressedForGzipClient(t *testing.T) {
 	}
 }
 
-func TestNetwork_CachedLargeOctetStreamCompressedForGzipClient(t *testing.T) {
+func TestNetwork_CachedOctetStreamNotGzippedEvenIfClientAcceptsGzip(t *testing.T) {
 	var hits atomic.Int32
 	want := bytes.Repeat([]byte{0xab, 0xcd, 0xef, 0x42}, 600)
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1374,6 +1374,9 @@ func TestNetwork_CachedLargeOctetStreamCompressedForGzipClient(t *testing.T) {
 		t.Fatalf("first body changed: got %d want %d", len(rec1.Body.Bytes()), len(want))
 	}
 
+	// Second request: same SSZ key, client also sends Accept-Encoding: gzip.
+	// The proxy must NOT gzip SSZ responses — binary payloads compress poorly
+	// and CL clients expect raw bytes without a transport re-encoding step.
 	req2 := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blobs/123", nil)
 	req2.Header.Set("Accept", "application/octet-stream")
 	req2.Header.Set("Accept-Encoding", "gzip")
@@ -1388,11 +1391,11 @@ func TestNetwork_CachedLargeOctetStreamCompressedForGzipClient(t *testing.T) {
 	if got := rec2.Header().Get("Content-Type"); got != "application/octet-stream" {
 		t.Fatalf("content-type: got %q", got)
 	}
-	if got := rec2.Header().Get("Content-Encoding"); got != "gzip" {
-		t.Fatalf("expected gzip response, got %q", got)
+	if got := rec2.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding should be empty for SSZ, got %q", got)
 	}
-	if got := gunzipBytes(t, rec2.Body.Bytes()); !bytes.Equal(got, want) {
-		t.Fatalf("cached binary mismatch after gunzip: got %d want %d", len(got), len(want))
+	if !bytes.Equal(rec2.Body.Bytes(), want) {
+		t.Fatalf("cached binary body mismatch: got %d want %d", len(rec2.Body.Bytes()), len(want))
 	}
 	if hits.Load() != 1 {
 		t.Fatalf("expected one upstream hit, got %d", hits.Load())
@@ -2067,22 +2070,6 @@ func gunzipString(t *testing.T, payload []byte) string {
 		t.Fatalf("close gzip response: %v", err)
 	}
 	return string(out)
-}
-
-func gunzipBytes(t *testing.T, payload []byte) []byte {
-	t.Helper()
-	gr, err := gzip.NewReader(bytes.NewReader(payload))
-	if err != nil {
-		t.Fatalf("read gzip response: %v", err)
-	}
-	out, err := io.ReadAll(gr)
-	if err != nil {
-		t.Fatalf("decompress response: %v", err)
-	}
-	if err := gr.Close(); err != nil {
-		t.Fatalf("close gzip response: %v", err)
-	}
-	return out
 }
 
 func TestPathHasNamedSlotID(t *testing.T) {

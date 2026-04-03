@@ -798,8 +798,9 @@ func streamSSE(ctx context.Context, cfg config, url string, onEvent func(sseEven
 }
 
 // ── pprof collector ───────────────────────────────────────────────────────────
-// Fetches heap snapshots and CPU profiles from eBeacon's pprof endpoint.
-// Also captures its own goroutine profile to help detect leaks in the test itself.
+// Fetches heap snapshots, CPU profiles, and goroutine dumps from eBeacon's
+// pprof endpoint. Also captures its own goroutine profile to help detect
+// leaks in the test itself.
 
 func runPprofCollector(ctx context.Context, cfg config, c *counters, files *pprofFiles) {
 	if err := os.MkdirAll(cfg.pprofDir, 0755); err != nil {
@@ -813,8 +814,9 @@ func runPprofCollector(ctx context.Context, cfg config, c *counters, files *ppro
 		slog.Warn("pprof: eBeacon pprof not reachable, skipping remote snapshots", "addr", cfg.pprofAddr, "err", err)
 	}
 
-	// Capture initial heap at startup.
+	// Capture initial heap and goroutines at startup.
 	captureHeap(ctx, cfg, c, files)
+	captureEBeaconGoroutines(ctx, cfg, c, files, "startup")
 	captureSelf(cfg, files, "startup")
 
 	ticker := time.NewTicker(cfg.pprofEvery)
@@ -827,11 +829,13 @@ func runPprofCollector(ctx context.Context, cfg config, c *counters, files *ppro
 			// Final snapshots on shutdown.
 			captureHeap(context.Background(), cfg, c, files)
 			captureCPU(context.Background(), cfg, c, files, 5*time.Second, snap)
+			captureEBeaconGoroutines(context.Background(), cfg, c, files, "shutdown")
 			captureSelf(cfg, files, "shutdown")
 			return
 		case <-ticker.C:
 			captureHeap(ctx, cfg, c, files)
 			captureCPU(ctx, cfg, c, files, 30*time.Second, snap)
+			captureEBeaconGoroutines(ctx, cfg, c, files, fmt.Sprintf("snap%02d", snap))
 			captureSelf(cfg, files, fmt.Sprintf("snap%02d", snap))
 			snap++
 		}
@@ -879,6 +883,43 @@ func captureSelf(cfg config, files *pprofFiles, tag string) {
 	}
 	files.add(path)
 	slog.Info("pprof: self goroutine dump saved", "file", path)
+}
+
+// captureEBeaconGoroutines fetches eBeacon's goroutine dump from its remote
+// pprof endpoint. Unlike captureSelf (which dumps this test process's own
+// goroutines), this captures the actual goroutines running inside eBeacon.
+func captureEBeaconGoroutines(ctx context.Context, cfg config, c *counters, files *pprofFiles, tag string) {
+	path := filepath.Join(cfg.pprofDir, "goroutines-ebeacon-"+tag+".txt")
+	if err := fetchPprofText(ctx, cfg.pprofAddr+"/debug/pprof/goroutine?debug=1", path); err != nil {
+		c.pprofErrors.Add(1)
+		slog.Warn("pprof: eBeacon goroutine capture failed", "err", err)
+		return
+	}
+	files.add(path)
+	slog.Info("pprof: eBeacon goroutine dump saved", "file", path)
+}
+
+// fetchPprofText fetches a pprof text endpoint (e.g. goroutine?debug=1) and saves
+// the response body as a plain text file.
+func fetchPprofText(ctx context.Context, url, outPath string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(outPath, data, 0644)
 }
 
 func fetchPprofProfile(ctx context.Context, url, outPath string) error {
