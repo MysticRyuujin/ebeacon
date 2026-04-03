@@ -12,6 +12,7 @@ import (
 	"github.com/ebeacon/ebeacon/config"
 	networkpkg "github.com/ebeacon/ebeacon/network"
 	"github.com/ebeacon/ebeacon/proxy"
+	"github.com/ebeacon/ebeacon/upstream"
 )
 
 // StatusAPI serves JSON status endpoints for the web UI.
@@ -203,7 +204,7 @@ func (s *StatusAPI) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 			health := "up"
 			if !u.IsHealthy() {
 				health = "down"
-			} else if !u.IsReady() {
+			} else if !u.IsReady() || u.Health() == upstream.HealthDegraded {
 				health = "degraded"
 			}
 			result = append(result, upstreamStatus{
