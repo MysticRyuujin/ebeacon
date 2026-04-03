@@ -25,11 +25,10 @@ import (
 // slot is finalized.
 var defaultPolicies = []config.CachePolicy{
 	// ── immutable chain constants ────────────────────────────────────────────
-	// config/genesis and beacon/genesis are true chain constants, identical across
-	// all clients. config/spec, config/fork_schedule, and config/deposit_contract
-	// are intentionally not cached: different consensus clients return different
+	// beacon/genesis is a true chain constant, identical across all clients.
+	// config/spec, config/fork_schedule, and config/deposit_contract are
+	// intentionally not cached: different consensus clients return different
 	// field sets or value formats, so requests pass through to the selected upstream.
-	{Pattern: `^/eth/v\d+/config/genesis$`, TTL: 0},
 	{Pattern: `^/eth/v\d+/beacon/genesis$`, TTL: 0},
 
 	// ── node metadata ────────────────────────────────────────────────────────
@@ -94,6 +93,10 @@ var defaultPolicies = []config.CachePolicy{
 	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/pending_consolidations$`, TTL: 12 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/states/(head|finalized|justified)/pending_partial_withdrawals$`, TTL: 4 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/pending_partial_withdrawals$`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/(head|finalized|justified)/randao$`, TTL: 4 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/randao$`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/(head|finalized|justified)/proposer_lookahead$`, TTL: 4 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/states/[^/]+/proposer_lookahead$`, TTL: 12 * time.Second},
 
 	// ── validator duties ──────────────────────────────────────────────────────
 	// Proposer duties are epoch-scoped and become immutable once the epoch finalizes.
@@ -248,6 +251,23 @@ func (c *Cache) Set(key string, status int, headers http.Header, body []byte, tt
 // Promote updates the TTL of an existing entry to "forever" (e.g. when its slot becomes finalized).
 func (c *Cache) Promote(key string) {
 	c.store.Promote(key)
+}
+
+// PromoteIf promotes all non-expired entries whose key satisfies fn to TTL=0
+// (cached forever) and returns the number of entries promoted.
+func (c *Cache) PromoteIf(fn func(key string) bool) int {
+	entries := c.Entries(0, false)
+	n := 0
+	for _, e := range entries {
+		if e.Expires.IsZero() {
+			continue // already permanent
+		}
+		if fn(e.Key) {
+			c.store.Promote(e.Key)
+			n++
+		}
+	}
+	return n
 }
 
 // Delete removes an entry from the cache.

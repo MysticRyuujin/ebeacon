@@ -3,10 +3,12 @@ package network
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +28,16 @@ var (
 	metricHeadWatcherReconnects = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "ebeacon_head_watcher_reconnects_total",
 		Help: "Number of head event watcher upstream reconnects",
+	}, []string{"network"})
+
+	metricReorgInvalidations = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ebeacon_reorg_cache_invalidations_total",
+		Help: "Cache entries invalidated on chain_reorg event",
+	}, []string{"network"})
+
+	metricFinalityPromotions = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ebeacon_finality_cache_promotions_total",
+		Help: "Cache entries promoted to permanent on finalized_checkpoint event",
 	}, []string{"network"})
 )
 
@@ -126,12 +138,13 @@ func (w *headWatcher) run(ctx context.Context) {
 	}
 }
 
-// subscribe opens a streaming GET to /eth/v1/events?topics=head on u and
-// processes lines until the connection closes, ctx is cancelled, or no data
-// arrives for 90 seconds (indicating a silent upstream or network stall).
+// subscribe opens a streaming GET to /eth/v1/events on u for head,
+// finalized_checkpoint, and chain_reorg topics, and processes lines until the
+// connection closes, ctx is cancelled, or no data arrives for 90 seconds
+// (indicating a silent upstream or network stall).
 func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		u.URL+"/eth/v1/events?topics=head", nil)
+		u.URL+"/eth/v1/events?topics=head,finalized_checkpoint,chain_reorg", nil)
 	if err != nil {
 		return err
 	}
@@ -186,8 +199,11 @@ func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error
 	defer idle.Stop()
 
 	inHeadEvent := false
+	inFinalizedEvent := false
+	inReorgEvent := false
 	sawEventName := false
-	sawHeadData := false
+	sawData := false
+	var dataPayload strings.Builder
 
 	for {
 		select {
@@ -212,24 +228,31 @@ func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error
 				switch {
 				case strings.HasPrefix(line, "event:"):
 					sawEventName = true
-					inHeadEvent = strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(line, "event:")), "head")
+					eventName := strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+					inHeadEvent = strings.EqualFold(eventName, "head")
+					inFinalizedEvent = strings.EqualFold(eventName, "finalized_checkpoint")
+					inReorgEvent = strings.EqualFold(eventName, "chain_reorg")
 				case strings.HasPrefix(line, "data:"):
-					if inHeadEvent || !sawEventName {
-						sawHeadData = true
+					if inHeadEvent || inFinalizedEvent || inReorgEvent || !sawEventName {
+						sawData = true
+						dataPayload.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
 					}
 				case line == "":
-					if sawHeadData {
-						w.invalidateHeadCache(ctx, u)
+					if sawData {
+						w.dispatchEvent(ctx, u, inHeadEvent, inFinalizedEvent, inReorgEvent, sawEventName, dataPayload.String())
 					}
 					inHeadEvent = false
+					inFinalizedEvent = false
+					inReorgEvent = false
 					sawEventName = false
-					sawHeadData = false
+					sawData = false
+					dataPayload.Reset()
 				}
 			}
 
 			if rr.err != nil {
-				if sawHeadData {
-					w.invalidateHeadCache(ctx, u)
+				if sawData {
+					w.dispatchEvent(ctx, u, inHeadEvent, inFinalizedEvent, inReorgEvent, sawEventName, dataPayload.String())
 				}
 				if rr.err == io.EOF || ctx.Err() != nil {
 					return nil
@@ -237,6 +260,18 @@ func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error
 				return fmt.Errorf("upstream %s: %w", u.ID, rr.err)
 			}
 		}
+	}
+}
+
+// dispatchEvent routes a completed SSE event to the appropriate handler.
+func (w *headWatcher) dispatchEvent(ctx context.Context, u *upstream.Upstream, isHead, isFinalized, isReorg, sawEventName bool, data string) {
+	switch {
+	case isHead || !sawEventName:
+		w.invalidateHeadCache(ctx, u)
+	case isFinalized:
+		w.handleFinalizedCheckpoint(data)
+	case isReorg:
+		w.handleChainReorg(data)
 	}
 }
 
@@ -270,6 +305,85 @@ func (w *headWatcher) invalidateHeadCache(ctx context.Context, u *upstream.Upstr
 // named slot identifier (head, finalized, justified).
 func isNamedHeadCacheKey(key string) bool {
 	return pathHasNamedSlotID(cacheKeyPath(key))
+}
+
+// handleFinalizedCheckpoint processes a finalized_checkpoint SSE event.
+// It updates the pool's finalized epoch and promotes existing cache entries
+// for slots/epochs that are now finalized.
+func (w *headWatcher) handleFinalizedCheckpoint(data string) {
+	var payload struct {
+		Epoch string `json:"epoch"`
+	}
+	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		slog.Debug("head watcher: failed to parse finalized_checkpoint data",
+			"network", w.networkID, "err", err)
+		return
+	}
+	epoch, err := strconv.ParseUint(payload.Epoch, 10, 64)
+	if err != nil || epoch == 0 {
+		return
+	}
+
+	w.pool.UpdateFinalizedEpoch(epoch)
+
+	finalizedSlot := epoch*32 + 31
+	n := w.cache.PromoteIf(func(key string) bool {
+		path := cacheKeyPath(key)
+		if path == "" {
+			return false
+		}
+		if slot, ok := pathNumericSlot(path); ok && slot <= finalizedSlot {
+			return true
+		}
+		if ep, ok := pathNumericEpoch(path); ok && ep <= epoch {
+			return true
+		}
+		return false
+	})
+	if n > 0 {
+		metricFinalityPromotions.WithLabelValues(w.networkID).Add(float64(n))
+		slog.Debug("head watcher: promoted cache entries on finality",
+			"network", w.networkID, "epoch", epoch, "count", n)
+	}
+}
+
+// handleChainReorg processes a chain_reorg SSE event by purging cached
+// responses for numeric slots at or above the reorg slot. These entries
+// may contain data from the now-orphaned fork.
+func (w *headWatcher) handleChainReorg(data string) {
+	var payload struct {
+		Slot string `json:"slot"`
+	}
+	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		slog.Debug("head watcher: failed to parse chain_reorg data",
+			"network", w.networkID, "err", err)
+		return
+	}
+	reorgSlot, err := strconv.ParseUint(payload.Slot, 10, 64)
+	if err != nil || reorgSlot == 0 {
+		return
+	}
+
+	// Purge numeric-slot entries at or above the reorg slot, plus all
+	// named-head entries which may also reference the orphaned fork.
+	n := w.cache.PurgeIf(func(key string) bool {
+		path := cacheKeyPath(key)
+		if path == "" {
+			return false
+		}
+		if pathHasNamedSlotID(path) {
+			return true
+		}
+		if slot, ok := pathNumericSlot(path); ok && slot >= reorgSlot {
+			return true
+		}
+		return false
+	})
+	if n > 0 {
+		metricReorgInvalidations.WithLabelValues(w.networkID).Add(float64(n))
+		slog.Info("head watcher: purged cache entries on chain reorg",
+			"network", w.networkID, "slot", reorgSlot, "count", n)
+	}
 }
 
 // cacheKeyPath extracts the URL path component from a cache key.
