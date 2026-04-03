@@ -195,7 +195,7 @@ When `genesisTime` is set, eBeacon aligns the cache TTL for head-relative reques
 | -------- | ------------- |
 | Mainnet  | `1606824023`  |
 | Sepolia  | `1655733600`  |
-| Hoodi    | `1742212800`  |
+| Hoodi    | `1742213400`  |
 
 These values are permanent chain constants and never change.
 
