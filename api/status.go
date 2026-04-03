@@ -693,6 +693,11 @@ function renderUpstreams(upstreams){
 		if(!grouped[network]){
 			grouped[network] = [];
 		}
+		var fi = forksByNetwork[network];
+		if(fi && fi.upstreams){
+			var fu = fi.upstreams.find(function(u){ return u.id === upstream.id; });
+			if(fu){ upstream.forkStatus = fu.forkStatus; }
+		}
 		grouped[network].push(upstream);
 		if(!upstreamSortState[network]){
 			upstreamSortState[network] = getDefaultUpstreamSort(grouped[network]);
