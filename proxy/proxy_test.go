@@ -440,6 +440,57 @@ networks:
 	}
 }
 
+func TestProxy_NetworkThenPathKey(t *testing.T) {
+	t.Parallel()
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/eth/v1/node/version" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":{"version":"ok"}}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer up.Close()
+
+	netID := networkID(t)
+	cfg := mustLoadConfig(t, netID, up.URL)
+	n, err := networkpkg.New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p := New(map[string]*networkpkg.Network{netID: n})
+	p.SetAuth(&config.AuthConfig{
+		Keys: []config.APIKeyConfig{{ID: "k", Secret: "secret-after-net"}},
+	})
+
+	// /{network}/{api-key}/... should authenticate and route correctly.
+	req := httptest.NewRequest(http.MethodGet, "/"+netID+"/secret-after-net/eth/v1/node/version", nil)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("network-then-key: status %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Wrong key in that position should be 401.
+	req2 := httptest.NewRequest(http.MethodGet, "/"+netID+"/wrong-secret/eth/v1/node/version", nil)
+	rec2 := httptest.NewRecorder()
+	p.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong key after network: expected 401, got %d", rec2.Code)
+	}
+
+	// /{network}/eth/... without a path key should still work via header.
+	req3 := httptest.NewRequest(http.MethodGet, "/"+netID+"/eth/v1/node/version", nil)
+	req3.Header.Set(headerAPIKey, "secret-after-net")
+	rec3 := httptest.NewRecorder()
+	p.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("header auth on standard path: status %d: %s", rec3.Code, rec3.Body.String())
+	}
+}
+
 func TestProxy_TierRateLimit(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/eth/v1/node/version" {

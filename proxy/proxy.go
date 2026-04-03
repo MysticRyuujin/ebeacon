@@ -122,6 +122,10 @@ func (p *Proxy) routeRequest(r *http.Request) (networkID, rest, pathKey string, 
 	}
 	segments := strings.Split(path, "/")
 	if _, exists := p.networks[segments[0]]; exists {
+		// Support /{network}/{api-key}/... in addition to /{network}/...
+		if len(segments) >= 2 && p.isPathKey(segments[1]) {
+			return segments[0], joinRest(segments[2:]), segments[1], true
+		}
 		return segments[0], joinRest(segments[1:]), "", true
 	}
 	if p.auth != nil && len(segments) >= 2 {
@@ -130,6 +134,20 @@ func (p *Proxy) routeRequest(r *http.Request) (networkID, rest, pathKey string, 
 		}
 	}
 	return "", "", "", false
+}
+
+// isPathKey reports whether candidate matches a configured secret, used to
+// detect /{network}/{api-key}/... style URLs during routing.
+func (p *Proxy) isPathKey(candidate string) bool {
+	if p.auth == nil || candidate == "" {
+		return false
+	}
+	for _, key := range p.auth.Keys {
+		if key.Secret != "" && constantTimeEquals(candidate, key.Secret) {
+			return true
+		}
+	}
+	return p.auth.Secret != "" && constantTimeEquals(candidate, p.auth.Secret)
 }
 
 func (p *Proxy) availableNetworks() string {
