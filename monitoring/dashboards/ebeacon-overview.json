@@ -1260,11 +1260,71 @@
       "type": "timeseries",
       "title": "SSE reconnects",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 117 },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 117 },
       "targets": [
         {
           "refId": "A",
           "expr": "sum by (network) (rate(ebeacon_sse_reconnects_total{network=~\"$network\"}[5m]))",
+          "legendFormat": "SSE {{network}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (network) (rate(ebeacon_head_watcher_reconnects_total{network=~\"$network\"}[5m]))",
+          "legendFormat": "Head watcher {{network}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "bars", "fillOpacity": 80, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 106,
+      "type": "timeseries",
+      "title": "Head cache invalidations",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 117 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (network) (rate(ebeacon_head_cache_invalidations_total{network=~\"$network\"}[5m]))",
+          "legendFormat": "Head {{network}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (network) (rate(ebeacon_reorg_cache_invalidations_total{network=~\"$network\"}[5m]))",
+          "legendFormat": "Reorg {{network}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "bars", "fillOpacity": 80, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 107,
+      "type": "timeseries",
+      "title": "Finality cache promotions",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 124 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (network) (rate(ebeacon_finality_cache_promotions_total{network=~\"$network\"}[5m]))",
           "legendFormat": "{{network}}"
         }
       ],
@@ -1284,7 +1344,7 @@
       "id": 18,
       "type": "row",
       "title": "Multiplexing",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 124 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 131 },
       "collapsed": false,
       "panels": []
     },
