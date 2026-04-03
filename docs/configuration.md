@@ -169,7 +169,7 @@ Network-level and upstream-level failsafe config overrides global values.
 ```yaml
 networks:
   - id: mainnet
-    genesisTime: 1606824023   # optional; enables slot-boundary TTL alignment
+    genesisTime: 1606824023 # optional; enables slot-boundary TTL alignment
     upstreams:
       - id: lighthouse
         url: "http://lh-mainnet:5052"
@@ -185,19 +185,19 @@ networks:
 
 ### `genesisTime` and slot-boundary TTL alignment
 
-When `genesisTime` is set, eBeacon aligns the cache TTL for head-relative requests (`/head`, `/finalized`, `/justified`, and bare `/eth/v1/beacon/headers`) to expire at the next Ethereum slot boundary rather than after a fixed duration.
+When `genesisTime` is known, eBeacon aligns the cache TTL for head-relative requests (`/head`, `/finalized`, `/justified`, and bare `/eth/v1/beacon/headers`) to expire at the next Ethereum slot boundary rather than after a fixed duration.
 
 **Why this matters:** Ethereum produces a block every 12 seconds. A response cached 11 seconds into a slot would otherwise remain fresh for its full configured TTL, serving stale data well into the following slot. With slot alignment, the TTL is capped to the time remaining in the current slot (minimum 1 s), so cached data never crosses a slot boundary.
 
-**Known genesis timestamps:**
+**Built-in defaults:** eBeacon automatically applies the correct genesis time for the three standard networks — no configuration needed.
 
-| Network  | `genesisTime` |
-| -------- | ------------- |
-| Mainnet  | `1606824023`  |
-| Sepolia  | `1655733600`  |
-| Hoodi    | `1742213400`  |
+| Network | `genesisTime` (default) |
+| ------- | ----------------------- |
+| mainnet | `1606824023`            |
+| sepolia | `1655733600`            |
+| hoodi   | `1742213400`            |
 
-These values are permanent chain constants and never change.
+For any other network, set `genesisTime` to the unix timestamp of its genesis block. These values are permanent chain constants and never change.
 
 ### Preferred local + backup public provider
 
