@@ -256,6 +256,36 @@ func (c *Cache) Delete(key string) {
 	c.metricSize.Set(float64(c.store.Len()))
 }
 
+// PurgeIf removes all non-expired entries whose key satisfies fn and returns
+// the number of entries deleted. It is safe to call concurrently.
+func (c *Cache) PurgeIf(fn func(key string) bool) int {
+	entries := c.Entries(0, false)
+	n := 0
+	for _, e := range entries {
+		if fn(e.Key) {
+			c.Delete(e.Key)
+			n++
+		}
+	}
+	return n
+}
+
+// PurgeCollect removes all non-expired entries whose key satisfies fn, returns
+// the number of entries deleted and the keys that were purged. This performs a
+// single scan instead of the two scans required by separate matchingCacheKeys +
+// PurgeIf calls.
+func (c *Cache) PurgeCollect(fn func(key string) bool) (int, []string) {
+	entries := c.Entries(0, false)
+	var keys []string
+	for _, e := range entries {
+		if fn(e.Key) {
+			c.Delete(e.Key)
+			keys = append(keys, e.Key)
+		}
+	}
+	return len(keys), keys
+}
+
 // Entries returns up to limit cached entries as snapshots. limit <= 0 means all available entries.
 // Bodies are only copied into the snapshots when includeBody is true.
 func (c *Cache) Entries(limit int, includeBody bool) []Snapshot {

@@ -516,3 +516,47 @@ func TestSSERelay_StopsPromptlyOnClientDisconnect(t *testing.T) {
 		t.Fatalf("relay did not stop promptly on client disconnect: %v", elapsed)
 	}
 }
+
+func TestSSERelay_FlushesTerminalEventWithoutBlankLine(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: head\ndata: trailing-event") //nolint:errcheck
+	}))
+	defer up.Close()
+
+	pool, err := upstream.NewPool(
+		netID(t),
+		[]config.UpstreamConfig{{ID: "u1", URL: up.URL}},
+		config.RoutingConfig{LoadBalancing: "round-robin"},
+		config.HealthConfig{CheckInterval: time.Hour, FinalityInterval: time.Hour, MaxSyncDistance: 10},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("new pool: %v", err)
+	}
+
+	relay := newSSERelay("mainnet", pool)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/events?topics=head", nil).WithContext(ctx)
+	req.Header.Set("Accept", "text/event-stream")
+	rec := httptest.NewRecorder()
+
+	relay.Serve(rec, req, "", requiredUpstreamSelector{})
+
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d body %q", rec.Code, body)
+	}
+	if !strings.Contains(body, "retry: 1000") {
+		t.Fatalf("stream missing retry directive: %q", body)
+	}
+	if !strings.Contains(body, "data: trailing-event") {
+		t.Fatalf("stream missing terminal event payload: %q", body)
+	}
+	if !strings.HasSuffix(body, "\n\n") {
+		t.Fatalf("stream missing terminating blank line: %q", body)
+	}
+}

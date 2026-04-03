@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +24,7 @@ var metricSSEReconnects = promauto.NewCounterVec(prometheus.CounterOpts{
 }, []string{"network"})
 
 var ssePingInterval = 15 * time.Second
+var sseClientRetry = 1 * time.Second
 
 // seenRing deduplicates SSE events by their FNV32 hash, using a circular buffer.
 // When reconnecting to a new upstream we may receive events already forwarded
@@ -197,6 +199,9 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Ebeacon-Upstream", u.ID)
 		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("retry: " + strconv.FormatInt(sseClientRetry.Milliseconds(), 10) + "\n\n")); err != nil {
+			return true
+		}
 		flusher.Flush()
 		*headersSent = true
 	}
@@ -245,16 +250,9 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 			if rr.line != "" {
 				event.WriteString(rr.line)
 				if rr.line == "\n" || rr.line == "\r\n" {
-					evStr := event.String()
-					h := hashEvent(evStr)
-					if !seen.has(h) {
-						seen.add(h)
-						if _, err := w.Write([]byte(evStr)); err != nil {
-							return true
-						}
-						flusher.Flush()
+					if !flushSSEEvent(w, flusher, seen, &event, false) {
+						return true
 					}
-					event.Reset()
 				}
 			}
 
@@ -262,6 +260,9 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 				continue
 			}
 			if rr.err == io.EOF {
+				if !flushSSEEvent(w, flusher, seen, &event, true) {
+					return true
+				}
 				u.CBSuccess()
 				slog.Info("sse: upstream closed connection",
 					"network", r.networkID, "upstream", u.ID,
@@ -276,4 +277,29 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 			return true
 		}
 	}
+}
+
+func flushSSEEvent(w http.ResponseWriter, flusher http.Flusher, seen *seenRing, event *strings.Builder, forceTerminator bool) bool {
+	if event.Len() == 0 {
+		return true
+	}
+
+	evStr := event.String()
+	if forceTerminator {
+		evStr = strings.TrimRight(evStr, "\r\n") + "\n\n"
+	}
+
+	h := hashEvent(evStr)
+	if seen.has(h) {
+		event.Reset()
+		return true
+	}
+	seen.add(h)
+
+	if _, err := w.Write([]byte(evStr)); err != nil {
+		return false
+	}
+	flusher.Flush()
+	event.Reset()
+	return true
 }

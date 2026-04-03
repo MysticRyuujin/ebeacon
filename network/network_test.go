@@ -2193,3 +2193,144 @@ networks:
 		t.Errorf("named path without genesisTime: expected 4s passthrough, got %v", got)
 	}
 }
+
+func TestCacheKeyPath(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		key  string
+		want string
+	}{
+		{"mainnet:GET:/eth/v1/beacon/headers", "/eth/v1/beacon/headers"},
+		{"mainnet:GET:/eth/v1/beacon/headers/head", "/eth/v1/beacon/headers/head"},
+		{"mainnet:GET:/eth/v1/beacon/headers/12345", "/eth/v1/beacon/headers/12345"},
+		{"mainnet:GET:/eth/v1/beacon/headers/head:upstream=client:lighthouse", "/eth/v1/beacon/headers/head"},
+		{"mainnet:GET:/eth/v1/beacon/headers:accept=binary", "/eth/v1/beacon/headers"},
+		{"mainnet:GET:/eth/v1/beacon/headers:accept=binary:upstream=u1", "/eth/v1/beacon/headers"},
+		{"mainnet:GET:/eth/v1/node/syncing?slot=1", "/eth/v1/node/syncing"},
+		{"mainnet:HEAD:/eth/v1/beacon/headers/head", "/eth/v1/beacon/headers/head"},
+	}
+	for _, tt := range tests {
+		if got := cacheKeyPath(tt.key); got != tt.want {
+			t.Errorf("cacheKeyPath(%q) = %q, want %q", tt.key, got, tt.want)
+		}
+	}
+}
+
+func TestIsNamedHeadCacheKey(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		key  string
+		want bool
+	}{
+		{"mainnet:GET:/eth/v1/beacon/headers", true},
+		{"mainnet:GET:/eth/v1/beacon/headers/head", true},
+		{"mainnet:GET:/eth/v1/beacon/headers/finalized", true},
+		{"mainnet:GET:/eth/v1/beacon/headers/justified", true},
+		{"mainnet:GET:/eth/v1/beacon/blocks/head:upstream=u1", true},
+		{"mainnet:GET:/eth/v1/beacon/states/head/validators", true},
+		{"mainnet:GET:/eth/v1/beacon/headers/12345", false},
+		{"mainnet:GET:/eth/v1/beacon/blocks/99999", false},
+		{"mainnet:GET:/eth/v1/node/syncing", false},
+	}
+	for _, tt := range tests {
+		if got := isNamedHeadCacheKey(tt.key); got != tt.want {
+			t.Errorf("isNamedHeadCacheKey(%q) = %v, want %v", tt.key, got, tt.want)
+		}
+	}
+}
+
+func TestHeadWatcher_InvalidatesOnHeadEvent(t *testing.T) {
+	t.Parallel()
+
+	// Track whether PurgeIf was called.
+	purged := make(chan int, 4)
+
+	// Fake upstream SSE server that sends one head event then keeps the
+	// connection open until the client disconnects.
+	sseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/eth/v1/events" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		fmt.Fprint(w, "event: head\ndata: {\"slot\":\"100\"}\n\n") //nolint:errcheck
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Hold connection open until client disconnects.
+		<-r.Context().Done()
+	}))
+	defer sseServer.Close()
+
+	id := netID(t)
+	cfg := mustCfgText(t, fmt.Sprintf(`
+logLevel: error
+server: { host: "127.0.0.1", port: 5555, maxTimeout: 30s }
+failsafe: { timeout: { duration: 10s } }
+health: { checkInterval: 1h, finalityInterval: 1h, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: %s
+    upstreams:
+      - id: u1
+        url: %q
+    cache: { enabled: true, maxSize: 32 }
+`, id, sseServer.URL))
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed the cache with a named-head entry.
+	n.cache.Set(id+":GET:/eth/v1/beacon/headers/head", 200,
+		http.Header{"Content-Type": []string{"application/json"}},
+		[]byte(`{}`), 4*time.Second)
+	// And a numeric entry that must NOT be purged.
+	n.cache.Set(id+":GET:/eth/v1/beacon/headers/12345", 200,
+		http.Header{"Content-Type": []string{"application/json"}},
+		[]byte(`{}`), 12*time.Second)
+
+	if n.cache.Size() != 2 {
+		t.Fatalf("expected 2 pre-seeded cache entries, got %d", n.cache.Size())
+	}
+
+	// Wrap PurgeIf to capture calls.
+	origPurge := n.cache
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start the watcher.
+	w := startHeadWatcher(ctx, id, n.pool, origPurge, nil)
+
+	// Wait for the head event to be processed (max 3 s).
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if n.cache.Get(id+":GET:/eth/v1/beacon/headers/head") == nil {
+			purged <- 1
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	cancel()
+	w.wait()
+
+	select {
+	case <-purged:
+		// head entry was invalidated — pass
+	default:
+		t.Error("head cache entry was not invalidated after head event")
+	}
+
+	// Numeric entry must still be present.
+	if n.cache.Get(id+":GET:/eth/v1/beacon/headers/12345") == nil {
+		t.Error("numeric slot cache entry was unexpectedly invalidated")
+	}
+}
