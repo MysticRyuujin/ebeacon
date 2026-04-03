@@ -431,7 +431,20 @@ func applyDebugLoggingDefaults(dl *DebugLoggingConfig) {
 	}
 }
 
+// knownGenesisTimes maps well-known network IDs to their genesis unix timestamps.
+// These are permanent chain constants that never change.
+var knownGenesisTimes = map[string]int64{
+	"mainnet": 1606824023,
+	"sepolia": 1655733600,
+	"hoodi":   1742213400,
+}
+
 func applyNetworkDefaults(n *NetworkConfig) {
+	if n.GenesisTime == 0 {
+		if t, ok := knownGenesisTimes[strings.ToLower(n.ID)]; ok {
+			n.GenesisTime = t
+		}
+	}
 	if n.Routing.LoadBalancing == "" {
 		n.Routing.LoadBalancing = "round-robin"
 	}
