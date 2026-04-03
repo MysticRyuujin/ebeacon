@@ -3,6 +3,8 @@
 
 # Local build artifacts
 /ebeacon
+/loadtest
+/reliability
 /scripts/loadtest/loadtest
 /scripts/reliability/reliability
 *.test

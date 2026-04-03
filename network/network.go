@@ -194,6 +194,9 @@ type Network struct {
 	// Consensus policy
 	consensus *ConsensusPolicy
 
+	// Head event watcher for cache invalidation (nil when cache is disabled).
+	headWatcher *headWatcher
+
 	// gzip enabled
 	gzipEnabled bool
 
@@ -474,6 +477,9 @@ func (n *Network) Start(ctx context.Context) {
 			n.sessions.StartRebalancer(ctx, n.cfg.Routing.RebalanceInterval, n.pool,
 				n.cfg.Routing.RebalanceThreshold, n.cfg.Routing.RebalanceMaxSweep)
 		}
+	}
+	if n.cache != nil {
+		n.headWatcher = startHeadWatcher(ctx, n.id, n.pool, n.cache, n.warmHeadCache)
 	}
 }
 

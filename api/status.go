@@ -164,6 +164,7 @@ type forkUpstream struct {
 	HeadSlot    uint64 `json:"headSlot"`
 	HeadRoot    string `json:"headRoot"`
 	OnCanonical bool   `json:"onCanonicalFork"`
+	ForkStatus  string `json:"forkStatus"`
 	ClientType  string `json:"clientType"`
 }
 
@@ -372,6 +373,7 @@ func (s *StatusAPI) handleForks(w http.ResponseWriter, r *http.Request) {
 				HeadSlot:    u.HeadSlot(),
 				HeadRoot:    u.HeadRoot(),
 				OnCanonical: bc.IsOnCanonicalFork(u.ID),
+				ForkStatus:  bc.ForkStatus(u.ID),
 				ClientType:  u.ClientType(),
 			})
 		}
@@ -516,7 +518,7 @@ th{color:#8b949e;font-weight:500}
 .up{color:#3fb950}.down{color:#f85149}.degraded{color:#d29922}
 .badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:0.75rem;font-weight:500}
 .badge.up{background:#0d3117}.badge.down{background:#3d1114}.badge.degraded{background:#3d2e00}
-.canonical{color:#3fb950}.non-canonical{color:#f85149}
+.canonical{color:#3fb950}.non-canonical{color:#f85149}.lagging{color:#d29922}
 .summary-chip{display:inline-flex;align-items:center;gap:6px;background:#0d1117;border:1px solid #21262d;border-radius:999px;color:#8b949e;font-size:0.75rem;padding:4px 10px}
 .cell-meta{display:block;color:#8b949e;font-size:0.75rem;margin-top:2px;white-space:nowrap}
 #refresh{position:fixed;top:16px;right:16px;background:#238636;color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:0.85rem}
@@ -653,7 +655,7 @@ function renderUpstreamRow(upstream){
 		'<td>'+escapeHTML(upstream.headSlot)+'</td>'+
 		'<td>'+escapeHTML(upstream.activeConnections)+'</td>'+
 		'<td>'+escapeHTML(upstream.priority)+'</td>'+
-		'<td class="'+(upstream.onCanonicalFork ? 'canonical' : 'non-canonical')+'">'+(upstream.onCanonicalFork ? 'canonical' : 'forked')+'</td>'+
+		'<td class="'+(upstream.forkStatus === 'canonical' ? 'canonical' : upstream.forkStatus === 'lagging' ? 'lagging' : 'non-canonical')+'">'+(upstream.forkStatus || (upstream.onCanonicalFork ? 'canonical' : 'forked'))+'</td>'+
 	'</tr>';
 }
 
@@ -672,11 +674,13 @@ function renderForkSummary(forkInfo, upstreamCount){
 	const canonicalCount = (forkInfo.upstreams || []).filter(function(upstream){
 		return upstream.onCanonicalFork;
 	}).length;
-	const forkedCount = Math.max((upstreamCount || 0) - canonicalCount, 0);
+	const laggingCount = (forkInfo.upstreams || []).filter(function(u){ return u.forkStatus === 'lagging'; }).length;
+	const forkedCount = Math.max((upstreamCount || 0) - canonicalCount - laggingCount, 0);
 	return '<div class="table-meta">'+
 		'<span class="summary-chip">Canonical slot '+escapeHTML(forkInfo.canonicalSlot)+'</span>'+
 		'<span class="summary-chip">Max slot '+escapeHTML(forkInfo.maxSlot)+'</span>'+
 		'<span class="summary-chip"><span class="canonical">'+canonicalCount+' canonical</span></span>'+
+		(laggingCount ? '<span class="summary-chip"><span class="lagging">'+laggingCount+' lagging</span></span>' : '')+
 		'<span class="summary-chip"><span class="'+(forkedCount ? 'non-canonical' : 'canonical')+'">'+forkedCount+' forked</span></span>'+
 	'</div>';
 }

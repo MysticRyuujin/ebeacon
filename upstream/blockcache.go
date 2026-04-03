@@ -145,6 +145,50 @@ func (bc *BlockCache) IsOnCanonicalFork(upstreamID string) bool {
 	return false
 }
 
+// ForkStatus returns a descriptive status for the upstream's fork position:
+//   - "canonical" — the upstream has reported the canonical head block or is
+//     slightly behind (within maxHeadDistance) on the same chain.
+//   - "forked" — the upstream reported a different block at the canonical slot,
+//     indicating it is on a competing minority chain.
+//   - "lagging" — the upstream has not reported any block near the canonical
+//     head and is too far behind to determine its fork status.
+func (bc *BlockCache) ForkStatus(upstreamID string) string {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+
+	canonSlot, canonRoot := bc.canonicalHeadLocked()
+	if canonSlot == 0 {
+		return "canonical" // no data yet, assume canonical
+	}
+
+	// Check if upstream has seen the canonical head block.
+	if b, ok := bc.rootMap[canonRoot]; ok {
+		if b.SeenBy[upstreamID] {
+			return "canonical"
+		}
+	}
+
+	// If the upstream reported a different block at the canonical slot,
+	// it is on a competing fork.
+	for _, b := range bc.slotMap[canonSlot] {
+		if b.SeenBy[upstreamID] {
+			return "forked"
+		}
+	}
+
+	// Upstream is canonical if it is only slightly behind.
+	for s := canonSlot - 1; s > 0 && canonSlot-s <= bc.maxHeadDistance; s-- {
+		for _, b := range bc.slotMap[s] {
+			if b.SeenBy[upstreamID] {
+				return "canonical"
+			}
+		}
+	}
+
+	// Too far behind to determine — lagging, not necessarily forked.
+	return "lagging"
+}
+
 func (bc *BlockCache) canonicalHeadLocked() (uint64, string) {
 	if bc.maxSlot == 0 {
 		return 0, ""
