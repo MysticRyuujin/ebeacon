@@ -16,6 +16,7 @@
 //	ERROR_PCT          — share of requests hitting a bogus path (default 0)
 //	REQUEST_TIMEOUT    — per-request HTTP timeout in seconds (default 60)
 //	REPORT_INTERVAL    — seconds between progress prints (default 10)
+//	MAX_RPS            — global request-per-second cap across all workers (default 0 = unlimited)
 package main
 
 import (
@@ -36,6 +37,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 // ── configuration ────────────────────────────────────────────────────────────
@@ -50,6 +53,7 @@ type config struct {
 	errorPct       int
 	requestTimeout time.Duration
 	reportInterval time.Duration
+	maxRPS         int // 0 = unlimited
 }
 
 func loadConfig() config {
@@ -62,6 +66,7 @@ func loadConfig() config {
 	errorPct := flag.Int("error-pct", 0, "percentage of requests sent to invalid paths")
 	requestTimeout := flag.Int("request-timeout", 60, "per-request HTTP timeout in seconds")
 	reportInterval := flag.Int("report-interval", 10, "seconds between progress reports")
+	maxRPS := flag.Int("max-rps", 0, "maximum total requests per second across all workers (0 = unlimited)")
 	flag.Parse()
 
 	cfg := config{
@@ -74,6 +79,7 @@ func loadConfig() config {
 		errorPct:       *errorPct,
 		requestTimeout: time.Duration(*requestTimeout) * time.Second,
 		reportInterval: time.Duration(*reportInterval) * time.Second,
+		maxRPS:         *maxRPS,
 	}
 
 	// Env vars override flags.
@@ -114,6 +120,11 @@ func loadConfig() config {
 	if v := os.Getenv("REPORT_INTERVAL"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.reportInterval = time.Duration(n) * time.Second
+		}
+	}
+	if v := os.Getenv("MAX_RPS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.maxRPS = n
 		}
 	}
 
@@ -466,11 +477,16 @@ func (w *weightedEndpoints) pick() endpoint {
 // ── workers ───────────────────────────────────────────────────────────────────
 
 func httpWorker(ctx context.Context, stopAt time.Time, cfg config, client *http.Client, weighted weightedEndpoints,
-	statMap map[string]*stats, mu *sync.RWMutex, wid int) {
+	statMap map[string]*stats, mu *sync.RWMutex, wid int, limiter *rate.Limiter) {
 
 	for ctx.Err() == nil {
 		if time.Now().After(stopAt) {
 			return
+		}
+		if limiter != nil {
+			if err := limiter.Wait(ctx); err != nil {
+				return
+			}
 		}
 		ep := weighted.pick()
 
@@ -722,8 +738,12 @@ func printFinalReport(statMap map[string]*stats, mu *sync.RWMutex, ss *sseStats,
 func main() {
 	cfg := loadConfig()
 
-	fmt.Fprintf(os.Stderr, "eBeacon loadtest: base=%s concurrency=%d sse_workers=%d duration=%s error_pct=%d%% request_timeout=%s\n",
-		cfg.base, cfg.concurrency, cfg.sseWorkers, cfg.duration, cfg.errorPct, cfg.requestTimeout)
+	rpsDesc := "unlimited"
+	if cfg.maxRPS > 0 {
+		rpsDesc = fmt.Sprintf("%d/s", cfg.maxRPS)
+	}
+	fmt.Fprintf(os.Stderr, "eBeacon loadtest: base=%s concurrency=%d sse_workers=%d duration=%s error_pct=%d%% request_timeout=%s max_rps=%s\n",
+		cfg.base, cfg.concurrency, cfg.sseWorkers, cfg.duration, cfg.errorPct, cfg.requestTimeout, rpsDesc)
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.duration+cfg.requestTimeout)
 	defer cancel()
@@ -768,6 +788,17 @@ func main() {
 	}
 	statMap["_error_path"] = &stats{}
 
+	// Build rate limiter if max-rps is set. Use burst = min(concurrency, maxRPS)
+	// so a burst of parallel in-flight requests is allowed but we don't overload.
+	var limiter *rate.Limiter
+	if cfg.maxRPS > 0 {
+		burst := cfg.concurrency
+		if burst > cfg.maxRPS {
+			burst = cfg.maxRPS
+		}
+		limiter = rate.NewLimiter(rate.Limit(cfg.maxRPS), burst)
+	}
+
 	// Start HTTP workers.
 	stopAt := time.Now().Add(cfg.duration)
 	workerCtx, workerCancel := context.WithTimeout(ctx, cfg.duration)
@@ -778,7 +809,7 @@ func main() {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			httpWorker(ctx, stopAt, cfg, httpClient, weighted, statMap, &mu, id)
+			httpWorker(ctx, stopAt, cfg, httpClient, weighted, statMap, &mu, id, limiter)
 		}(i)
 	}
 

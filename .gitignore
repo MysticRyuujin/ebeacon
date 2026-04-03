@@ -26,3 +26,6 @@ ebeacon.*.yaml
 
 # Local environment variables (use .env.example as template)
 .env
+
+# Default local log directory
+/logs/

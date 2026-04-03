@@ -2,12 +2,12 @@ services:
   ebeacon:
     build: .
     container_name: ebeacon
-    command: ["-config", "/app/ebeacon.yaml", "-pprof", "0.0.0.0:6060"]
+    command: ["-config", "/app/ebeacon.yaml"]
     volumes:
       - ${EBEACON_CONFIG:-./ebeacon.local.yaml}:/app/ebeacon.yaml:ro
       # Optional rotating debug log output when debugLogging.path points under /logs.
       # Ensure the host directory is writable by the container's non-root user.
-      # - ./logs:/logs
+      - ${EBEACON_LOG_DIR:-./logs}:/logs
     ports:
       - "5555:5555"
       - "6060:6060"
@@ -24,8 +24,6 @@ services:
       - "19090:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    depends_on:
-      - ebeacon
     restart: unless-stopped
 
   grafana:

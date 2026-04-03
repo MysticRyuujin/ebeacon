@@ -149,7 +149,7 @@ func pathNumericEpoch(path string) (uint64, bool) {
 // that gzip.NewWriter incurs when compressing responses to clients.
 var gzipPool = sync.Pool{
 	New: func() interface{} {
-		gz, _ := gzip.NewWriterLevel(io.Discard, gzip.DefaultCompression)
+		gz, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
 		return gz
 	},
 }
@@ -615,7 +615,8 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				cachedHeaders.Set("X-Ebeacon-Cache", "HIT")
 				copyResponseHeaders(w.Header(), cachedHeaders)
 				if n.gzipEnabled && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") &&
-					cachedHeaders.Get("Content-Encoding") == "" && len(entry.Body()) > 1024 {
+					cachedHeaders.Get("Content-Encoding") == "" && len(entry.Body()) > 1024 &&
+					!strings.EqualFold(cachedHeaders.Get("Content-Type"), "application/octet-stream") {
 					w.Header().Set("Content-Encoding", "gzip")
 					w.Header().Del("Content-Length")
 					w.WriteHeader(entry.Status())
@@ -794,9 +795,12 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	copyResponseHeaders(w.Header(), resp.Header)
 
-	// gzip compression for client if accepted and response is not already compressed
+	// gzip compression for client if accepted and response is not already compressed.
+	// SSZ (application/octet-stream) is skipped: binary payloads compress poorly and
+	// CL clients requesting SSZ expect raw bytes without a transport re-encoding step.
 	if n.gzipEnabled && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") &&
-		resp.Header.Get("Content-Encoding") == "" && len(respBody) > 1024 {
+		resp.Header.Get("Content-Encoding") == "" && len(respBody) > 1024 &&
+		!strings.EqualFold(resp.Header.Get("Content-Type"), "application/octet-stream") {
 		w.Header().Set("Content-Encoding", "gzip")
 		w.Header().Del("Content-Length")
 		w.WriteHeader(resp.StatusCode)
