@@ -176,14 +176,17 @@ func TestStatusAPI_CacheEntriesEndpoint(t *testing.T) {
 	if got := rec.Header().Get("Content-Type"); got != "application/json" {
 		t.Fatalf("content-type: got %q", got)
 	}
-	var entries []cacheEntryInfo
-	if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
+	var result cacheListResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
 		t.Fatalf("decode json: %v", err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("entries len: got %d want 1", len(entries))
+	if result.Total != 1 {
+		t.Fatalf("total: got %d want 1", result.Total)
 	}
-	entry := entries[0]
+	if len(result.Entries) != 1 {
+		t.Fatalf("entries len: got %d want 1", len(result.Entries))
+	}
+	entry := result.Entries[0]
 	if entry.Network != networkID {
 		t.Fatalf("network: got %q", entry.Network)
 	}
@@ -231,14 +234,14 @@ func TestStatusAPI_CacheEntriesEndpointIncludeBody(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status: got %d body %q", rec.Code, rec.Body.String())
 	}
-	var entries []cacheEntryInfo
-	if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
+	var result cacheListResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
 		t.Fatalf("decode json: %v", err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("entries len: got %d want 1", len(entries))
+	if len(result.Entries) != 1 {
+		t.Fatalf("entries len: got %d want 1", len(result.Entries))
 	}
-	entry := entries[0]
+	entry := result.Entries[0]
 	if entry.BodyBase64 != base64.StdEncoding.EncodeToString(body) {
 		t.Fatalf("bodyBase64: got %q", entry.BodyBase64)
 	}
