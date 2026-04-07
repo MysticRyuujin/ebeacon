@@ -15,4 +15,12 @@ go vet ./...
 echo "pre-push: race tests..."
 go test -race ./...
 
+echo "pre-push: golangci-lint..."
+if command -v golangci-lint >/dev/null 2>&1; then
+  golangci-lint run ./...
+else
+  echo "pre-push: golangci-lint not installed; skipping local lint."
+  echo "          CI will still enforce golangci-lint."
+fi
+
 echo "pre-push: passed."
