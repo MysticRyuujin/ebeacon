@@ -140,6 +140,11 @@ type cacheEntryInfo struct {
 	ContentType string      `json:"contentType,omitempty"`
 }
 
+type cacheListResult struct {
+	Total   int              `json:"total"`
+	Entries []cacheEntryInfo `json:"entries"`
+}
+
 type cacheDeleteResult struct {
 	Network string `json:"network"`
 	Key     string `json:"key"`
@@ -264,12 +269,10 @@ func (s *StatusAPI) listCacheEntries(w http.ResponseWriter, r *http.Request) {
 	networkFilter := strings.TrimSpace(r.URL.Query().Get("network"))
 	keyFilter := strings.TrimSpace(r.URL.Query().Get("key"))
 	includeBody := parseBoolQuery(r.URL.Query().Get("includeBody"))
-	limit := parseIntQuery(r.URL.Query().Get("limit"), 100)
-	if limit > 500 {
-		limit = 500
-	}
+	// Hard cap to avoid very large responses; client-side search/pagination handles the rest.
+	const maxEntries = 2000
 
-	var result []cacheEntryInfo
+	var all []cacheEntryInfo
 	for id, n := range s.Networks {
 		if networkFilter != "" && id != networkFilter {
 			continue
@@ -278,11 +281,7 @@ func (s *StatusAPI) listCacheEntries(w http.ResponseWriter, r *http.Request) {
 		if c == nil {
 			continue
 		}
-		remaining := limit
-		if remaining > 0 {
-			remaining = limit - len(result)
-		}
-		for _, entry := range c.Entries(remaining, includeBody) {
+		for _, entry := range c.Entries(0, includeBody) {
 			if keyFilter != "" && entry.Key != keyFilter {
 				continue
 			}
@@ -302,17 +301,20 @@ func (s *StatusAPI) listCacheEntries(w http.ResponseWriter, r *http.Request) {
 			if includeBody {
 				item.BodyBase64 = base64.StdEncoding.EncodeToString(entry.Body)
 			}
-			result = append(result, item)
-			if limit > 0 && len(result) >= limit {
+			all = append(all, item)
+			if len(all) >= maxEntries {
 				break
 			}
 		}
-		if limit > 0 && len(result) >= limit {
+		if len(all) >= maxEntries {
 			break
 		}
 	}
-	sortCacheEntries(result)
-	writeJSON(w, result)
+	sortCacheEntries(all)
+	if all == nil {
+		all = []cacheEntryInfo{}
+	}
+	writeJSON(w, cacheListResult{Total: len(all), Entries: all})
 }
 
 func (s *StatusAPI) deleteCacheEntry(w http.ResponseWriter, r *http.Request) {
@@ -550,7 +552,7 @@ const upstreamColumns = [
 ];
 const defaultUpstreamSort = {key:'priority',direction:'asc'};
 const upstreamSortState = {};
-const cacheEntriesState = {network:'',key:'',limit:100};
+const cacheEntriesState = {network:'',search:'',page:0,pageSize:25};
 let latestUpstreams = [];
 let latestForks = [];
 let latestCacheStats = [];
@@ -757,30 +759,36 @@ function formatTimestamp(value){
 
 function syncCacheEntryFiltersFromDOM(){
 	const network = document.getElementById('cache-network-filter');
-	const key = document.getElementById('cache-key-filter');
+	const search = document.getElementById('cache-search-filter');
 	if(network){
 		cacheEntriesState.network = network.value || '';
 	}
-	if(key){
-		cacheEntriesState.key = key.value.trim();
+	if(search){
+		cacheEntriesState.search = search.value.trim();
 	}
 }
 
 function buildCacheEntriesURL(){
-	const params = new URLSearchParams();
-	if(cacheEntriesState.network){
-		params.set('network',cacheEntriesState.network);
-	}
-	if(cacheEntriesState.key){
-		params.set('key',cacheEntriesState.key);
-	}
-	params.set('limit',String(cacheEntriesState.limit));
-	return base+'/api/cache/entries?'+params.toString();
+	return base+'/api/cache/entries';
 }
 
 function buildSingleCacheEntryURL(network,key){
-	const params = new URLSearchParams({network:network,key:key,limit:'1',includeBody:'true'});
+	const params = new URLSearchParams({network:network,key:key,includeBody:'true'});
 	return base+'/api/cache/entries?'+params.toString();
+}
+
+function filterCacheEntries(entries){
+	const network = cacheEntriesState.network;
+	const search = cacheEntriesState.search.toLowerCase();
+	return (entries || []).filter(function(entry){
+		if(network && entry.network !== network){
+			return false;
+		}
+		if(search && entry.key.toLowerCase().indexOf(search) === -1){
+			return false;
+		}
+		return true;
+	});
 }
 
 function decodeBase64(value){
@@ -808,7 +816,7 @@ function formatPreviewBody(entry){
 
 function updateCacheNetworkOptions(caches){
 	const select = document.getElementById('cache-network-filter');
-	const key = document.getElementById('cache-key-filter');
+	const search = document.getElementById('cache-search-filter');
 	if(!select){
 		return;
 	}
@@ -822,25 +830,27 @@ function updateCacheNetworkOptions(caches){
 	if(select.value !== selected){
 		cacheEntriesState.network = select.value || '';
 	}
-	if(key && key.value !== cacheEntriesState.key){
-		key.value = cacheEntriesState.key;
+	if(search && search.value !== cacheEntriesState.search){
+		search.value = cacheEntriesState.search;
 	}
 	if(!select.dataset.bound){
 		select.addEventListener('change',function(){
+			cacheEntriesState.page = 0;
 			syncCacheEntryFiltersFromDOM();
-			loadAll();
+			renderCacheEntries(latestCacheEntries);
 		});
 		select.dataset.bound = 'true';
 	}
-	if(key && !key.dataset.bound){
-		key.addEventListener('keydown',function(event){
+	if(search && !search.dataset.bound){
+		search.addEventListener('keydown',function(event){
 			if(event.key === 'Enter'){
 				event.preventDefault();
+				cacheEntriesState.page = 0;
 				syncCacheEntryFiltersFromDOM();
-				loadAll();
+				renderCacheEntries(latestCacheEntries);
 			}
 		});
-		key.dataset.bound = 'true';
+		search.dataset.bound = 'true';
 	}
 }
 
@@ -849,7 +859,19 @@ function renderCacheEntries(entries){
 	if(!container){
 		return;
 	}
-	const rows = (entries || []).length ? (entries || []).map(function(entry){
+	const filtered = filterCacheEntries(entries);
+	const total = filtered.length;
+	const pageSize = cacheEntriesState.pageSize;
+	const page = cacheEntriesState.page;
+	const totalPages = Math.max(1, Math.ceil(total / pageSize));
+	const clampedPage = Math.min(page, totalPages - 1);
+	if(clampedPage !== page){
+		cacheEntriesState.page = clampedPage;
+	}
+	const startEntry = total === 0 ? 0 : clampedPage * pageSize + 1;
+	const endEntry = Math.min((clampedPage + 1) * pageSize, total);
+	const pageEntries = filtered.slice(clampedPage * pageSize, (clampedPage + 1) * pageSize);
+	const rows = pageEntries.length ? pageEntries.map(function(entry){
 		return '<tr>'+
 			'<td>'+escapeHTML(entry.network)+'</td>'+
 			'<td class="mono">'+escapeHTML(entry.key)+'</td>'+
@@ -870,17 +892,44 @@ function renderCacheEntries(entries){
 		'</div>'+
 		'<pre class="preview-body mono">'+escapeHTML(formatPreviewBody(activeCachePreview))+'</pre>'+
 	'</div>' : '';
+	const totalAll = (entries || []).length;
+	const paginationInfo = total === 0 ? '0 entries' : startEntry+'\u2013'+endEntry+' of '+total+' entr'+(total === 1 ? 'y' : 'ies');
+	const pagination = '<div class="controls cache-pagination">'+
+		'<button type="button" class="action-button" id="cache-page-prev" '+(clampedPage <= 0 ? 'disabled' : '')+'>&#8592; Prev</button>'+
+		'<span class="table-count">'+escapeHTML(paginationInfo)+'</span>'+
+		'<button type="button" class="action-button" id="cache-page-next" '+(clampedPage >= totalPages - 1 ? 'disabled' : '')+'>Next &#8594;</button>'+
+	'</div>';
+	const totalLabel = total === totalAll ? total+' entr'+(total === 1 ? 'y' : 'ies') : total+' match'+(total === 1 ? '' : 'es')+' of '+totalAll;
 	container.innerHTML = '<section class="table-card stack">'+
-		'<div class="table-header"><h3>Entries</h3><span class="table-count">'+(entries || []).length+' entr'+((entries || []).length === 1 ? 'y' : 'ies')+'</span></div>'+
+		'<div class="table-header"><h3>Entries</h3><span class="table-count">'+escapeHTML(totalLabel)+'</span></div>'+
 		'<div class="controls">'+
 			'<select id="cache-network-filter"></select>'+
-			'<input id="cache-key-filter" type="text" placeholder="Exact cache key">'+
+			'<input id="cache-search-filter" type="text" placeholder="Search key\u2026" value="'+escapeHTML(cacheEntriesState.search)+'">'+
 			'<button type="button" onclick="applyCacheEntryFilters()">Apply</button>'+
 		'</div>'+
+		pagination+
 		'<div class="table-scroll"><table><thead><tr><th>Network</th><th>Key</th><th>Status</th><th>Content-Type</th><th>Bytes</th><th>Created</th><th>Expires</th><th>Action</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
 		preview+
 	'</section>';
 	updateCacheNetworkOptions(latestCacheStats);
+	const prevBtn = document.getElementById('cache-page-prev');
+	const nextBtn = document.getElementById('cache-page-next');
+	if(prevBtn){
+		prevBtn.addEventListener('click',function(){
+			if(cacheEntriesState.page > 0){
+				cacheEntriesState.page--;
+				renderCacheEntries(latestCacheEntries);
+			}
+		});
+	}
+	if(nextBtn){
+		nextBtn.addEventListener('click',function(){
+			if(cacheEntriesState.page < totalPages - 1){
+				cacheEntriesState.page++;
+				renderCacheEntries(latestCacheEntries);
+			}
+		});
+	}
 	const clearPreview = document.getElementById('clear-cache-preview');
 	if(clearPreview){
 		clearPreview.addEventListener('click',function(){
@@ -899,8 +948,9 @@ function renderCacheEntries(entries){
 				if(!response.ok){
 					throw new Error(await response.text());
 				}
-				const items = await response.json();
-				activeCachePreview = Array.isArray(items) && items.length ? items[0] : null;
+				const result = await response.json();
+				const items = result && result.entries ? result.entries : (Array.isArray(result) ? result : []);
+				activeCachePreview = items.length ? items[0] : null;
 				renderCacheEntries(latestCacheEntries);
 			}catch(error){
 				console.error(error);
@@ -938,14 +988,15 @@ function renderCacheEntries(entries){
 }
 
 function applyCacheEntryFilters(){
+	cacheEntriesState.page = 0;
 	syncCacheEntryFiltersFromDOM();
-	loadAll();
+	renderCacheEntries(latestCacheEntries);
 }
 
 async function loadAll(){
 	try{
 		syncCacheEntryFiltersFromDOM();
-		const[health,ups,caches,entries,sessions,forks]=await Promise.all([
+		const[health,ups,caches,entriesResult,sessions,forks]=await Promise.all([
 			fetch(base+'/api/health').then(r=>r.json()),
 			fetch(base+'/api/upstreams').then(r=>r.json()),
 			fetch(base+'/api/cache').then(r=>r.json()),
@@ -955,10 +1006,10 @@ async function loadAll(){
 		]);
 		document.getElementById('health').innerHTML=(health||[]).map(function(h){ return '<div class="card"><h3>'+h.id+'</h3><div class="stat">'+h.healthyCount+'/'+h.upstreamCount+'</div><p>Finalized: '+h.finalizedSlot+'</p><p>Canonical: '+h.canonicalSlot+'</p></div>'; }).join('');
 		latestUpstreams = ups || [];
-			latestForks = forks || [];
+		latestForks = forks || [];
 		renderUpstreams(latestUpstreams);
 		latestCacheStats = caches || [];
-		latestCacheEntries = entries || [];
+		latestCacheEntries = (entriesResult && entriesResult.entries) ? entriesResult.entries : [];
 		document.getElementById('cache-stats').innerHTML=(latestCacheStats||[]).map(function(c){ return '<div class="card"><h3>'+c.network+'</h3><div class="stat">'+(c.enabled?c.size+' entries':'disabled')+'</div></div>'; }).join('');
 		renderCacheEntries(latestCacheEntries);
 		document.getElementById('sessions').innerHTML=(sessions||[]).map(function(s){ return '<div class="card"><h3>'+s.network+'</h3><div class="stat">'+s.activeSessions+' sessions</div></div>'; }).join('');
