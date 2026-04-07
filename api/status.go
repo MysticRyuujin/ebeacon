@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -432,17 +431,6 @@ func parseBoolQuery(v string) bool {
 	default:
 		return false
 	}
-}
-
-func parseIntQuery(v string, defaultValue int) int {
-	if strings.TrimSpace(v) == "" {
-		return defaultValue
-	}
-	parsed, err := strconv.Atoi(v)
-	if err != nil || parsed <= 0 {
-		return defaultValue
-	}
-	return parsed
 }
 
 func sortSessionStats(items []sessionStats) {
