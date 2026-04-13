@@ -237,3 +237,136 @@ func TestPool_NodeHealthStatusForSelector(t *testing.T) {
 		})
 	}
 }
+
+func TestPool_SelectForPathPreferCanonicalHead_PrefersCanonicalReporters(t *testing.T) {
+	// MaxHeadDistance=4 so upstreams one slot behind the canonical head are
+	// still considered "on the canonical fork" and remain in the candidate
+	// pool. This mirrors the real race scenario: "fast" is a valid candidate
+	// by the existing fork filter and wins score-based routing, even though
+	// it has not actually reported the new head block.
+	health := config.HealthConfig{MaxSyncDistance: 10, MaxHeadDistance: 4}
+	cb := &config.CircuitBreakerConfig{
+		FailureThreshold: 5,
+		SuccessThreshold: 2,
+		HalfOpenAfter:    30 * time.Second,
+	}
+	p, err := NewPool(fmt.Sprintf("pool_%d_%s", poolLabelSeq.Add(1), strings.ReplaceAll(t.Name(), "/", "_")), []config.UpstreamConfig{
+		{ID: "fast", URL: "http://a", Weight: 1},
+		{ID: "slow-canon", URL: "http://b", Weight: 1},
+		{ID: "other", URL: "http://c", Weight: 1},
+	}, config.RoutingConfig{LoadBalancing: "score"}, health, cb)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fast := p.ByID("fast")
+	slowCanon := p.ByID("slow-canon")
+	other := p.ByID("other")
+	fast.UpdateSyncStatus(false, 128, 0)
+	slowCanon.UpdateSyncStatus(false, 128, 0)
+	other.UpdateSyncStatus(false, 128, 0)
+
+	// Feed score samples: fast is much faster.
+	for range 10 {
+		fast.RecordSuccess(5 * time.Millisecond)
+		slowCanon.RecordSuccess(200 * time.Millisecond)
+		other.RecordSuccess(200 * time.Millisecond)
+	}
+
+	// All three agreed on slot 127, but only slow-canon has observed slot 128
+	// (the new canonical head). "fast" and "other" are still one slot behind —
+	// they satisfy IsOnCanonicalFork (within maxHeadDistance) but they have
+	// not reported the canonical head block itself.
+	p.BlockCache().AddBlock("fast", 127, "0xprev", "0x0")
+	p.BlockCache().AddBlock("slow-canon", 127, "0xprev", "0x0")
+	p.BlockCache().AddBlock("other", 127, "0xprev", "0x0")
+	p.BlockCache().AddBlock("slow-canon", 128, "0xhead", "0xprev")
+
+	// Sanity: without the head-aware filter, all three upstreams remain in
+	// play under score-based routing (fast is still a valid candidate
+	// because it is within maxHeadDistance of the canonical head). If the
+	// default selector happened to already lock onto slow-canon, the rest
+	// of this test would prove nothing.
+	seenDefault := map[string]bool{}
+	for range 300 {
+		ups := p.SelectForPath("/eth/v1/beacon/headers/{block_id}", 1)
+		seenDefault[ups[0].ID] = true
+	}
+	if !seenDefault["fast"] {
+		t.Fatalf("sanity: expected default score ordering to route to fast at least once, got %v", seenDefault)
+	}
+
+	// SelectForPathPreferCanonicalHead hard-prefers the head reporter, so
+	// slow-canon must win *every* time even though its score is worse.
+	for range 200 {
+		ups := p.SelectForPathPreferCanonicalHead("/eth/v1/beacon/headers/{block_id}", 1)
+		if ups[0].ID != "slow-canon" {
+			t.Fatalf("expected slow-canon to win head-aware selection, got %s", ups[0].ID)
+		}
+	}
+}
+
+func TestPool_SelectForPathPreferCanonicalHead_FailsOpenBeforeHeadSeen(t *testing.T) {
+	t.Parallel()
+	health := config.HealthConfig{MaxSyncDistance: 10}
+	cb := &config.CircuitBreakerConfig{
+		FailureThreshold: 5,
+		SuccessThreshold: 2,
+		HalfOpenAfter:    30 * time.Second,
+	}
+	p, err := NewPool(fmt.Sprintf("pool_%d_%s", poolLabelSeq.Add(1), strings.ReplaceAll(t.Name(), "/", "_")), []config.UpstreamConfig{
+		{ID: "a", URL: "http://a"},
+		{ID: "b", URL: "http://b"},
+	}, config.RoutingConfig{LoadBalancing: "round-robin"}, health, cb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range p.All() {
+		u.SetHealth(HealthUp)
+	}
+
+	// No blocks recorded yet — CanonicalHeadSeenBy returns nil. The selector
+	// must fall open and return the normal candidate set rather than nothing.
+	ups := p.SelectForPathPreferCanonicalHead("/eth/v1/beacon/headers/head", 2)
+	if len(ups) != 2 {
+		t.Fatalf("expected fail-open to return both upstreams, got %d", len(ups))
+	}
+}
+
+func TestPool_SelectForPathPreferCanonicalHead_FailsOpenWhenOnlyForkedHasHead(t *testing.T) {
+	t.Parallel()
+	health := config.HealthConfig{MaxSyncDistance: 10}
+	cb := &config.CircuitBreakerConfig{
+		FailureThreshold: 5,
+		SuccessThreshold: 2,
+		HalfOpenAfter:    30 * time.Second,
+	}
+	p, err := NewPool(fmt.Sprintf("pool_%d_%s", poolLabelSeq.Add(1), strings.ReplaceAll(t.Name(), "/", "_")), []config.UpstreamConfig{
+		{ID: "canon-a", URL: "http://a"},
+		{ID: "canon-b", URL: "http://b"},
+		{ID: "forked", URL: "http://c"},
+	}, config.RoutingConfig{LoadBalancing: "round-robin"}, health, cb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range p.All() {
+		u.UpdateSyncStatus(false, 128, 0)
+	}
+
+	// canon-a and canon-b are on the canonical chain at slot 128 (which is the
+	// canonical head by majority vote). "forked" reports a different block at
+	// slot 128 — it's on a competing fork and the normal canonical-fork filter
+	// excludes it. The head-aware filter must not accidentally resurrect it.
+	p.BlockCache().AddBlock("canon-a", 128, "0xcanon", "0x0")
+	p.BlockCache().AddBlock("canon-b", 128, "0xcanon", "0x0")
+	p.BlockCache().AddBlock("forked", 128, "0xfork", "0x0")
+
+	for range 50 {
+		ups := p.SelectForPathPreferCanonicalHead("/eth/v1/beacon/headers/head", 3)
+		for _, u := range ups {
+			if u.ID == "forked" {
+				t.Fatalf("forked upstream must not appear in head-aware selection: %v", ups)
+			}
+		}
+	}
+}

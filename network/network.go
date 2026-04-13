@@ -194,7 +194,9 @@ type Network struct {
 	// Consensus policy
 	consensus *ConsensusPolicy
 
-	// Head event watcher for cache invalidation (nil when cache is disabled).
+	// Head event watcher. Runs on all networks (including cache-disabled ones)
+	// because it feeds BlockCache for head-aware routing in addition to
+	// invalidating cached responses.
 	headWatcher *headWatcher
 
 	// gzip enabled
@@ -478,9 +480,14 @@ func (n *Network) Start(ctx context.Context) {
 				n.cfg.Routing.RebalanceThreshold, n.cfg.Routing.RebalanceMaxSweep)
 		}
 	}
-	if n.cache != nil {
-		n.headWatcher = startHeadWatcher(ctx, n.id, n.pool, n.cache, n.warmHeadCache)
-	}
+	// Always start the head watcher — it has two responsibilities:
+	//   1. Feed the pool's BlockCache in real time from SSE head events so
+	//      the canonical-head-aware router (SelectForPathPreferCanonicalHead)
+	//      has current data. This applies to all networks regardless of
+	//      whether response caching is enabled.
+	//   2. Invalidate and pre-warm named-head cache entries. This part is a
+	//      no-op on networks where n.cache is nil.
+	n.headWatcher = startHeadWatcher(ctx, n.id, n.pool, n.cache, n.warmHeadCache)
 }
 
 // ServeHTTP handles a proxied request for this network.
@@ -1034,9 +1041,21 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 		return wrapResponseBodyCancel(resp, timeoutCancel), u, nil
 	}
 
+	// For requests targeting a named head ID (/head, /finalized, /justified)
+	// prefer upstreams that have reported the canonical head block. This closes
+	// the race window where a downstream client receives an SSE head event from
+	// one upstream and immediately queries for the block data before other
+	// upstreams have caught up. Detection uses the raw URL path because the
+	// normalized apiPath collapses "head" into "{block_id}".
+	preferCanonicalHead := pathHasNamedSlotID(r.URL.Path)
+	selectForPath := n.pool.SelectForPath
+	if preferCanonicalHead {
+		selectForPath = n.pool.SelectForPathPreferCanonicalHead
+	}
+
 	// Consensus policy: send to N upstreams, require M agreement
 	if n.consensus != nil {
-		ups := n.pool.SelectForPath(apiPath, n.consensus.MaxParticipants)
+		ups := selectForPath(apiPath, n.consensus.MaxParticipants)
 		if len(ups) >= n.consensus.AgreementThreshold {
 			resp, u, err := n.consensus.Execute(ctx, ups, func(u *upstream.Upstream) (*http.Request, error) {
 				dest := u.URL + pathAndQueryForUpstream(r.URL)
@@ -1070,7 +1089,7 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 	// Hedge: fire parallel requests after a delay.
 	if fs.Hedge != nil {
 		count := fs.Hedge.MaxCount + 1
-		ups := n.pool.SelectForPath(apiPath, count)
+		ups := selectForPath(apiPath, count)
 		if len(ups) > 1 {
 			resp, u, err := n.executeHedgeFS(ctx, ups, r, bodyBytes, preferID, fs, apiPath)
 			if err != nil {
@@ -1082,7 +1101,7 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 	}
 
 	// Sequential retry across upstreams.
-	ups := n.pool.SelectForPath(apiPath, maxAttempts)
+	ups := selectForPath(apiPath, maxAttempts)
 	if len(ups) == 0 {
 		cancelTimeout()
 		return nil, nil, fmt.Errorf("no upstreams available")

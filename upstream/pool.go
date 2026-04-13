@@ -283,7 +283,7 @@ func (p *Pool) SelectByClientTypeForPath(clientType, apiPath string, n int) []*U
 		}
 	}
 	p.mu.RUnlock()
-	return p.selectFromCandidatesForPath(all, n, apiPath)
+	return p.selectFromCandidatesForPath(all, n, apiPath, false)
 }
 
 // SelectByGlob returns up to n upstreams whose IDs match the glob pattern,
@@ -303,7 +303,7 @@ func (p *Pool) SelectByGlobForPath(pattern, apiPath string, n int) []*Upstream {
 		}
 	}
 	p.mu.RUnlock()
-	return p.selectFromCandidatesForPath(all, n, apiPath)
+	return p.selectFromCandidatesForPath(all, n, apiPath, false)
 }
 
 // ByGlob returns the first ready upstream whose ID matches the glob pattern.
@@ -331,10 +331,24 @@ func (p *Pool) SelectForPath(apiPath string, n int) []*Upstream {
 	p.mu.RLock()
 	all := p.upstreams
 	p.mu.RUnlock()
-	return p.selectFromCandidatesForPath(all, n, apiPath)
+	return p.selectFromCandidatesForPath(all, n, apiPath, false)
 }
 
-func (p *Pool) selectFromCandidatesForPath(all []*Upstream, n int, apiPath string) []*Upstream {
+// SelectForPathPreferCanonicalHead is like SelectForPath but hard-prefers
+// upstreams that have already reported the canonical head block. This is used
+// for requests targeting a named head ID (/head, /finalized, /justified) to
+// avoid routing to a faster-but-staler upstream that has not yet seen the
+// block a downstream client just learned about via an SSE head event.
+// Falls open to the normal candidate set if no upstream has reported the head
+// yet (e.g. startup, or before the head watcher has observed any events).
+func (p *Pool) SelectForPathPreferCanonicalHead(apiPath string, n int) []*Upstream {
+	p.mu.RLock()
+	all := p.upstreams
+	p.mu.RUnlock()
+	return p.selectFromCandidatesForPath(all, n, apiPath, true)
+}
+
+func (p *Pool) selectFromCandidatesForPath(all []*Upstream, n int, apiPath string, preferCanonicalHead bool) []*Upstream {
 	// Prefer upstreams that are both healthy and on the canonical fork.
 	// Fall back progressively: canonical+ready → any ready → any healthy → all.
 	// The fallback chain ensures we always return something rather than dropping
@@ -351,6 +365,22 @@ func (p *Pool) selectFromCandidatesForPath(all []*Upstream, n int, apiPath strin
 	}
 	if len(candidates) == 0 {
 		candidates = all
+	}
+
+	// For named-head paths, hard-prefer upstreams that have reported the
+	// canonical head block. This closes the race window where an SSE head
+	// event from NodeB is forwarded to a client, which immediately fires a
+	// /head request that then gets routed to NodeA — a higher-scoring upstream
+	// that has not yet seen the block. Fails open if no upstream has reported
+	// the head yet.
+	if preferCanonicalHead {
+		seen := p.blockCache.CanonicalHeadSeenBy()
+		if len(seen) > 0 {
+			preferred := filter(candidates, func(u *Upstream) bool { return seen[u.ID] })
+			if len(preferred) > 0 {
+				candidates = preferred
+			}
+		}
 	}
 
 	// Prefer upstreams not currently over their auto-tuned rate limit, but
