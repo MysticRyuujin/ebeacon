@@ -23,4 +23,12 @@ else
   echo "          CI will still enforce golangci-lint."
 fi
 
+# Match CI's security job: run govulncheck against the Go version declared in
+# go.mod so stdlib vulns are detected before push. Without GOTOOLCHAIN pinning,
+# a developer on a newer local Go than go.mod declares will silently miss
+# stdlib vulns that CI reports against the older toolchain.
+echo "pre-push: govulncheck..."
+GOTOOLCHAIN="go$(awk '/^go /{print $2; exit}' go.mod)" \
+  go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
 echo "pre-push: passed."

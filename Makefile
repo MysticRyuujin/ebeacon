@@ -42,7 +42,12 @@ vet:
 	@go vet ./...
 
 vuln:
-	@go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+	@# Pin GOTOOLCHAIN to the Go version declared in go.mod so local vuln
+	@# scans use the same stdlib as CI (which installs Go per go.mod). Without
+	@# this, a developer running a newer local Go than go.mod declares will
+	@# silently miss stdlib vulns that CI reports against the older toolchain.
+	@GOTOOLCHAIN=go$$(awk '/^go /{print $$2; exit}' go.mod) \
+		go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
 mod-check:
 	@cp go.mod go.mod.bak && cp go.sum go.sum.bak
