@@ -91,6 +91,58 @@ func TestBlockCache_ForkStatus_LaggingBeyondDistance(t *testing.T) {
 	}
 }
 
+func TestBlockCache_CanonicalHeadSeenBy_ReturnsReporters(t *testing.T) {
+	t.Parallel()
+	bc := NewBlockCache(32, 2)
+
+	bc.AddBlock("a", 100, "root-canon", "p99")
+	bc.AddBlock("b", 100, "root-canon", "p99")
+	// Competing head at the same slot; should not appear in the canonical set.
+	bc.AddBlock("c", 100, "root-fork", "p99")
+	// Lagging upstream one slot back; should not appear either.
+	bc.AddBlock("d", 99, "root-prev", "p98")
+
+	seen := bc.CanonicalHeadSeenBy()
+	if len(seen) != 2 || !seen["a"] || !seen["b"] {
+		t.Fatalf("expected {a,b} as canonical head reporters, got %v", seen)
+	}
+	if seen["c"] || seen["d"] {
+		t.Fatalf("forked/lagging upstreams must not appear in canonical set: %v", seen)
+	}
+}
+
+func TestBlockCache_CanonicalHeadSeenBy_EmptyBeforeAnyBlocks(t *testing.T) {
+	t.Parallel()
+	bc := NewBlockCache(32, 2)
+
+	if got := bc.CanonicalHeadSeenBy(); got != nil {
+		t.Fatalf("expected nil before any blocks observed, got %v", got)
+	}
+}
+
+func TestBlockCache_CanonicalHeadSeenBy_ExcludesRemote(t *testing.T) {
+	t.Parallel()
+	bc := NewBlockCache(32, 2)
+
+	// A canonical head reported only by another ebeacon instance via shared
+	// state cannot serve client requests locally and must not appear.
+	bc.AddBlock("remote", 100, "root-canon", "p99")
+
+	if got := bc.CanonicalHeadSeenBy(); got != nil {
+		t.Fatalf("expected nil when only remote has reported, got %v", got)
+	}
+
+	// Once a local upstream reports the same block, it becomes eligible.
+	bc.AddBlock("a", 100, "root-canon", "p99")
+	seen := bc.CanonicalHeadSeenBy()
+	if len(seen) != 1 || !seen["a"] {
+		t.Fatalf("expected {a} after local reports head, got %v", seen)
+	}
+	if seen["remote"] {
+		t.Fatalf("remote pseudo-ID must never appear in canonical set: %v", seen)
+	}
+}
+
 func TestAutoTuner_AdjustsRateOn429(t *testing.T) {
 	t.Parallel()
 	at := NewAutoTuner(10, 1, 100, time.Second, 0.2)

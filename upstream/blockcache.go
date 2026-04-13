@@ -145,6 +145,39 @@ func (bc *BlockCache) IsOnCanonicalFork(upstreamID string) bool {
 	return false
 }
 
+// CanonicalHeadSeenBy returns the set of upstream IDs that have reported the
+// canonical head block. It is used by the router to hard-prefer upstreams that
+// are guaranteed to have the newest head when serving requests for named-head
+// paths (/head, /finalized, /justified). Returns nil if no canonical head is
+// known yet; callers should fail open in that case.
+//
+// The "remote" pseudo-ID published by other ebeacon instances via shared state
+// is excluded from the result because it cannot serve client requests.
+func (bc *BlockCache) CanonicalHeadSeenBy() map[string]bool {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+
+	_, canonRoot := bc.canonicalHeadLocked()
+	if canonRoot == "" {
+		return nil
+	}
+	b, ok := bc.rootMap[canonRoot]
+	if !ok || len(b.SeenBy) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(b.SeenBy))
+	for id := range b.SeenBy {
+		if id == "remote" {
+			continue
+		}
+		out[id] = true
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // ForkStatus returns a descriptive status for the upstream's fork position:
 //   - "canonical" — the upstream has reported the canonical head block or is
 //     slightly behind (within maxHeadDistance) on the same chain.

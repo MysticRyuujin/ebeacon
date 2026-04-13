@@ -41,29 +41,32 @@ var (
 	}, []string{"network"})
 )
 
-// headWatcher maintains a best-effort SSE subscription to one upstream's head
-// event topic. When a new head is announced, it purges cached responses for
-// named-slot-ID paths (head, finalized, justified) so stale data is not served
-// across a slot boundary.
+// headWatcher maintains one best-effort SSE subscription per upstream to the
+// head event topic. When a new head is announced, it records the block into
+// the pool's BlockCache (so routing can hard-prefer upstreams that have seen
+// the new head) and purges cached responses for named-slot-ID paths (head,
+// finalized, justified) so stale data is not served across a slot boundary.
 //
-// Behaviour on failure: the watcher reconnects with exponential backoff, trying
-// a different upstream on each attempt. If no upstream is available the watcher
-// sleeps and retries. The request path is never blocked by watcher state.
+// Behaviour on failure: each per-upstream watcher reconnects with exponential
+// backoff and is independent of the others. The request path is never blocked
+// by watcher state.
 type headWatcher struct {
 	networkID string
 	pool      *upstream.Pool
 	cache     *cache.Cache
 	warm      func(context.Context, *upstream.Upstream, []string)
 	done      chan struct{}
+	wg        sync.WaitGroup
 
 	// cancelWarm cancels the previous warm goroutine so stale pre-warm
-	// requests don't race with a newer invalidation cycle.
+	// requests don't race with a newer invalidation cycle. Shared across all
+	// per-upstream watchers so only one pre-warm is in flight at a time.
 	warmMu     sync.Mutex
 	cancelWarm context.CancelFunc
 }
 
-// startHeadWatcher starts the background watcher goroutine. It exits when ctx
-// is cancelled.
+// startHeadWatcher starts the background watcher goroutines, one per upstream.
+// Exits when ctx is cancelled.
 func startHeadWatcher(ctx context.Context, networkID string, pool *upstream.Pool, c *cache.Cache, warm func(context.Context, *upstream.Upstream, []string)) *headWatcher {
 	w := &headWatcher{
 		networkID: networkID,
@@ -76,11 +79,27 @@ func startHeadWatcher(ctx context.Context, networkID string, pool *upstream.Pool
 	return w
 }
 
-// wait blocks until the watcher goroutine has exited.
+// wait blocks until all watcher goroutines have exited.
 func (w *headWatcher) wait() { <-w.done }
 
 func (w *headWatcher) run(ctx context.Context) {
 	defer close(w.done)
+
+	// Snapshot the upstream set once at startup. The pool does not currently
+	// support dynamic add/remove of upstreams after construction, so a single
+	// snapshot is sufficient.
+	upstreams := w.pool.All()
+	for _, u := range upstreams {
+		w.wg.Add(1)
+		go w.watchUpstream(ctx, u)
+	}
+	w.wg.Wait()
+}
+
+// watchUpstream maintains a single long-lived SSE subscription to u, with
+// exponential backoff on failure.
+func (w *headWatcher) watchUpstream(ctx context.Context, u *upstream.Upstream) {
+	defer w.wg.Done()
 
 	const (
 		minBackoff      = 1 * time.Second
@@ -89,26 +108,11 @@ func (w *headWatcher) run(ctx context.Context) {
 	)
 
 	backoff := minBackoff
-	upstreamIdx := 0
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-
-		candidates := w.pool.All()
-		if len(candidates) == 0 {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(backoff):
-				backoff = min(backoff*2, maxBackoff)
-			}
-			continue
-		}
-
-		u := candidates[upstreamIdx%len(candidates)]
-		upstreamIdx++
 
 		start := time.Now()
 		err := w.subscribe(ctx, u)
@@ -267,6 +271,10 @@ func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error
 func (w *headWatcher) dispatchEvent(ctx context.Context, u *upstream.Upstream, isHead, isFinalized, isReorg, sawEventName bool, data string) {
 	switch {
 	case isHead || !sawEventName:
+		// Record the block in the BlockCache first so routing decisions
+		// made inside the pre-warm request can already see this upstream
+		// as a canonical-head reporter.
+		w.recordHeadSeen(u, data)
 		w.invalidateHeadCache(ctx, u)
 	case isFinalized:
 		w.handleFinalizedCheckpoint(data)
@@ -275,7 +283,46 @@ func (w *headWatcher) dispatchEvent(ctx context.Context, u *upstream.Upstream, i
 	}
 }
 
+// recordHeadSeen parses the JSON payload of a head SSE event and records the
+// block into the pool's BlockCache. This lets the router hard-prefer this
+// upstream for subsequent /head, /finalized, /justified requests — closing the
+// race where a client receives the event and immediately queries the block
+// before slower upstreams have caught up.
+//
+// Head event payload shape (Beacon API spec):
+//
+//	{"slot":"123","block":"0xabc...","state":"...","epoch_transition":false,...}
+//
+// Malformed or empty payloads are silently ignored; the cache-invalidation
+// path still runs so cache correctness is preserved even if parsing fails.
+func (w *headWatcher) recordHeadSeen(u *upstream.Upstream, data string) {
+	if data == "" {
+		return
+	}
+	var payload struct {
+		Slot  string `json:"slot"`
+		Block string `json:"block"`
+	}
+	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		slog.Debug("head watcher: failed to parse head data",
+			"network", w.networkID, "upstream", u.ID, "err", err)
+		return
+	}
+	slot, err := strconv.ParseUint(payload.Slot, 10, 64)
+	if err != nil || slot == 0 || payload.Block == "" {
+		return
+	}
+	u.UpdateHeadBlock(slot, payload.Block, "")
+	w.pool.BlockCache().AddBlock(u.ID, slot, payload.Block, "")
+	w.pool.SyncCanonicalHead()
+}
+
 func (w *headWatcher) invalidateHeadCache(ctx context.Context, u *upstream.Upstream) {
+	// No-op on networks with caching disabled; recordHeadSeen still runs
+	// unconditionally so BlockCache-based routing keeps working.
+	if w.cache == nil {
+		return
+	}
 	// Single-pass: purge matching entries and collect their keys for warming.
 	n, keys := w.cache.PurgeCollect(isNamedHeadCacheKey)
 	if n == 0 {
@@ -324,7 +371,13 @@ func (w *headWatcher) handleFinalizedCheckpoint(data string) {
 		return
 	}
 
+	// Pool epoch tracking is independent of caching and must always run.
 	w.pool.UpdateFinalizedEpoch(epoch)
+
+	// Cache promotion only applies when caching is enabled.
+	if w.cache == nil {
+		return
+	}
 
 	finalizedSlot := epoch*32 + 31
 	n := w.cache.PromoteIf(func(key string) bool {
@@ -351,6 +404,9 @@ func (w *headWatcher) handleFinalizedCheckpoint(data string) {
 // responses for numeric slots at or above the reorg slot. These entries
 // may contain data from the now-orphaned fork.
 func (w *headWatcher) handleChainReorg(data string) {
+	if w.cache == nil {
+		return
+	}
 	var payload struct {
 		Slot string `json:"slot"`
 	}

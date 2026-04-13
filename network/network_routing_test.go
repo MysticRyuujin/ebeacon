@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/ebeacon/ebeacon/config"
@@ -392,5 +393,101 @@ networks:
 	}
 	if got := recPinned.Header().Get("X-Ebeacon-Cache"); got == "HIT" {
 		t.Fatal("client-pinned route should not reuse the shared cache entry")
+	}
+}
+
+// TestNetwork_NamedHeadPathPrefersCanonicalReporter verifies the full
+// end-to-end routing path: a request to /eth/v1/beacon/headers/head must be
+// routed to the upstream that has reported the canonical head block, even
+// when a different upstream would normally win on score.
+func TestNetwork_NamedHeadPathPrefersCanonicalReporter(t *testing.T) {
+	var aHits, bHits atomic.Int64
+
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		aHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":{"root":"0xprev"}}`))
+	}))
+	defer a.Close()
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":{"root":"0xhead"}}`))
+	}))
+	defer b.Close()
+
+	id := netID(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ebeacon.yaml")
+	// maxHeadDistance left at default (2) so upstreams one slot behind the
+	// canonical head are still considered on the canonical fork and remain
+	// in the candidate pool. This mirrors the real race: "a-fast" passes the
+	// existing fork filter and wins score-based routing, even though it has
+	// not yet reported the new head block.
+	yaml := fmt.Sprintf(`logLevel: error
+server: { host: "127.0.0.1", port: 5555, maxTimeout: 30s }
+failsafe: { timeout: { duration: 10s } }
+health: { checkInterval: 1h, finalityInterval: 1h, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: %s
+    upstreams:
+      - id: a-fast
+        url: %q
+      - id: b-canon
+        url: %q
+    routing:
+      loadBalancing: score
+      stickySession: false
+    cache:
+      enabled: false
+`, id, a.URL, b.URL)
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Mark both upstreams healthy and synced at slot 127 (the previous head).
+	aFast := n.pool.ByID("a-fast")
+	bCanon := n.pool.ByID("b-canon")
+	aFast.UpdateSyncStatus(false, 127, 0)
+	bCanon.UpdateSyncStatus(false, 127, 0)
+	n.pool.BlockCache().AddBlock("a-fast", 127, "0xprev", "0x0")
+	n.pool.BlockCache().AddBlock("b-canon", 127, "0xprev", "0x0")
+
+	// Only b-canon has observed slot 128 — the new canonical head, as if it
+	// just fired a head SSE event that a downstream client is now acting on.
+	n.pool.BlockCache().AddBlock("b-canon", 128, "0xhead", "0xprev")
+
+	// Drive scores so a-fast would otherwise dominate by a wide margin.
+	for range 20 {
+		aFast.RecordSuccess(2 * 1e6) // 2ms
+		bCanon.RecordSuccess(500 * 1e6)
+	}
+
+	for range 20 {
+		req := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/headers/head", nil)
+		rec := httptest.NewRecorder()
+		n.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d body %q", rec.Code, rec.Body.String())
+		}
+	}
+
+	if aHits.Load() != 0 {
+		t.Fatalf("a-fast must not receive /head requests while it has not reported the canonical head; got %d hits", aHits.Load())
+	}
+	if bHits.Load() != 20 {
+		t.Fatalf("expected all 20 /head requests routed to b-canon, got %d", bHits.Load())
 	}
 }
