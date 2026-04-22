@@ -17,6 +17,7 @@ eBeacon is a fault-tolerant, high-performance reverse proxy for Ethereum Beacon 
 - Per-upstream rate limit auto-tuner (adapts to 429 responses)
 - Sticky sessions with automatic rebalancing
 - Upstream priority tiers for preferred and backup upstreams
+- Archive upstream routing (serve historical queries pruned nodes can't)
 - Per-method/path failsafe overrides
 - gzip compression (client-proxy and proxy-upstream)
 - Configurable CORS for browser clients and frontend apps
@@ -305,6 +306,43 @@ networks:
 With that setup, eBeacon prefers the local tier for primary traffic and only reaches the backup tier when the local tier is exhausted by health, fork exclusion, or retry / hedge behavior.
 
 The live composite score is exposed in both the embedded dashboard (`/webui`, Upstreams table) and Prometheus. The main metrics are `ebeacon_upstream_score`, `ebeacon_upstream_score_error_rate`, `ebeacon_upstream_score_p90_latency_seconds`, and `ebeacon_upstream_score_head_lag`, and the bundled Grafana overview dashboard includes them in the per-upstream table.
+
+## Archive vs Pruned Upstream Routing
+
+Beacon nodes prune historical state by default (about 8 days of full historical states and roughly 18 days of blob sidecars for typical clients — blocks are retained longer but still finite). If every upstream in a pool is pruned, a client asking for `/eth/v2/beacon/blocks/2000000` or a 6-month-old blob sidecar gets a 404 and nothing else eBeacon can do. Marking specific upstreams as **archive** lets eBeacon route those historical-data requests to upstreams that can actually serve them.
+
+```yaml
+networks:
+  - id: mainnet
+    upstreams:
+      - id: lighthouse
+        url: "http://lh:5052"
+        priority: 0 # local pruned
+      - id: quicknode
+        url: "https://..."
+        priority: 10
+        archive: true # serves historical data when the local tier can't
+```
+
+The default is `archive: false`, matching the CL default. Only mark upstreams you have verified to retain full history.
+
+Two mechanisms decide when archive upstreams get used:
+
+1. **Proactive classification.** Request paths that carry a numeric slot, epoch, or block root are classified up front. If the target is older than the per-endpoint retention window (blob sidecars ~18 days, blocks ~5 months, states ~27 hours, duties 1 epoch), eBeacon skips pruned upstreams on the first attempt and routes to archive-capable ones directly. Named identifiers (`head`, `finalized`, `justified`, `genesis`) and root-based lookups cannot be classified this way and flow through normal routing.
+
+2. **Error-driven fallthrough.** If a pruned upstream returns a 404 for any historical-id path — by-root lookups, or requests that sat just inside our conservative retention threshold but outside the client's actual retention — eBeacon promotes the remaining retry budget to archive upstreams and continues the request without the client seeing the 404.
+
+Priority still applies within the archive subset. A `priority: 0` local archive beats a `priority: 10` cloud archive. If no upstream is marked `archive: true`, behavior matches pre-archive releases: pruning-shaped 404s propagate to the client unchanged, and `ebeacon_pruning_error_no_archive_total` ticks so operators can see the signal that adding an archive upstream would help.
+
+Relevant Prometheus metrics:
+
+- `ebeacon_upstream_archive{network,upstream}` — 1 if archive, 0 if pruned
+- `ebeacon_archive_promotion_total{network,reason}` — counter, `reason` is `proactive` or `pruning_error`
+- `ebeacon_pruning_error_no_archive_total{network}` — counter of pruning-shaped 404s returned because no archive upstream exists
+
+The bundled Grafana overview dashboard has an **Archive Routing** row covering all three.
+
+When hedge is enabled (`failsafe.hedge`) and proactive archive routing fires, multiple parallel requests go to archive upstreams simultaneously. For metered providers like QuickNode or Alchemy, either disable hedge for that network or set per-upstream `rateLimiting.autoTune` to stay inside your plan.
 
 ## Caching
 

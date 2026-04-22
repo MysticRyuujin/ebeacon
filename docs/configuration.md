@@ -57,6 +57,7 @@ Use top-level `networks:` and optionally top-level `auth:`. Let HAProxy rewrite 
 - `cache.maxSize`: `2048`
 - `cache.driver`: `memory`
 - `upstream.weight`: `1` when omitted
+- `upstream.archive`: `false` when omitted (default is pruned, matching CL client defaults)
 
 Validation examples:
 
@@ -180,6 +181,7 @@ networks:
 
 - Lower `priority` is preferred. `0` is your primary tier, `1` is a backup tier, `2` is a deeper fallback tier, and so on.
 - `weight` biases routing inside a priority tier. Higher weight means more traffic share for `round-robin`, `random`, and `score`, and more effective capacity for `least-conn`.
+- `archive: true` marks the upstream as retaining full chain history. Used only for requests that target data older than a pruned node retains. See [Archive upstreams](#archive-upstreams) below.
 - Optional per-upstream `rateLimiting.autoTune` adapts to upstream `429` responses.
 - Top-level `auth:` applies here, including path-auth `/{apiKey}/{networkId}/eth/v1/...`.
 
@@ -225,6 +227,58 @@ networks:
 With `retry.maxAttempts: 1`, the backup tier is only used when no primary-tier upstream is eligible.
 
 With `retry.maxAttempts > 1`, retries walk the ordered list, so backup tiers can receive traffic after failures from the preferred tier.
+
+### Archive upstreams
+
+Consensus-layer (CL) nodes prune historical state by default. Typical client retention is roughly 8 days of historical states, ~18 days of blob sidecars, and several months of blocks. Requests for data older than that return a 404 from a pruned node. Marking specific upstreams as **archive** tells eBeacon they retain full history and can serve those historical-data requests.
+
+```yaml
+networks:
+  - id: mainnet
+    upstreams:
+      - id: lighthouse
+        url: "http://lh:5052"
+        priority: 0
+      - id: prysm
+        url: "http://prysm:3500"
+        priority: 0
+      - id: quicknode
+        url: "https://your-endpoint.quiknode.pro/..."
+        priority: 10
+        archive: true
+        headers:
+          Authorization: "Bearer ${QUICKNODE_TOKEN}"
+        rateLimiting:
+          autoTune: true
+          initialRate: 10
+          maxRate: 25
+```
+
+The default is `archive: false`, which matches the CL client default — only set `archive: true` on upstreams you have verified retain full history.
+
+Two routing behaviors are driven by the flag:
+
+1. **Proactive routing on first attempt.** When the request path carries a numeric slot, epoch, or block root, eBeacon extracts the target identifier and compares it to a per-endpoint retention window:
+
+   | Endpoint family | Retention threshold | Source |
+   | --- | --- | --- |
+   | `/eth/v1/beacon/blob_sidecars/{block_id}` | 4096 epochs (~18 days) | `MIN_EPOCHS_FOR_BLOB_SIDECARS_REQUESTS` (EIP-4844) |
+   | `/eth/v1/beacon/states/{state_id}/...` | 8192 slots (~27 hours) | conservative; real Lighthouse/Prysm retention varies |
+   | `/eth/v{1,2}/beacon/blocks/{block_id}` and related | 33024 epochs (~5 months) | `MIN_EPOCHS_FOR_BLOCK_REQUESTS` (spec) |
+   | `/eth/v1/validator/duties/{attester,proposer,sync}/{epoch}` | current epoch + 1 | Beacon API spec |
+   | `/eth/v1/beacon/rewards/attestations/{epoch}` | current epoch + 1 | Beacon API spec |
+
+   When the target is demonstrably older than the threshold, eBeacon routes directly to `archive: true` upstreams on the first attempt and skips the pruned tier entirely. Named identifiers (`head`, `finalized`, `justified`, `genesis`) are always served by pruned nodes and are not classified this way.
+
+2. **Error-driven fallthrough on 404.** For cases proactive classification cannot cover (by-root lookups where the slot is unknown, or requests that sat just inside the conservative threshold but outside the client's actual retention), eBeacon watches for pruning-shaped responses. A 404 on any historical-id path triggers promotion: the remaining retry budget is filled with archive-capable candidates and the request continues. The client does not see the 404 unless the archive tier also fails.
+
+Priority continues to apply inside the archive subset. A `priority: 0` local archive node beats a `priority: 10` cloud archive provider. The same `weight` and load-balancing rules apply between equal-priority archive upstreams.
+
+If no upstream in the pool is marked `archive: true`, behavior is unchanged from pre-archive releases: pruning-shaped 404s propagate to clients, and `ebeacon_pruning_error_no_archive_total` (see [Operations Guide](operations.md#metrics)) ticks so you can see the signal that configuring an archive upstream would convert those errors into successful responses.
+
+**Pruning detection is heuristic-based.** eBeacon treats an HTTP 404 on a historical-id path as pruning-shaped. Body substrings are intentionally not matched (Lighthouse, Prysm, Teku, and Nimbus use different error wording that changes between versions). The cost of a false positive is one extra upstream roundtrip; the archive retry will fail identically and return the 404 the client would have seen anyway.
+
+**Hedge and archive quota.** When `failsafe.hedge` is enabled alongside proactive archive routing, multiple parallel requests fire to archive upstreams for a single historical request. For metered providers (QuickNode, Alchemy tiered plans), either disable hedge for that network or rely on per-upstream `rateLimiting.autoTune` to stay inside your allotment.
 
 ## `routing`
 

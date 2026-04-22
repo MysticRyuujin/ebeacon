@@ -75,6 +75,14 @@ Per-path score metrics (labelled by `api_path`) include:
 
 The `api_path` label is a normalized route template (e.g. `/eth/v1/beacon/headers/{block_id}`) rather than a raw URL, so cardinality stays bounded regardless of request volume. These metrics let you see whether a specific endpoint class (validator duties, state queries, blob sidecars, etc.) is driving latency or errors on a particular upstream before the global score reflects it.
 
+Archive routing metrics (see [Configuration: Archive upstreams](configuration.md#archive-upstreams)):
+
+- `ebeacon_upstream_archive{network,upstream}` — gauge, `1` if the upstream is configured with `archive: true`, `0` otherwise.
+- `ebeacon_archive_promotion_total{network,reason}` — counter of requests routed to archive upstreams. `reason` is `proactive` (the target slot/epoch was older than the retention window so archive was used on the first attempt) or `pruning_error` (a pruned upstream returned a 404 and the retry budget was promoted to archive candidates).
+- `ebeacon_pruning_error_no_archive_total{network}` — counter of pruning-shaped 404s returned to clients because no upstream in the network is marked `archive: true`. A sustained non-zero rate here is a direct signal that configuring an archive upstream would convert those errors into successful responses.
+
+The bundled Grafana overview dashboard has an **Archive Routing** row covering these, including an overlay of promotions vs no-archive 404s to help decide whether to add an archive upstream to a network.
+
 ## Logging
 
 `logLevel` supports `debug`, `info`, `warn`, `error`.
@@ -184,6 +192,40 @@ Operationally, this means:
 - hedging can also send traffic to backup tiers if they are inside the top `maxCount + 1` ordered candidates.
 
 If you want the backup provider to be true cold standby, keep `retry.maxAttempts: 1` and disable hedging for that network.
+
+## Archive Upstream Pattern
+
+If your local nodes are pruned (the CL client default) and clients request data older than those nodes retain — historical blocks, old blob sidecars, pre-finalization state — configure a provider that retains full history and mark it `archive: true`:
+
+```yaml
+networks:
+  - id: mainnet
+    upstreams:
+      - id: lighthouse
+        url: "http://lh:5052"
+        priority: 0
+      - id: archive-provider
+        url: "https://archive.example-provider.com"
+        priority: 10
+        archive: true
+        headers:
+          Authorization: "Bearer ${ARCHIVE_TOKEN}"
+        rateLimiting:
+          autoTune: true
+          initialRate: 10
+          maxRate: 25
+```
+
+Operationally, this means:
+
+- Recent requests continue to flow to the pruned tier, exactly as before.
+- Requests demonstrably targeting historical data (e.g. `/eth/v1/beacon/blob_sidecars/{slot}` where the slot is more than 18 days behind head) are routed to the archive tier on the first attempt, skipping pruned upstreams entirely.
+- Requests that can't be classified up front (typically by-root lookups) flow to the pruned tier first; if a 404 comes back, the retry budget is promoted to archive upstreams and the request continues. The client sees success as long as the archive tier can serve it.
+- Priority ordering is preserved inside the archive subset, so a local archive node at `priority: 0` would still beat the cloud archive at `priority: 10` if both were archive-capable.
+
+If `ebeacon_pruning_error_no_archive_total{network="mainnet"}` is non-zero without an archive upstream configured, clients are asking for data your pruned nodes cannot serve. Watch `ebeacon_archive_promotion_total` after enabling archive to see the load pattern: a high `reason="proactive"` rate indicates well-classified historical traffic, while a high `reason="pruning_error"` rate indicates root-based lookups or requests near the retention boundary — both are expected and harmless.
+
+If `failsafe.hedge` is enabled for a network that also has archive upstreams, historical requests trigger parallel archive calls under hedge semantics. For metered providers, prefer disabling hedge on the archive-using network, or rely on per-upstream `rateLimiting.autoTune` to throttle to your plan limits.
 
 ## Horizontal Scaling
 
