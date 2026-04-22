@@ -1658,6 +1658,171 @@
         "cellHeight": "sm",
         "footer": { "show": false }
       }
+    },
+    {
+      "id": 200,
+      "type": "row",
+      "title": "Archive Routing",
+      "description": "Routing of historical-data requests to archive-capable upstreams.",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 174 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 201,
+      "type": "timeseries",
+      "title": "Archive promotions/s by reason",
+      "description": "Rate of requests routed to archive upstreams, broken down by why: `proactive` = target slot/epoch was demonstrably older than the per-endpoint retention window (classified before any upstream was tried); `pruning_error` = a pruned upstream returned a 404 on a historical-id path and the retry budget was promoted to archive candidates.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 175 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(ebeacon_archive_promotion_total{network=~\"$network\"}[5m]))",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 3,
+          "custom": { "drawStyle": "line", "fillOpacity": 18, "showPoints": "never", "stacking": { "mode": "normal" } }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "proactive" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "pruning_error" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "mean", "max"] },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 202,
+      "type": "stat",
+      "title": "Pruning 404s returned (no archive configured)",
+      "description": "Rate of pruning-shaped 404s returned to clients because no upstream in this network is marked archive: true. A sustained non-zero rate means clients are asking for historical data your pruned nodes cannot serve — configuring an archive upstream would convert these into successful responses.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 175 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(ebeacon_pruning_error_no_archive_total{network=~\"$network\"}[5m]))",
+          "legendFormat": "no-archive 404/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.01 },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 203,
+      "type": "table",
+      "title": "Archive-capable upstreams",
+      "description": "Per-upstream `archive` flag. A value of 1 means the upstream is eligible to serve historical-data requests promoted via archive routing; 0 means it is treated as pruned and skipped for known-historical requests.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 175 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (upstream, network) (ebeacon_upstream_archive{network=~\"$network\"})",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Time" }, "properties": [{ "id": "custom.hidden", "value": true }] },
+          { "matcher": { "id": "byName", "options": "Value" }, "properties": [{ "id": "displayName", "value": "archive" }, { "id": "mappings", "value": [ { "type": "value", "options": { "0": { "text": "pruned" }, "1": { "text": "archive" } } } ] }] }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "show": false }
+      }
+    },
+    {
+      "id": 204,
+      "type": "timeseries",
+      "title": "Archive promotions/s by network",
+      "description": "Per-network breakdown of archive promotion rate (sum of both reasons). Useful for finding which networks are exercising historical-data paths.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 183 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (network) (rate(ebeacon_archive_promotion_total{network=~\"$network\"}[5m]))",
+          "legendFormat": "{{network}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 3,
+          "custom": { "drawStyle": "line", "fillOpacity": 12, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "mean"] },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 205,
+      "type": "timeseries",
+      "title": "Archive promotions vs pruning-404 no-archive events",
+      "description": "Overlay of archive promotions (handled) against pruning 404s returned unhandled because no archive is configured. If the orange line is persistently non-zero, the network would benefit from adding an archive: true upstream.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 183 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(ebeacon_archive_promotion_total{network=~\"$network\"}[5m]))",
+          "legendFormat": "archive promotions/s"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(ebeacon_pruning_error_no_archive_total{network=~\"$network\"}[5m]))",
+          "legendFormat": "pruning 404 (no-archive)/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 3,
+          "custom": { "drawStyle": "line", "fillOpacity": 15, "showPoints": "never" }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "archive promotions/s" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "pruning 404 (no-archive)/s" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "mean", "max"] },
+        "tooltip": { "mode": "multi" }
+      }
     }
   ],
   "timepicker": {},

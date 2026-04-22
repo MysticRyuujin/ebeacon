@@ -104,6 +104,7 @@ type upstreamStatus struct {
 	ActiveConn        int64   `json:"activeConnections"`
 	Priority          int     `json:"priority"`
 	Weight            int     `json:"weight"`
+	Archive           bool    `json:"archive"`
 	Score             float64 `json:"score"`
 	ScoreErrorRate    float64 `json:"scoreErrorRate"`
 	ScoreP90LatencyMs float64 `json:"scoreP90LatencyMs"`
@@ -225,6 +226,7 @@ func (s *StatusAPI) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 				ActiveConn:        u.ActiveConns(),
 				Priority:          u.Priority,
 				Weight:            u.Weight,
+				Archive:           u.IsArchive(),
 				Score:             score.Score,
 				ScoreErrorRate:    score.ErrorRate,
 				ScoreP90LatencyMs: float64(score.P90Latency) / float64(time.Millisecond),
@@ -536,6 +538,7 @@ const upstreamColumns = [
 	{key:'headSlot',label:'Head Slot',type:'number'},
 	{key:'activeConnections',label:'Active',type:'number'},
 	{key:'priority',label:'Priority',type:'number'},
+	{key:'archive',label:'Archive',type:'string'},
 	{key:'fork',label:'Fork',type:'fork'}
 ];
 const defaultUpstreamSort = {key:'priority',direction:'asc'};
@@ -646,6 +649,7 @@ function renderUpstreamRow(upstream){
 		'<td>'+escapeHTML(upstream.headSlot)+'</td>'+
 		'<td>'+escapeHTML(upstream.activeConnections)+'</td>'+
 		'<td>'+escapeHTML(upstream.priority)+'</td>'+
+		'<td>'+(upstream.archive ? '<span class="badge up" title="Archive-capable: serves historical data pruned nodes may not have">archive</span>' : '<span class="cell-meta">pruned</span>')+'</td>'+
 		'<td class="'+(upstream.forkStatus === 'canonical' ? 'canonical' : upstream.forkStatus === 'lagging' ? 'lagging' : 'non-canonical')+'">'+(upstream.forkStatus || (upstream.onCanonicalFork ? 'canonical' : 'forked'))+'</td>'+
 	'</tr>';
 }

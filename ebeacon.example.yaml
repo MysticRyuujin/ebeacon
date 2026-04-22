@@ -187,6 +187,32 @@ networks:
           circuitBreaker:
             failureThreshold: 10
             halfOpenAfter: 60s
+      # Archive upstream example: a premium provider used only for historical
+      # data your pruned local nodes cannot serve. eBeacon routes requests to
+      # archive: true upstreams when (a) the request path targets a slot/epoch
+      # older than the per-endpoint retention window (proactive), or (b) a
+      # pruned upstream returns a 404 on a historical-id path (fallthrough).
+      # Priority still applies within the archive subset, so a priority-0
+      # local archive node beats a priority-10 cloud archive provider.
+      #
+      # Operational notes:
+      #  - Quota: when hedge is enabled (failsafe.hedge) and proactive archive
+      #    routing fires, multiple parallel requests go to archive upstreams.
+      #    For metered providers (QuickNode/Alchemy tiers), either disable
+      #    hedge for this network or rely on per-upstream rate limits below.
+      #  - A non-zero ebeacon_pruning_error_no_archive_total metric is a
+      #    signal that clients are requesting historical data your pruned
+      #    nodes cannot serve and adding an archive upstream would help.
+      # - id: quicknode
+      #   url: "https://your-endpoint.quiknode.pro/..."
+      #   priority: 10
+      #   archive: true
+      #   headers:
+      #     Authorization: "Bearer your-key"
+      #   rateLimiting:
+      #     autoTune: true
+      #     initialRate: 10
+      #     maxRate: 25
 
     routing:
       loadBalancing: round-robin  # round-robin | random | least-conn | score

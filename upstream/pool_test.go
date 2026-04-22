@@ -370,3 +370,84 @@ func TestPool_SelectForPathPreferCanonicalHead_FailsOpenWhenOnlyForkedHasHead(t 
 		}
 	}
 }
+
+func TestPool_SelectForPathArchive_FiltersToArchiveOnly(t *testing.T) {
+	t.Parallel()
+	health := config.HealthConfig{MaxSyncDistance: 10}
+	cb := &config.CircuitBreakerConfig{
+		FailureThreshold: 5,
+		SuccessThreshold: 2,
+		HalfOpenAfter:    30 * time.Second,
+	}
+	p, err := NewPool(fmt.Sprintf("pool_%d_%s", poolLabelSeq.Add(1), strings.ReplaceAll(t.Name(), "/", "_")), []config.UpstreamConfig{
+		{ID: "pruned-a", URL: "http://a", Priority: 0, Archive: false},
+		{ID: "pruned-b", URL: "http://b", Priority: 0, Archive: false},
+		{ID: "archive-local", URL: "http://c", Priority: 0, Archive: true},
+		{ID: "archive-cloud", URL: "http://d", Priority: 10, Archive: true},
+	}, config.RoutingConfig{LoadBalancing: "round-robin"}, health, cb)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ups := p.SelectForPathArchive("/eth/v2/beacon/blocks/12345", 4)
+	if len(ups) != 2 {
+		t.Fatalf("expected 2 archive-capable upstreams, got %d: %+v", len(ups), upstreamIDs(ups))
+	}
+	for _, u := range ups {
+		if !u.IsArchive() {
+			t.Fatalf("non-archive upstream %q returned from SelectForPathArchive", u.ID)
+		}
+	}
+	// Priority within archive set: local (priority 0) must come before cloud (priority 10)
+	if ups[0].ID != "archive-local" {
+		t.Fatalf("priority-0 archive upstream should be preferred, got %q first", ups[0].ID)
+	}
+}
+
+func TestPool_SelectForPathArchive_NoArchiveReturnsNil(t *testing.T) {
+	t.Parallel()
+	health := config.HealthConfig{MaxSyncDistance: 10}
+	cb := &config.CircuitBreakerConfig{
+		FailureThreshold: 5,
+		SuccessThreshold: 2,
+		HalfOpenAfter:    30 * time.Second,
+	}
+	p, err := NewPool(fmt.Sprintf("pool_%d_%s", poolLabelSeq.Add(1), strings.ReplaceAll(t.Name(), "/", "_")), []config.UpstreamConfig{
+		{ID: "pruned-a", URL: "http://a"},
+		{ID: "pruned-b", URL: "http://b"},
+	}, config.RoutingConfig{LoadBalancing: "round-robin"}, health, cb)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := p.SelectForPathArchive("/eth/v2/beacon/blocks/12345", 2); got != nil {
+		t.Fatalf("expected nil when no archive upstreams configured, got %+v", upstreamIDs(got))
+	}
+	if p.HasArchive() {
+		t.Fatalf("HasArchive should be false when no archive upstreams configured")
+	}
+}
+
+func TestPool_HasArchive(t *testing.T) {
+	t.Parallel()
+	health := config.HealthConfig{MaxSyncDistance: 10}
+	cb := &config.CircuitBreakerConfig{FailureThreshold: 5, SuccessThreshold: 2, HalfOpenAfter: 30 * time.Second}
+	p, err := NewPool(fmt.Sprintf("pool_%d_%s", poolLabelSeq.Add(1), strings.ReplaceAll(t.Name(), "/", "_")), []config.UpstreamConfig{
+		{ID: "pruned", URL: "http://a"},
+		{ID: "archive", URL: "http://b", Archive: true},
+	}, config.RoutingConfig{LoadBalancing: "round-robin"}, health, cb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.HasArchive() {
+		t.Fatalf("HasArchive should be true when at least one archive upstream exists")
+	}
+}
+
+func upstreamIDs(ups []*Upstream) []string {
+	ids := make([]string, len(ups))
+	for i, u := range ups {
+		ids[i] = u.ID
+	}
+	return ids
+}

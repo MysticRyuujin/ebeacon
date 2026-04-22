@@ -348,6 +348,44 @@ func (p *Pool) SelectForPathPreferCanonicalHead(apiPath string, n int) []*Upstre
 	return p.selectFromCandidatesForPath(all, n, apiPath, true)
 }
 
+// SelectForPathArchive is like SelectForPath but restricts the candidate set
+// to upstreams explicitly marked as archive-capable. Used when a request
+// targets historical data pruned nodes may no longer retain.
+//
+// Priority and load-balancing still apply within the archive subset — a
+// priority-0 archive upstream is preferred over a priority-10 archive upstream
+// exactly as with normal selection.
+//
+// If no upstream is marked archive, returns nil. Callers MUST handle this case:
+// typically by falling back to SelectForPath (for proactive classification,
+// where we guessed wrong about archive being needed) or by surfacing the
+// upstream error unchanged (for error-driven retry, where no archive exists
+// to promote to).
+func (p *Pool) SelectForPathArchive(apiPath string, n int) []*Upstream {
+	p.mu.RLock()
+	archives := filter(p.upstreams, (*Upstream).IsArchive)
+	p.mu.RUnlock()
+	if len(archives) == 0 {
+		return nil
+	}
+	return p.selectFromCandidatesForPath(archives, n, apiPath, false)
+}
+
+// HasArchive reports whether any upstream in the pool is configured as archive.
+// Used by the routing layer to decide whether archive-aware routing is enabled
+// for this pool; when no archive upstream exists, pruning errors are returned
+// unchanged (no behavior change from pre-archive versions).
+func (p *Pool) HasArchive() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, u := range p.upstreams {
+		if u.IsArchive() {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Pool) selectFromCandidatesForPath(all []*Upstream, n int, apiPath string, preferCanonicalHead bool) []*Upstream {
 	// Prefer upstreams that are both healthy and on the canonical fork.
 	// Fall back progressively: canonical+ready → any ready → any healthy → all.

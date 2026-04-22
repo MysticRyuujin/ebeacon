@@ -112,6 +112,7 @@ type UpstreamConfig struct {
 	Failsafe     *FailsafeConfig          `yaml:"failsafe"` // overrides network/global
 	Priority     int                      `yaml:"priority"` // lower = preferred (default 0)
 	Weight       int                      `yaml:"weight"`   // relative weight within same priority (default 1)
+	Archive      bool                     `yaml:"archive"`  // true = serves historical data pruned nodes may 404 for
 	RateLimiting *UpstreamRateLimitConfig `yaml:"rateLimiting"`
 }
 
