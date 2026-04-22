@@ -118,6 +118,11 @@ var (
 		Name: "ebeacon_upstream_finalized_epoch",
 		Help: "Latest observed finalized epoch for each upstream",
 	}, []string{"network", "upstream"})
+
+	metricArchive = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ebeacon_upstream_archive",
+		Help: "Whether upstream is configured as archive (1=archive, 0=pruned)",
+	}, []string{"network", "upstream"})
 )
 
 // Known consensus client types (auto-detected via /eth/v1/node/version).
@@ -141,6 +146,7 @@ type Upstream struct {
 	Client    *http.Client
 	Priority  int
 	Weight    int
+	Archive   bool
 
 	// Health state
 	mu             sync.RWMutex
@@ -197,6 +203,7 @@ func New(networkID string, cfg config.UpstreamConfig, defaultCB *config.CircuitB
 		Client:       &http.Client{Transport: transport},
 		Priority:     cfg.Priority,
 		Weight:       cfg.Weight,
+		Archive:      cfg.Archive,
 		health:       HealthUp,
 		clientType:   ClientUnknown,
 		scorer:       NewScoreTracker(scoreWindowSize),
@@ -245,6 +252,11 @@ func New(networkID string, cfg config.UpstreamConfig, defaultCB *config.CircuitB
 	metricRoutingScoreHeadLag.WithLabelValues(networkID, u.ID).Set(0)
 	metricRoutingScoreSamples.WithLabelValues(networkID, u.ID).Set(0)
 	metricFinalizedEpoch.WithLabelValues(networkID, u.ID).Set(0)
+	if cfg.Archive {
+		metricArchive.WithLabelValues(networkID, u.ID).Set(1)
+	} else {
+		metricArchive.WithLabelValues(networkID, u.ID).Set(0)
+	}
 
 	return u
 }
@@ -252,6 +264,13 @@ func New(networkID string, cfg config.UpstreamConfig, defaultCB *config.CircuitB
 // IsReady returns true if the upstream is healthy and the circuit breaker allows requests.
 func (u *Upstream) IsReady() bool {
 	return u.IsHealthy() && u.cbAllow()
+}
+
+// IsArchive returns true if the upstream is explicitly marked as archive-capable.
+// Archive upstreams are expected to serve historical data that pruned nodes may
+// have already pruned (old blocks, old states, old blob sidecars).
+func (u *Upstream) IsArchive() bool {
+	return u.Archive
 }
 
 // IsHealthy returns true if the upstream is reachable (up or degraded).

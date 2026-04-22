@@ -1048,8 +1048,39 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 	// upstreams have caught up. Detection uses the raw URL path because the
 	// normalized apiPath collapses "head" into "{block_id}".
 	preferCanonicalHead := pathHasNamedSlotID(r.URL.Path)
+
+	// Archive-aware routing: classify the request path to detect historical
+	// targets (slot/epoch/root identifiers on /beacon/blocks, /blob_sidecars,
+	// /states, /validator/duties, etc.). When the target is demonstrably older
+	// than the per-endpoint retention window AND at least one upstream is
+	// marked archive, route directly to archive upstreams on the first attempt.
+	// This avoids the wasted roundtrip to a pruned upstream that would 404.
+	// The error-driven fallthrough below catches cases this misses (root-based
+	// lookups, or retention windows more aggressive than our conservative
+	// thresholds).
+	target := classifyHistoricalTarget(r.URL.Path)
+	proactiveArchive := n.pool.HasArchive() && target.RequiresArchive(n.pool.BlockCache().MaxSlot())
+
+	// When proactive archive routing is on, neutralize a sticky-session or
+	// route-rule preferID that points to a non-archive upstream. Otherwise
+	// ensurePreferredUpstreamFirst would prepend a pruned upstream to the
+	// archive-only candidate set, defeating the whole point of proactive
+	// routing (and also short-circuiting error-driven fallthrough, because
+	// archiveBiased starts true). The session affinity is harmless for the
+	// current request — if the preferred upstream is archive-capable, it's
+	// honored; otherwise it's dropped for this one request only.
+	if proactiveArchive && preferID != "" {
+		if pu := n.pool.ByID(preferID); pu == nil || !pu.IsArchive() {
+			preferID = ""
+		}
+	}
+
 	selectForPath := n.pool.SelectForPath
-	if preferCanonicalHead {
+	switch {
+	case proactiveArchive:
+		selectForPath = n.pool.SelectForPathArchive
+		metricArchivePromotion.WithLabelValues(n.id, archivePromotionProactive).Inc()
+	case preferCanonicalHead:
 		selectForPath = n.pool.SelectForPathPreferCanonicalHead
 	}
 
@@ -1109,8 +1140,23 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 
 	ups = ensurePreferredUpstreamFirst(n.pool, ups, preferID, maxAttempts)
 
+	// archiveBiased tracks whether the current ups slice is already archive-only.
+	// Starts true if we proactively routed to archive (no further promotion needed),
+	// or flips true when a pruning-shaped 404 triggers mid-loop promotion.
+	archiveBiased := proactiveArchive
+	// triedByID dedupes upstreams across the pre-swap and post-swap portions of
+	// the attempt sequence so archive promotion doesn't retry an upstream we
+	// already exhausted (archive upstream that also appears in normal ordering).
+	triedByID := make(map[string]struct{}, len(ups))
+
 	var lastErr error
-	for i, u := range ups {
+	for i := 0; i < len(ups); i++ {
+		u := ups[i]
+		if _, already := triedByID[u.ID]; already {
+			continue
+		}
+		triedByID[u.ID] = struct{}{}
+
 		if i > 0 && fs.Retry != nil {
 			delay := retryDelay(fs.Retry, i-1)
 			select {
@@ -1129,6 +1175,40 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 		attemptStarted := time.Now()
 		resp, err := n.forward(ctx, u, r, body)
 		if err == nil && resp.StatusCode < 500 {
+			// Pruning-shaped 404 on a historical target: if we have archive
+			// upstreams we haven't yet tried, promote and re-enter the loop
+			// with archive candidates filling the remaining attempt budget.
+			// Everything else (real 2xx/3xx, non-pruning 4xx) is returned
+			// to the client unchanged.
+			if !archiveBiased && isPruningError(resp.StatusCode, target) {
+				if !n.pool.HasArchive() {
+					// Pruning-shaped 404 with no archive upstream configured.
+					// Surface this via a metric so operators can see the
+					// signal that adding an archive upstream would help,
+					// then return the 404 unchanged (no behavior change).
+					metricPruningErrorNoArchive.WithLabelValues(n.id).Inc()
+					u.CBSuccess()
+					return wrapResponseBodyCancel(resp, timeoutCancel), u, nil
+				}
+				resp.Body.Close() //nolint:errcheck
+				u.CBSuccess()
+				u.RecordResponseStatus(resp.StatusCode)
+				remaining := max(maxAttempts-(i+1), 1)
+				archiveUps := n.pool.SelectForPathArchive(apiPath, remaining)
+				if len(archiveUps) > 0 {
+					metricArchivePromotion.WithLabelValues(n.id, archivePromotionOnError).Inc()
+					slog.Debug("promoting to archive upstreams after pruning-shaped 404", "network", n.id, "upstream", u.ID, "status", resp.StatusCode, "api_path", apiPath, "remaining_attempts", len(archiveUps))
+					ups = append(ups[:i+1], archiveUps...)
+					archiveBiased = true
+					lastErr = fmt.Errorf("HTTP %d (pruned)", resp.StatusCode)
+					continue
+				}
+				// Archive upstreams exist but none selectable right now (all
+				// unhealthy / circuit-broken / already tried). Return the 404
+				// to the client — no more attempts to promote on this request.
+				// We don't restore `resp` because Body is still open here, so
+				// we fall through to the normal success return.
+			}
 			u.CBSuccess()
 			return wrapResponseBodyCancel(resp, timeoutCancel), u, nil
 		}
