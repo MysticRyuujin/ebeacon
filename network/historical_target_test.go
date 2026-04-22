@@ -55,6 +55,21 @@ func TestClassifyHistoricalTarget(t *testing.T) {
 			want: HistoricalTarget{Kind: HistoricalKindBlobSidecars, Slot: uint64Ptr(500000)},
 		},
 		{
+			name: "blobs by slot uses blob retention",
+			path: "/eth/v1/beacon/blobs/13337749",
+			want: HistoricalTarget{Kind: HistoricalKindBlobSidecars, Slot: uint64Ptr(13337749)},
+		},
+		{
+			name: "blobs by root uses blob retention",
+			path: "/eth/v1/beacon/blobs/0xabc",
+			want: HistoricalTarget{Kind: HistoricalKindBlobSidecars, Root: "0xabc"},
+		},
+		{
+			name: "blobs by named head uses blob retention",
+			path: "/eth/v1/beacon/blobs/head",
+			want: HistoricalTarget{Kind: HistoricalKindBlobSidecars, Named: "head"},
+		},
+		{
 			name: "blob sidecars by root",
 			path: "/eth/v1/beacon/blob_sidecars/0xabc",
 			want: HistoricalTarget{Kind: HistoricalKindBlobSidecars, Root: "0xabc"},
@@ -96,6 +111,61 @@ func TestClassifyHistoricalTarget(t *testing.T) {
 			name: "rewards attestations by epoch",
 			path: "/eth/v1/beacon/rewards/attestations/50",
 			want: HistoricalTarget{Kind: HistoricalKindRewardsEpoch, Epoch: uint64Ptr(50)},
+		},
+		// Rewards — block and sync_committee variants
+		{
+			name: "rewards blocks by slot",
+			path: "/eth/v1/beacon/rewards/blocks/12345",
+			want: HistoricalTarget{Kind: HistoricalKindBlockByID, Slot: uint64Ptr(12345)},
+		},
+		{
+			name: "rewards blocks by root",
+			path: "/eth/v1/beacon/rewards/blocks/0xdead",
+			want: HistoricalTarget{Kind: HistoricalKindBlockByID, Root: "0xdead"},
+		},
+		{
+			name: "rewards sync_committee by slot",
+			path: "/eth/v1/beacon/rewards/sync_committee/54321",
+			want: HistoricalTarget{Kind: HistoricalKindBlockByID, Slot: uint64Ptr(54321)},
+		},
+		// Light client bootstrap — always by block_root
+		{
+			name: "light_client bootstrap by root",
+			path: "/eth/v1/beacon/light_client/bootstrap/0xabcdef",
+			want: HistoricalTarget{Kind: HistoricalKindBlockByID, Root: "0xabcdef"},
+		},
+		// Validator liveness
+		{
+			name: "validator liveness by epoch",
+			path: "/eth/v1/validator/liveness/999",
+			want: HistoricalTarget{Kind: HistoricalKindLiveness, Epoch: uint64Ptr(999)},
+		},
+		// Debug paths
+		{
+			name: "debug beacon states v2",
+			path: "/eth/v2/debug/beacon/states/77",
+			want: HistoricalTarget{Kind: HistoricalKindStateByID, Slot: uint64Ptr(77)},
+		},
+		{
+			name: "debug beacon states named",
+			path: "/eth/v2/debug/beacon/states/finalized",
+			want: HistoricalTarget{Kind: HistoricalKindStateByID, Named: "finalized"},
+		},
+		{
+			name: "debug data_column_sidecars by slot",
+			path: "/eth/v1/debug/beacon/data_column_sidecars/13337749",
+			want: HistoricalTarget{Kind: HistoricalKindBlobSidecars, Slot: uint64Ptr(13337749)},
+		},
+		// Unknown debug sub-paths fall through
+		{
+			name: "debug fork_choice is not historical",
+			path: "/eth/v1/debug/fork_choice",
+			want: HistoricalTarget{},
+		},
+		{
+			name: "debug beacon heads is not historical",
+			path: "/eth/v2/debug/beacon/heads",
+			want: HistoricalTarget{},
 		},
 		// Non-historical
 		{
@@ -258,6 +328,19 @@ func TestHistoricalTargetRequiresArchive(t *testing.T) {
 		{
 			name:   "old rewards epoch",
 			target: HistoricalTarget{Kind: HistoricalKindRewardsEpoch, Epoch: uint64Ptr(1)},
+			head:   headSlot,
+			want:   true,
+		},
+		// Liveness uses same duty semantics
+		{
+			name:   "recent liveness (current epoch)",
+			target: HistoricalTarget{Kind: HistoricalKindLiveness, Epoch: uint64Ptr(headEpoch)},
+			head:   headSlot,
+			want:   false,
+		},
+		{
+			name:   "old liveness",
+			target: HistoricalTarget{Kind: HistoricalKindLiveness, Epoch: uint64Ptr(1)},
 			head:   headSlot,
 			want:   true,
 		},

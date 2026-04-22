@@ -12,13 +12,14 @@ type HistoricalKind int
 
 const (
 	HistoricalKindNone           HistoricalKind = iota
-	HistoricalKindBlockByID                     // /beacon/blocks/{block_id}, /blinded_blocks/{id}, /headers/{id}, /blobs/{id}
-	HistoricalKindBlobSidecars                  // /beacon/blob_sidecars/{block_id}
-	HistoricalKindStateByID                     // /beacon/states/{state_id}/...
+	HistoricalKindBlockByID                     // /beacon/blocks/{block_id}, /blinded_blocks/{id}, /headers/{id}, /rewards/blocks/{id}, /rewards/sync_committee/{id}, /light_client/bootstrap/{block_root}
+	HistoricalKindBlobSidecars                  // /beacon/blob_sidecars/{block_id}, /beacon/blobs/{block_id}, /debug/beacon/data_column_sidecars/{block_id}
+	HistoricalKindStateByID                     // /beacon/states/{state_id}/..., /debug/beacon/states/{state_id}
 	HistoricalKindAttesterDuties                // /validator/duties/attester/{epoch}
 	HistoricalKindProposerDuties                // /validator/duties/proposer/{epoch}
 	HistoricalKindSyncDuties                    // /validator/duties/sync/{epoch}
 	HistoricalKindRewardsEpoch                  // /beacon/rewards/attestations/{epoch}
+	HistoricalKindLiveness                      // /validator/liveness/{epoch}
 )
 
 // SlotsPerEpoch is the Ethereum consensus-layer constant (SLOTS_PER_EPOCH = 32).
@@ -95,9 +96,10 @@ func (t HistoricalTarget) RequiresArchive(headSlot uint64) bool {
 		}
 		return olderThan(*t.Slot, headSlot, statesRetentionSlots)
 
-	case HistoricalKindAttesterDuties, HistoricalKindProposerDuties, HistoricalKindSyncDuties, HistoricalKindRewardsEpoch:
-		// Beacon API guarantees duties for current and next epoch only. Anything
-		// earlier than (current - 1) is historical.
+	case HistoricalKindAttesterDuties, HistoricalKindProposerDuties, HistoricalKindSyncDuties, HistoricalKindRewardsEpoch, HistoricalKindLiveness:
+		// Beacon API guarantees duties (and closely-related epoch endpoints
+		// like liveness and attestation rewards) for current and next epoch
+		// only. Anything earlier than (current - 1) is historical.
 		if t.Epoch == nil {
 			return false
 		}
@@ -136,6 +138,8 @@ func classifyHistoricalTarget(p string) HistoricalTarget {
 		return classifyBeaconPath(segments)
 	case "validator":
 		return classifyValidatorPath(segments)
+	case "debug":
+		return classifyDebugPath(segments)
 	}
 	return HistoricalTarget{}
 }
@@ -143,7 +147,7 @@ func classifyHistoricalTarget(p string) HistoricalTarget {
 func classifyBeaconPath(segments []string) HistoricalTarget {
 	// segments[3] is the sub-category under /eth/vN/beacon/
 	switch segments[3] {
-	case "blocks", "blinded_blocks", "blobs", "headers":
+	case "blocks", "blinded_blocks", "headers":
 		if len(segments) < 5 {
 			return HistoricalTarget{}
 		}
@@ -151,7 +155,12 @@ func classifyBeaconPath(segments []string) HistoricalTarget {
 		t.Kind = HistoricalKindBlockByID
 		return t
 
-	case "blob_sidecars":
+	case "blobs", "blob_sidecars":
+		// Both endpoints return blob data, which is pruned per EIP-4844's
+		// MIN_EPOCHS_FOR_BLOB_SIDECARS_REQUESTS (~18 days). Using the block
+		// retention threshold (~5 months) would miss archive promotion for
+		// blob requests 18d–5mo old, where pruned nodes 404 but we still
+		// have an archive upstream that can serve.
 		if len(segments) < 5 {
 			return HistoricalTarget{}
 		}
@@ -168,17 +177,56 @@ func classifyBeaconPath(segments []string) HistoricalTarget {
 		return t
 
 	case "rewards":
-		// /eth/v1/beacon/rewards/attestations/{epoch}
-		if len(segments) >= 6 && segments[4] == "attestations" {
+		if len(segments) < 6 {
+			return HistoricalTarget{}
+		}
+		switch segments[4] {
+		case "attestations":
+			// /eth/v1/beacon/rewards/attestations/{epoch}
 			if epoch, ok := parseUint64(segments[5]); ok {
 				return HistoricalTarget{Kind: HistoricalKindRewardsEpoch, Epoch: &epoch}
 			}
+		case "blocks", "sync_committee":
+			// /eth/v1/beacon/rewards/blocks/{block_id}
+			// /eth/v1/beacon/rewards/sync_committee/{block_id}
+			// Reward data is tied to the block — pruned when the underlying
+			// block is pruned. Classify under the block retention window so
+			// proactive routing and error-driven promotion both kick in.
+			t := parseBlockIdentifier(segments[5])
+			t.Kind = HistoricalKindBlockByID
+			return t
+		}
+
+	case "light_client":
+		// /eth/v1/beacon/light_client/bootstrap/{block_root}
+		// Bootstrap data is indexed by block_root and served from the block
+		// the client is starting from. Pruned nodes 404 when that block is
+		// no longer retained. The named endpoints (finality_update,
+		// optimistic_update) and the query-paginated `/updates` endpoint
+		// are not classified — they serve current data or use query
+		// parameters rather than path identifiers.
+		if len(segments) >= 6 && segments[4] == "bootstrap" {
+			t := parseBlockIdentifier(segments[5])
+			t.Kind = HistoricalKindBlockByID
+			return t
 		}
 	}
 	return HistoricalTarget{}
 }
 
 func classifyValidatorPath(segments []string) HistoricalTarget {
+	if len(segments) < 5 {
+		return HistoricalTarget{}
+	}
+
+	// /eth/v1/validator/liveness/{epoch}
+	if segments[3] == "liveness" {
+		if epoch, ok := parseUint64(segments[4]); ok {
+			return HistoricalTarget{Kind: HistoricalKindLiveness, Epoch: &epoch}
+		}
+		return HistoricalTarget{}
+	}
+
 	// /eth/v1/validator/duties/{attester|proposer|sync}/{epoch}
 	if len(segments) < 6 || segments[3] != "duties" {
 		return HistoricalTarget{}
@@ -194,6 +242,36 @@ func classifyValidatorPath(segments []string) HistoricalTarget {
 		return HistoricalTarget{Kind: HistoricalKindProposerDuties, Epoch: &epoch}
 	case "sync":
 		return HistoricalTarget{Kind: HistoricalKindSyncDuties, Epoch: &epoch}
+	}
+	return HistoricalTarget{}
+}
+
+// classifyDebugPath handles /eth/vN/debug/... endpoints that target historical
+// data. Debug endpoints are often blocked in production eBeacon deployments,
+// but when exposed they carry the same pruning semantics as their non-debug
+// counterparts:
+//
+//   - /eth/vN/debug/beacon/states/{state_id}   (state dumps)
+//   - /eth/v1/debug/beacon/data_column_sidecars/{block_id}  (PeerDAS raw columns)
+func classifyDebugPath(segments []string) HistoricalTarget {
+	if len(segments) < 5 || segments[3] != "beacon" {
+		return HistoricalTarget{}
+	}
+	if len(segments) < 6 {
+		return HistoricalTarget{}
+	}
+	switch segments[4] {
+	case "states":
+		t := parseBlockIdentifier(segments[5])
+		t.Kind = HistoricalKindStateByID
+		return t
+	case "data_column_sidecars":
+		// Data column sidecars share blob retention (4096 epochs) because
+		// they are the post-Fusaka storage unit for blob data and are
+		// pruned together.
+		t := parseBlockIdentifier(segments[5])
+		t.Kind = HistoricalKindBlobSidecars
+		return t
 	}
 	return HistoricalTarget{}
 }

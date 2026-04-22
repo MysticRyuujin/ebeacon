@@ -924,6 +924,14 @@ func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Reque
 	var lastUpstream *upstream.Upstream
 	var lastErr error
 
+	// Client-type and glob selectors can include multiple upstreams of
+	// mixed retention (e.g. a pruned local lighthouse and an archive-capable
+	// lighthouse fallback). A pruning-shaped 2xx–4xx response from an early
+	// candidate should not win over a real 200 from a later one, so we keep
+	// iterating past pruning errors and buffer the last one to return only
+	// if every remaining candidate also fails.
+	target := classifyHistoricalTarget(r.URL.Path)
+
 	for i, u := range ups {
 		if i > 0 && fs.Retry != nil {
 			delay := retryDelay(fs.Retry, i-1)
@@ -941,6 +949,31 @@ func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Reque
 
 		resp, err := n.forward(ctx, u, r, body)
 		if err == nil && resp.StatusCode < 500 {
+			peeked, peekErr := peekBodyForPruning(resp, target)
+			if peekErr != nil {
+				slog.Warn("peek body for pruning classification failed", "network", n.id, "upstream", u.ID, "err", peekErr)
+			}
+			if i < len(ups)-1 && isPruningError(resp.StatusCode, peeked, target) {
+				// Pruning-shaped response with more candidates remaining:
+				// record it as lastResp (so we'll return it if no later
+				// candidate produces a real success) and continue.
+				//
+				// CBSuccess is intentional: a pruning/custody response means
+				// the upstream responded cleanly but lacks the data — not
+				// an upstream fault. Treating it as a failure would trip
+				// the CB on any non-supernode client that receives a steady
+				// stream of blob queries it literally cannot serve, locking
+				// out that upstream from unrelated requests it could serve.
+				u.CBSuccess()
+				u.RecordResponseStatus(resp.StatusCode)
+				if lastResp != nil {
+					lastResp.Body.Close() //nolint:errcheck
+				}
+				lastResp = resp
+				lastUpstream = u
+				lastErr = fmt.Errorf("HTTP %d (pruned)", resp.StatusCode)
+				continue
+			}
 			u.CBSuccess()
 			if lastResp != nil {
 				lastResp.Body.Close() //nolint:errcheck
@@ -1122,7 +1155,7 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 		count := fs.Hedge.MaxCount + 1
 		ups := selectForPath(apiPath, count)
 		if len(ups) > 1 {
-			resp, u, err := n.executeHedgeFS(ctx, ups, r, bodyBytes, preferID, fs, apiPath)
+			resp, u, err := n.executeHedgeFS(ctx, ups, r, bodyBytes, preferID, fs, apiPath, target, proactiveArchive)
 			if err != nil {
 				cancelTimeout()
 				return nil, nil, err
@@ -1175,12 +1208,18 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 		attemptStarted := time.Now()
 		resp, err := n.forward(ctx, u, r, body)
 		if err == nil && resp.StatusCode < 500 {
-			// Pruning-shaped 404 on a historical target: if we have archive
-			// upstreams we haven't yet tried, promote and re-enter the loop
-			// with archive candidates filling the remaining attempt budget.
-			// Everything else (real 2xx/3xx, non-pruning 4xx) is returned
-			// to the client unchanged.
-			if !archiveBiased && isPruningError(resp.StatusCode, target) {
+			// Pruning-shaped response on a historical target: if we have
+			// archive upstreams we haven't yet tried, promote and re-enter
+			// the loop with archive candidates filling the remaining attempt
+			// budget. Peek a bounded prefix of the body so we can recognize
+			// post-Fusaka HTTP 400 "insufficient data columns" custody errors
+			// as pruning-shaped; the peek is replayed to the client on the
+			// no-archive fallthrough.
+			peekedBody, peekErr := peekBodyForPruning(resp, target)
+			if peekErr != nil {
+				slog.Warn("peek body for pruning classification failed", "network", n.id, "upstream", u.ID, "err", peekErr)
+			}
+			if !archiveBiased && isPruningError(resp.StatusCode, peekedBody, target) {
 				if !n.pool.HasArchive() {
 					// Pruning-shaped 404 with no archive upstream configured.
 					// Surface this via a metric so operators can see the
@@ -1265,7 +1304,7 @@ func trimUpstreamSlice(ups []*upstream.Upstream, maxLen int) []*upstream.Upstrea
 	return ups
 }
 
-func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, r *http.Request, bodyBytes []byte, preferID string, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, error) {
+func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, r *http.Request, bodyBytes []byte, preferID string, fs config.FailsafeConfig, apiPath string, target HistoricalTarget, archiveBiased bool) (*http.Response, *upstream.Upstream, error) {
 	hedge := fs.Hedge
 	maxFire := hedge.MaxCount + 1
 	if maxFire > len(ups) {
@@ -1320,13 +1359,58 @@ func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, 
 	defer hedgeTimer.Stop()
 
 	var lastErr error
+	// pruningResp buffers the first pruning-shaped response so it doesn't win
+	// the hedge race ahead of a potentially-still-inflight 2xx from another
+	// upstream. If all hedged attempts complete without a real success, we
+	// promote to archive upstreams (sequential pass); only if archive also
+	// fails do we fall back to returning the buffered pruning response.
+	var pruningResp *result
+	// triedByID dedupes upstreams between hedge and the archive-promotion
+	// pass so a hedged upstream that also appears in the archive candidate
+	// set is not retried against itself.
+	triedByID := make(map[string]struct{}, maxFire)
 
+loop:
 	for inflight > 0 || fired < maxFire {
 		select {
 		case res := <-resultCh:
 			inflight--
 			if res.err == nil && res.resp.StatusCode < 500 {
+				// Classify for pruning: peek a bounded prefix of the body so
+				// we catch post-Fusaka 400s as well as 404s. The peek is
+				// replayed if we end up returning this response to the
+				// client.
+				peeked, peekErr := peekBodyForPruning(res.resp, target)
+				if peekErr != nil {
+					slog.Warn("peek hedge response for pruning classification failed", "network", n.id, "upstream", res.u.ID, "err", peekErr)
+				}
+				if !archiveBiased && n.pool.HasArchive() && isPruningError(res.resp.StatusCode, peeked, target) {
+					// Buffer the first pruning-shaped response; discard
+					// subsequent ones (they're shaped the same). Don't
+					// return yet — another hedged upstream may still yield
+					// a real 2xx.
+					if pruningResp == nil {
+						r := res
+						pruningResp = &r
+						triedByID[res.u.ID] = struct{}{}
+					} else {
+						res.resp.Body.Close() //nolint:errcheck
+						triedByID[res.u.ID] = struct{}{}
+					}
+					res.u.CBSuccess()
+					res.u.RecordResponseStatus(res.resp.StatusCode)
+					if inflight == 0 && fired >= maxFire {
+						break loop
+					}
+					continue
+				}
+				// Real success (or a non-pruning 4xx) — cancel the rest and
+				// return. If we had a buffered pruning response, close it.
 				cancelAllExcept(res.idx)
+				if pruningResp != nil {
+					pruningResp.resp.Body.Close() //nolint:errcheck
+					pruningResp = nil
+				}
 				res.resp = wrapResponseBodyCancel(res.resp, cancels[res.idx])
 				res.u.CBSuccess()
 				return res.resp, res.u, nil
@@ -1348,9 +1432,9 @@ func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, 
 			res.u.RecordScoreErrorForPath(apiPath)
 			n.pool.RefreshUpstreamPathScoreMetrics(res.u, apiPath)
 			res.u.RecordError()
+			triedByID[res.u.ID] = struct{}{}
 			if inflight == 0 && fired >= maxFire {
-				cancelAll()
-				return nil, nil, fmt.Errorf("all hedged requests failed: %w", lastErr)
+				break loop
 			}
 
 		case <-hedgeTimer.C:
@@ -1365,11 +1449,94 @@ func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, 
 
 		case <-ctx.Done():
 			cancelAll()
+			if pruningResp != nil {
+				pruningResp.resp.Body.Close() //nolint:errcheck
+			}
 			return nil, nil, ctx.Err()
 		}
 	}
 
+	// All hedges complete. If one was a pruning-shaped response, promote to
+	// archive upstreams in a sequential pass; if any succeed, return that
+	// response and discard the buffered pruning one. If archive promotion
+	// also fails (or no archive upstreams are selectable), return the
+	// buffered pruning response to the client unchanged.
+	if pruningResp != nil {
+		cancelAll()
+		maxArchiveAttempts := maxFire
+		if fs.Retry != nil && fs.Retry.MaxAttempts > maxArchiveAttempts {
+			maxArchiveAttempts = fs.Retry.MaxAttempts
+		}
+		// The sequential archive pass runs under the parent request ctx so
+		// the outer failsafe timeout continues to apply. If hedge consumed
+		// most of that budget racing two upstreams, the archive retry may
+		// not complete — callers see ctx-deadline. Acceptable tradeoff:
+		// keeps the client's overall deadline honored.
+		archiveResp, archiveU, archiveErr := n.promoteToArchive(ctx, apiPath, r, bodyBytes, triedByID, maxArchiveAttempts, target)
+		if archiveErr == nil && archiveResp != nil {
+			pruningResp.resp.Body.Close() //nolint:errcheck
+			metricArchivePromotion.WithLabelValues(n.id, archivePromotionOnError).Inc()
+			slog.Debug("promoting hedge pruning result to archive upstream", "network", n.id, "api_path", apiPath, "archive_upstream", archiveU.ID)
+			return archiveResp, archiveU, nil
+		}
+		if archiveErr != nil {
+			slog.Debug("archive promotion after hedge pruning failed", "network", n.id, "api_path", apiPath, "err", archiveErr)
+		}
+		return pruningResp.resp, pruningResp.u, nil
+	}
+
+	cancelAll()
 	return nil, nil, fmt.Errorf("all hedged requests failed: %w", lastErr)
+}
+
+// promoteToArchive runs a sequential pass over the archive-capable upstreams
+// not already tried by the caller, returning the first successful (non-5xx,
+// non-pruning) response. Returns (nil, nil, nil) if no archive upstreams are
+// available or all fail. Caller is responsible for closing any buffered
+// non-archive response if this succeeds.
+func (n *Network) promoteToArchive(ctx context.Context, apiPath string, r *http.Request, bodyBytes []byte, triedByID map[string]struct{}, maxAttempts int, target HistoricalTarget) (*http.Response, *upstream.Upstream, error) {
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	archiveUps := n.pool.SelectForPathArchive(apiPath, maxAttempts)
+	if len(archiveUps) == 0 {
+		return nil, nil, nil
+	}
+	var lastErr error
+	for _, u := range archiveUps {
+		if _, already := triedByID[u.ID]; already {
+			continue
+		}
+		var body io.Reader
+		if bodyBytes != nil {
+			body = bytes.NewReader(bodyBytes)
+		}
+		resp, err := n.forward(ctx, u, r, body)
+		if err != nil {
+			lastErr = err
+			u.CBFailure()
+			continue
+		}
+		if resp.StatusCode >= 500 {
+			resp.Body.Close() //nolint:errcheck
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			u.CBFailure()
+			continue
+		}
+		// Archive upstreams still subject to pruning classification —
+		// if they also return pruning-shaped, treat as failure and
+		// continue. (Rare: archive upstream lacking the blob data.)
+		peeked, _ := peekBodyForPruning(resp, target)
+		if isPruningError(resp.StatusCode, peeked, target) {
+			resp.Body.Close() //nolint:errcheck
+			lastErr = fmt.Errorf("archive upstream returned pruning-shaped HTTP %d", resp.StatusCode)
+			u.CBSuccess() // not an upstream fault
+			continue
+		}
+		u.CBSuccess()
+		return resp, u, nil
+	}
+	return nil, nil, lastErr
 }
 
 func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Request, body io.Reader) (*http.Response, error) {
@@ -1671,6 +1838,37 @@ func readAndFinalizeResponseBody(resp *http.Response) ([]byte, error) {
 	}
 	return finalizeResponseBody(resp.Header, body), nil
 }
+
+// peekBodyForPruning reads up to peerDASBodyPeekLimit bytes of resp.Body so
+// isPruningError can inspect it for PeerDAS custody-error substrings (HTTP
+// 400 on blob endpoints). Subsequent readers of resp.Body see the original
+// byte sequence unchanged — the peeked prefix is replayed via a MultiReader
+// and the original Close is preserved. Returns nil for statuses/targets that
+// don't require body inspection.
+func peekBodyForPruning(resp *http.Response, target HistoricalTarget) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, nil
+	}
+	if resp.StatusCode != 400 || target.Kind != HistoricalKindBlobSidecars || !target.IsHistorical() || target.Named != "" {
+		return nil, nil
+	}
+	peeked, err := io.ReadAll(io.LimitReader(resp.Body, peerDASBodyPeekLimit))
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = &peekedBody{
+		Reader: io.MultiReader(bytes.NewReader(peeked), resp.Body),
+		closer: resp.Body,
+	}
+	return peeked, nil
+}
+
+type peekedBody struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (b *peekedBody) Close() error { return b.closer.Close() }
 
 func wrapResponseBodyCancel(resp *http.Response, cancel context.CancelFunc) *http.Response {
 	if resp == nil || resp.Body == nil || cancel == nil {

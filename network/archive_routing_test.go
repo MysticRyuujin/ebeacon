@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ebeacon/ebeacon/config"
 )
@@ -373,5 +374,201 @@ func TestArchiveRouting_NamedHead404NotPromoted(t *testing.T) {
 	}
 	if archiveHits.Load() != 0 {
 		t.Fatalf("archive must not be hit for named-head 404, got %d", archiveHits.Load())
+	}
+}
+
+// Scenario E: Hedge fires two upstreams in parallel; the faster one returns a
+// pruning-shaped 404, but the slower one returns 200. The 200 must win —
+// i.e., the pruning response must be buffered, not immediately returned.
+// Regression guard for executeHedgeFS's pruningResp buffer logic.
+func TestArchiveRouting_HedgePruningDoesNotWinRace(t *testing.T) {
+	var prunedHits, archiveHits atomic.Int64
+
+	// Pruned responds immediately with a 404. Archive responds slowly with 200.
+	// Without the pruning buffer, the fast 404 would win the hedge and the
+	// client would see 404.
+	pruned := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prunedHits.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer pruned.Close()
+	archive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		archiveHits.Add(1)
+		time.Sleep(100 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":{"from":"archive"}}`))
+	}))
+	defer archive.Close()
+
+	id := netID(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ebeacon.yaml")
+	// Hedge fires 2 upstreams with a very short delay (1ms), so both are
+	// in-flight within the test's tolerance.
+	yaml := fmt.Sprintf(`logLevel: error
+server: { host: "127.0.0.1", port: 5555, maxTimeout: 30s }
+failsafe:
+  timeout: { duration: 10s }
+  retry: { maxAttempts: 2, delay: 1ms, backoff: 1, maxDelay: 1ms }
+  hedge: { delay: 1ms, maxCount: 1 }
+health: { checkInterval: 1h, finalityInterval: 1h, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: %s
+    upstreams:
+      - id: pruned
+        url: %q
+        priority: 0
+      - id: archive
+        url: %q
+        priority: 10
+        archive: true
+    routing:
+      loadBalancing: round-robin
+      stickySession: false
+    cache:
+      enabled: false
+`, id, pruned.URL, archive.URL)
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seedHeadSlot(t, n, 20_000_000)
+
+	// By-root so proactive classification can't fire — both upstreams are
+	// eligible for hedge, racing.
+	req := httptest.NewRequest(http.MethodGet, "/eth/v2/beacon/blocks/0xdeadbeef", nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("archive 200 should have won the hedge race: got status %d body %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "archive") {
+		t.Fatalf("body should have come from archive, got %q", rec.Body.String())
+	}
+}
+
+// Scenario F: Client-type-pinned routing (X-Ebeacon-Use-Upstream) with two
+// upstreams of the same type where the priority-0 one returns pruning-shaped
+// 404. The loop must fall through to the priority-10 archive-capable peer
+// instead of returning the 404. Regression guard for executeSelectedCandidatesFS.
+func TestArchiveRouting_ClientTypePinnedFallthrough(t *testing.T) {
+	var prunedHits, archiveHits atomic.Int64
+
+	pruned := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/eth/v1/node/version") {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":{"version":"Lighthouse/v8.1.3/x86_64-linux"}}`))
+			return
+		}
+		prunedHits.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer pruned.Close()
+	archive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/eth/v1/node/version") {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":{"version":"Lighthouse/v8.1.3/x86_64-linux"}}`))
+			return
+		}
+		archiveHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":{"from":"archive"}}`))
+	}))
+	defer archive.Close()
+
+	id := netID(t)
+	cfg := buildArchiveTestConfig(t, id, pruned.URL, archive.URL, true)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The health watcher's version probe identifies both as Lighthouse. We
+	// can't wait for the background watcher cleanly in a test, so set the
+	// client type directly on each upstream.
+	for _, u := range n.pool.All() {
+		u.SetClientType("lighthouse")
+	}
+
+	seedHeadSlot(t, n, 20_000_000)
+
+	// Client-type-pinned GET by block root — triggers executeSelectedFS path.
+	// Pruned (priority 0) returns 404; the loop must fall through to archive.
+	req := httptest.NewRequest(http.MethodGet, "/eth/v2/beacon/blocks/0xfeedface", nil)
+	req.Header.Set("X-Ebeacon-Use-Upstream", "lighthouse")
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("client-type-pinned pruning-shaped 404 should have promoted to archive: got %d body %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "archive") {
+		t.Fatalf("body should have come from archive: %q", rec.Body.String())
+	}
+	if prunedHits.Load() != 1 {
+		t.Fatalf("pruned should have been tried exactly once, got %d", prunedHits.Load())
+	}
+	if archiveHits.Load() != 1 {
+		t.Fatalf("archive should have served after fallthrough, got %d", archiveHits.Load())
+	}
+}
+
+// Scenario G: PeerDAS 400 custody error is recognized as pruning-shaped and
+// promoted to an archive upstream. The 400 has a body containing the
+// "Insufficient data columns to reconstruct blobs" signal that Lighthouse
+// emits on non-supernode deployments post-Fusaka. End-to-end check that
+// peekBodyForPruning + isPruningError + promotion flow together.
+func TestArchiveRouting_PeerDAS400Promotes(t *testing.T) {
+	var prunedHits, archiveHits atomic.Int64
+
+	pruned := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prunedHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"code":400,"message":"BAD_REQUEST: Insufficient data columns to reconstruct blobs: required 64, but only 0 were found. You may need to run the beacon node with --supernode or --semi-supernode.","stacktraces":[]}`))
+	}))
+	defer pruned.Close()
+	archive := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		archiveHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":[{"from":"archive"}]}`))
+	}))
+	defer archive.Close()
+
+	id := netID(t)
+	cfg := buildArchiveTestConfig(t, id, pruned.URL, archive.URL, true)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Target a blob sidecar by root so proactive classification stays off —
+	// exercises the error-driven path, which is where the 400 body-peek
+	// classification has to do the work.
+	seedHeadSlot(t, n, 20_000_000)
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blob_sidecars/0xdeadbabe", nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PeerDAS 400 should have promoted to archive: got status %d body %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "archive") {
+		t.Fatalf("body should have come from archive: %q", rec.Body.String())
+	}
+	if archiveHits.Load() != 1 {
+		t.Fatalf("archive should have been hit exactly once, got %d", archiveHits.Load())
 	}
 }
