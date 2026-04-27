@@ -2,6 +2,8 @@
 
 eBeacon is a fault-tolerant, high-performance reverse proxy for Ethereum Beacon API nodes. It provides intelligent load balancing, response caching, canonical fork detection, request multiplexing, and multi-upstream reliability for consensus layer infrastructure.
 
+> ⚠️ **Pre-1.0.** Breaking changes to the YAML config schema and CLI flags can land at any time. APIs and metric names may move between releases. Run at your own risk.
+
 > ⚠️ **Not for validators.** eBeacon is a load balancer and cache for read-heavy Beacon API workloads (RPC clients, indexers, dashboards). It is **not** intended to sit between a validator client and its beacon node — caching and load balancing can violate the freshness and correctness guarantees a validator needs. If you want a fault-tolerant, validator-safe Beacon API load balancer, look at [Vero](https://github.com/serenita-org/vero).
 
 ## Features
