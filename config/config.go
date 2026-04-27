@@ -501,12 +501,33 @@ func (c *Config) expandSecrets() {
 		c.DebugLogging.Path = os.ExpandEnv(c.DebugLogging.Path)
 	}
 
-	if c.State.Redis != nil && c.State.Redis.Password != "" {
-		c.State.Redis.Password = os.ExpandEnv(c.State.Redis.Password)
+	if r := c.State.Redis; r != nil {
+		if r.Username != "" {
+			r.Username = os.ExpandEnv(r.Username)
+		}
+		if r.Password != "" {
+			r.Password = os.ExpandEnv(r.Password)
+		}
 	}
 	for i := range c.Networks {
-		if r := c.Networks[i].Cache.Redis; r != nil && r.Password != "" {
-			r.Password = os.ExpandEnv(r.Password)
+		if r := c.Networks[i].Cache.Redis; r != nil {
+			if r.Username != "" {
+				r.Username = os.ExpandEnv(r.Username)
+			}
+			if r.Password != "" {
+				r.Password = os.ExpandEnv(r.Password)
+			}
+		}
+		for j := range c.Networks[i].Upstreams {
+			u := &c.Networks[i].Upstreams[j]
+			if u.URL != "" {
+				u.URL = os.ExpandEnv(u.URL)
+			}
+			for k, v := range u.Headers {
+				if v != "" {
+					u.Headers[k] = os.ExpandEnv(v)
+				}
+			}
 		}
 	}
 }
@@ -868,6 +889,17 @@ func validateFailsafe(fs *FailsafeConfig, ctx string) error {
 		}
 		if fs.CircuitBreaker.HalfOpenAfter < 0 {
 			return fmt.Errorf("%s circuitBreaker.halfOpenAfter must be >= 0", ctx)
+		}
+	}
+	if fs.Consensus != nil && fs.Consensus.Enabled {
+		if fs.Consensus.MaxParticipants < 1 {
+			return fmt.Errorf("%s consensus.maxParticipants must be >= 1 when enabled", ctx)
+		}
+		if fs.Consensus.AgreementThreshold < 1 {
+			return fmt.Errorf("%s consensus.agreementThreshold must be >= 1 when enabled", ctx)
+		}
+		if fs.Consensus.AgreementThreshold > fs.Consensus.MaxParticipants {
+			return fmt.Errorf("%s consensus.agreementThreshold (%d) cannot exceed consensus.maxParticipants (%d)", ctx, fs.Consensus.AgreementThreshold, fs.Consensus.MaxParticipants)
 		}
 	}
 	return nil

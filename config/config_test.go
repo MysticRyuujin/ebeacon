@@ -519,3 +519,161 @@ func TestApplyDefaults_SetsGlobalFailsafeTimeout(t *testing.T) {
 		t.Fatalf("expected default timeout 30s, got %v", cfg.Failsafe.Timeout.Duration)
 	}
 }
+
+func TestLoad_UpstreamHeaderAndURLEnvExpansion(t *testing.T) {
+	t.Setenv("EBEACON_TEST_UPSTREAM_TOKEN", "real-token-9001")
+	t.Setenv("EBEACON_TEST_UPSTREAM_HOST", "node.example.com")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ebeacon.yaml")
+	content := strings.TrimSpace(`
+logLevel: warn
+server: { host: "127.0.0.1", port: 9000, maxTimeout: 30s }
+failsafe: { timeout: { duration: 10s } }
+health: { checkInterval: 30s, finalityInterval: 2m, maxSyncDistance: 5 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: testnet
+    upstreams:
+      - id: a
+        url: "https://${EBEACON_TEST_UPSTREAM_HOST}:5052"
+        headers:
+          Authorization: "Bearer ${EBEACON_TEST_UPSTREAM_TOKEN}"
+          X-Static: "no-expansion-here"
+    routing: { loadBalancing: round-robin }
+    cache: { enabled: false }
+`)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	u := cfg.Networks[0].Upstreams[0]
+	if u.URL != "https://node.example.com:5052" {
+		t.Fatalf("upstream URL: got %q", u.URL)
+	}
+	if got := u.Headers["Authorization"]; got != "Bearer real-token-9001" {
+		t.Fatalf("Authorization header: got %q", got)
+	}
+	if got := u.Headers["X-Static"]; got != "no-expansion-here" {
+		t.Fatalf("X-Static header should be untouched: got %q", got)
+	}
+}
+
+func TestLoad_RedisUsernameEnvExpansion(t *testing.T) {
+	t.Setenv("EBEACON_TEST_REDIS_USER", "ebeacon-user")
+	t.Setenv("EBEACON_TEST_REDIS_PASS", "ebeacon-pass")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ebeacon.yaml")
+	content := strings.TrimSpace(`
+logLevel: warn
+server: { host: "127.0.0.1", port: 9000, maxTimeout: 30s }
+failsafe: { timeout: { duration: 10s } }
+health: { checkInterval: 30s, finalityInterval: 2m, maxSyncDistance: 5 }
+rateLimiting: {}
+metrics: { enabled: false }
+state:
+  driver: redis
+  redis:
+    url: "redis://127.0.0.1:6379/0"
+    username: "${EBEACON_TEST_REDIS_USER}"
+    password: "${EBEACON_TEST_REDIS_PASS}"
+networks:
+  - id: testnet
+    upstreams:
+      - id: a
+        url: "http://127.0.0.1:5052"
+    routing: { loadBalancing: round-robin }
+    cache:
+      enabled: true
+      maxSize: 10
+      driver: redis
+      redis:
+        url: "redis://127.0.0.1:6379/1"
+        username: "${EBEACON_TEST_REDIS_USER}"
+        password: "${EBEACON_TEST_REDIS_PASS}"
+`)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.State.Redis.Username; got != "ebeacon-user" {
+		t.Fatalf("state.redis.username: got %q", got)
+	}
+	if got := cfg.State.Redis.Password; got != "ebeacon-pass" {
+		t.Fatalf("state.redis.password: got %q", got)
+	}
+	if got := cfg.Networks[0].Cache.Redis.Username; got != "ebeacon-user" {
+		t.Fatalf("cache.redis.username: got %q", got)
+	}
+	if got := cfg.Networks[0].Cache.Redis.Password; got != "ebeacon-pass" {
+		t.Fatalf("cache.redis.password: got %q", got)
+	}
+}
+
+func TestValidate_ConsensusBounds(t *testing.T) {
+	tests := []struct {
+		name    string
+		fs      FailsafeConfig
+		wantSub string
+	}{
+		{
+			name: "maxParticipants zero",
+			fs: FailsafeConfig{
+				Consensus: &ConsensusConfig{Enabled: true, MaxParticipants: 0, AgreementThreshold: 1},
+			},
+			wantSub: "maxParticipants must be >= 1",
+		},
+		{
+			name: "agreementThreshold zero",
+			fs: FailsafeConfig{
+				Consensus: &ConsensusConfig{Enabled: true, MaxParticipants: 3, AgreementThreshold: 0},
+			},
+			wantSub: "agreementThreshold must be >= 1",
+		},
+		{
+			name: "threshold exceeds participants",
+			fs: FailsafeConfig{
+				Consensus: &ConsensusConfig{Enabled: true, MaxParticipants: 3, AgreementThreshold: 5},
+			},
+			wantSub: "cannot exceed consensus.maxParticipants",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateFailsafe(&tt.fs, "test")
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Fatalf("error %q should contain %q", err.Error(), tt.wantSub)
+			}
+		})
+	}
+}
+
+func TestValidate_ConsensusOK(t *testing.T) {
+	t.Parallel()
+	fs := FailsafeConfig{
+		Consensus: &ConsensusConfig{Enabled: true, MaxParticipants: 3, AgreementThreshold: 2},
+	}
+	if err := validateFailsafe(&fs, "test"); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestValidate_ConsensusDisabledSkipsBounds(t *testing.T) {
+	t.Parallel()
+	fs := FailsafeConfig{
+		Consensus: &ConsensusConfig{Enabled: false, MaxParticipants: 0, AgreementThreshold: 0},
+	}
+	if err := validateFailsafe(&fs, "test"); err != nil {
+		t.Fatalf("disabled consensus should skip bounds, got %v", err)
+	}
+}
