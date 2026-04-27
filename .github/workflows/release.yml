@@ -16,9 +16,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
+      # QEMU is no longer needed: the Dockerfile cross-compiles Go from
+      # BUILDPLATFORM (amd64) to TARGETARCH, and the runtime stage is
+      # COPY-only (distroless/static, no foreign instructions execute).
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
