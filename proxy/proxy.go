@@ -8,9 +8,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/ebeacon/ebeacon/config"
-	networkpkg "github.com/ebeacon/ebeacon/network"
-	"github.com/ebeacon/ebeacon/upstream"
+	"github.com/mysticryuujin/ebeacon/config"
+	networkpkg "github.com/mysticryuujin/ebeacon/network"
+	"github.com/mysticryuujin/ebeacon/upstream"
 	"golang.org/x/time/rate"
 )
 

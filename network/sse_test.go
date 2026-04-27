@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ebeacon/ebeacon/config"
-	"github.com/ebeacon/ebeacon/upstream"
+	"github.com/mysticryuujin/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/upstream"
 )
 
 func TestSSERelay_StreamsLargeEventAndSetsHeaders(t *testing.T) {

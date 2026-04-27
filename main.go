@@ -13,12 +13,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ebeacon/ebeacon/api"
-	"github.com/ebeacon/ebeacon/config"
-	"github.com/ebeacon/ebeacon/debuglog"
-	networkpkg "github.com/ebeacon/ebeacon/network"
-	"github.com/ebeacon/ebeacon/proxy"
-	"github.com/ebeacon/ebeacon/state"
+	"github.com/mysticryuujin/ebeacon/api"
+	"github.com/mysticryuujin/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/debuglog"
+	networkpkg "github.com/mysticryuujin/ebeacon/network"
+	"github.com/mysticryuujin/ebeacon/proxy"
+	"github.com/mysticryuujin/ebeacon/state"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )

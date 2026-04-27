@@ -3,7 +3,7 @@ package proxy
 import (
 	"net/http"
 
-	"github.com/ebeacon/ebeacon/reqctx"
+	"github.com/mysticryuujin/ebeacon/reqctx"
 )
 
 // WithAPIKeyID attaches the authenticated API key ID to the request context.

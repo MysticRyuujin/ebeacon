@@ -6,9 +6,9 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/ebeacon/ebeacon/config"
-	"github.com/ebeacon/ebeacon/state"
-	"github.com/ebeacon/ebeacon/upstream"
+	"github.com/mysticryuujin/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/state"
+	"github.com/mysticryuujin/ebeacon/upstream"
 )
 
 // newMinimalPool creates a Pool with one fake upstream for state tests.

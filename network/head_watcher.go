@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ebeacon/ebeacon/cache"
-	"github.com/ebeacon/ebeacon/upstream"
+	"github.com/mysticryuujin/ebeacon/cache"
+	"github.com/mysticryuujin/ebeacon/upstream"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )

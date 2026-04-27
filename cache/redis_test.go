@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/ebeacon/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/config"
 )
 
 func newTestRedisStore(t *testing.T, mr *miniredis.Miniredis, prefix string) *RedisStore {

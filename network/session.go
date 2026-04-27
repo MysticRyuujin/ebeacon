@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ebeacon/ebeacon/upstream"
+	"github.com/mysticryuujin/ebeacon/upstream"
 	"golang.org/x/time/rate"
 )
 

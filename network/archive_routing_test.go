@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ebeacon/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/config"
 )
 
 // seedHeadSlot advances the pool's block cache so that MaxSlot() returns a

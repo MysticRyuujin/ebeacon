@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ebeacon/ebeacon/config"
-	networkpkg "github.com/ebeacon/ebeacon/network"
+	"github.com/mysticryuujin/ebeacon/config"
+	networkpkg "github.com/mysticryuujin/ebeacon/network"
 )
 
 var statusLabelSeq atomic.Uint64
@@ -349,6 +349,189 @@ func TestStatusAPI_UpstreamsEndpointIncludesScoreDetails(t *testing.T) {
 	}
 	if item.ScoreHeadLag != 0 {
 		t.Fatalf("scoreHeadLag: got %d want 0", item.ScoreHeadLag)
+	}
+}
+
+func TestSanitizeUpstreamURL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"plain http", "http://node:5052", "http://node:5052"},
+		{"https with path-embedded key", "https://example.quiknode.pro/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/", "https://example.quiknode.pro"},
+		{"userinfo", "https://user:pass@beacon.example.com:5052/eth/v1/foo", "https://beacon.example.com:5052"},
+		{"query string token", "https://beacon.example.com/?api_key=secret", "https://beacon.example.com"},
+		{"fragment", "https://beacon.example.com/path#token", "https://beacon.example.com"},
+		{"malformed", "://not a url", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeUpstreamURL(tc.in)
+			if got != tc.want {
+				t.Fatalf("sanitizeUpstreamURL(%q): got %q want %q", tc.in, got, tc.want)
+			}
+			if got != "" && (strings.Contains(got, "ee9a3908") || strings.Contains(got, "user:pass") || strings.Contains(got, "secret")) {
+				t.Fatalf("sanitizeUpstreamURL leaked credential material: %q", got)
+			}
+		})
+	}
+}
+
+func TestSanitizeCacheHeaders(t *testing.T) {
+	t.Parallel()
+	in := http.Header{
+		"Content-Type":           {"application/json"},
+		"Authorization":          {"Bearer secret-token"},
+		"Cookie":                 {"session=abc"},
+		"Set-Cookie":             {"id=xyz"},
+		"X-Api-Key":              {"key-123"},
+		"X-Ebeacon-Secret-Token": {"top-secret"},
+		"Etag":                   {"\"v1\""},
+	}
+	out := sanitizeCacheHeaders(in)
+
+	if got := out.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("content-type: got %q", got)
+	}
+	if got := out.Get("Etag"); got != "\"v1\"" {
+		t.Fatalf("etag: got %q", got)
+	}
+	for _, k := range []string{"Authorization", "Cookie", "Set-Cookie", "X-Api-Key", "X-Ebeacon-Secret-Token"} {
+		v := out.Get(k)
+		if v != "[REDACTED]" {
+			t.Fatalf("expected %s redacted, got %q", k, v)
+		}
+	}
+	// Ensure source header values were not mutated.
+	if got := in.Get("Authorization"); got != "Bearer secret-token" {
+		t.Fatalf("source Authorization mutated: got %q", got)
+	}
+	// Empty input passes through.
+	if got := sanitizeCacheHeaders(nil); len(got) != 0 {
+		t.Fatalf("nil input: got %v", got)
+	}
+}
+
+func TestStatusAPI_UpstreamsEndpointDoesNotLeakURLCredentials(t *testing.T) {
+	t.Parallel()
+	networkID := statusNetworkID(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ebeacon.yaml")
+	yaml := fmt.Sprintf("logLevel: error\n"+
+		"server: { host: \"127.0.0.1\", port: 5555, maxTimeout: 30s }\n"+
+		"failsafe: { timeout: { duration: 10s } }\n"+
+		"health: { checkInterval: 1h, finalityInterval: 1h, maxSyncDistance: 10 }\n"+
+		"rateLimiting: {}\n"+
+		"metrics: { enabled: false }\n"+
+		"networks:\n"+
+		"  - id: %q\n"+
+		"    upstreams:\n"+
+		"      - id: u1\n"+
+		"        url: \"https://example.quiknode.pro/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/\"\n"+
+		"    routing:\n"+
+		"      loadBalancing: round-robin\n"+
+		"      stickySession: false\n"+
+		"    cache:\n"+
+		"      enabled: false\n"+
+		"      maxSize: 10\n", networkID)
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	network, err := networkpkg.New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	s := NewStatusAPI(map[string]*networkpkg.Network{networkID: network})
+	s.Auth = &config.AuthConfig{Keys: []config.APIKeyConfig{{ID: "test", Secret: "test-secret"}}}
+	s.RegisterRoutes(mux, "/webui")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/webui/api/upstreams", nil)
+	req.Header.Set("Authorization", "Bearer test-secret")
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d body %q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "ee9a3908") {
+		t.Fatalf("upstreams JSON leaked path-embedded API key: %s", body)
+	}
+
+	var upstreams []upstreamStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &upstreams); err != nil {
+		t.Fatalf("decode json: %v", err)
+	}
+	if len(upstreams) != 1 {
+		t.Fatalf("upstreams len: got %d want 1", len(upstreams))
+	}
+	if upstreams[0].URL != "https://example.quiknode.pro" {
+		t.Fatalf("URL: got %q want sanitized", upstreams[0].URL)
+	}
+}
+
+func TestStatusAPI_CacheEntriesEndpointRedactsSensitiveHeaders(t *testing.T) {
+	t.Parallel()
+	networkID := statusNetworkID(t)
+	network := mustStatusNetworkWithCache(t, networkID)
+	cache := network.CacheInstance()
+	if cache == nil {
+		t.Fatal("expected cache instance")
+	}
+	headers := http.Header{}
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Authorization", "Bearer leaked-token")
+	headers.Set("Set-Cookie", "session=abc; Path=/")
+	body := []byte(`{"data":"cached"}`)
+	cacheKey := networkID + ":GET:/eth/v1/node/version"
+	cache.Set(cacheKey, http.StatusOK, headers, body, time.Minute)
+
+	mux := http.NewServeMux()
+	s := NewStatusAPI(map[string]*networkpkg.Network{networkID: network})
+	s.Auth = &config.AuthConfig{Keys: []config.APIKeyConfig{{ID: "test", Secret: "test-secret"}}}
+	s.RegisterRoutes(mux, "/webui")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/webui/api/cache/entries?network="+networkID, nil)
+	req.Header.Set("Authorization", "Bearer test-secret")
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d body %q", rec.Code, rec.Body.String())
+	}
+	body2 := rec.Body.String()
+	if strings.Contains(body2, "leaked-token") {
+		t.Fatalf("cache entries JSON leaked Authorization value: %s", body2)
+	}
+	if strings.Contains(body2, "session=abc") {
+		t.Fatalf("cache entries JSON leaked Set-Cookie value: %s", body2)
+	}
+
+	var result cacheListResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode json: %v", err)
+	}
+	if len(result.Entries) != 1 {
+		t.Fatalf("entries len: got %d want 1", len(result.Entries))
+	}
+	got := result.Entries[0].Headers
+	if v := got.Get("Authorization"); v != "[REDACTED]" {
+		t.Fatalf("Authorization: got %q", v)
+	}
+	if v := got.Get("Set-Cookie"); v != "[REDACTED]" {
+		t.Fatalf("Set-Cookie: got %q", v)
+	}
+	if v := got.Get("Content-Type"); v != "application/json" {
+		t.Fatalf("Content-Type should not be redacted: got %q", v)
 	}
 }
 

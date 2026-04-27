@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/ebeacon/ebeacon/config"
-	"github.com/ebeacon/ebeacon/upstream"
+	"github.com/mysticryuujin/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/upstream"
 )
 
 // ConsensusPolicy sends a request to multiple upstreams and returns the majority result.
