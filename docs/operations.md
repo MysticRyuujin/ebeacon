@@ -52,6 +52,8 @@ metrics:
 
 Then scrape `http://<host>:<port>/metrics`.
 
+> ⚠️ **`/metrics` is not authenticated.** The handler is mounted on the same listener as the proxy and is not gated by `auth.keys`. Anyone who can reach the proxy port can read it. The endpoint does not expose credentials, but it does enumerate upstream IDs, request rates, error rates, and latency percentiles — useful recon for an attacker. Either restrict the listener to a private network / loopback, scrape it from inside a trusted network only, or front it with a firewall or auth-aware reverse proxy. The same applies to `/healthz` and `/ready`.
+
 Cache metrics include:
 
 - `ebeacon_cache_hits_total`

@@ -92,6 +92,9 @@ ui:
 metrics:
   enabled: true
   path: /metrics    # served on the same port as the proxy
+  # NOTE: /metrics is NOT gated by auth.keys. Anyone who can reach the proxy
+  # port can scrape it. Restrict the listener to a private network or front it
+  # with a firewall or auth-aware reverse proxy if exposed publicly.
 
 # ── Shared state (horizontal scaling) ─────────────────────────────────────────
 state:
