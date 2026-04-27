@@ -54,6 +54,10 @@ Then scrape `http://<host>:<port>/metrics`.
 
 > ⚠️ **`/metrics` is not authenticated.** The handler is mounted on the same listener as the proxy and is not gated by `auth.keys`. Anyone who can reach the proxy port can read it. The endpoint does not expose credentials, but it does enumerate upstream IDs, request rates, error rates, and latency percentiles — useful recon for an attacker. Either restrict the listener to a private network / loopback, scrape it from inside a trusted network only, or front it with a firewall or auth-aware reverse proxy. The same applies to `/healthz` and `/ready`.
 
+## Deployment topology
+
+eBeacon expects to run **behind a trusted reverse proxy or load balancer** (NGINX, Envoy, AWS ALB, Caddy, etc.) that sets the `X-Forwarded-For` and `X-Real-IP` headers correctly and strips any client-supplied versions of those headers. Per-IP rate limiting trusts those headers verbatim — if eBeacon is exposed directly to the public internet without a fronting proxy, a client can spoof either header to evade the per-IP limiter. There is no current `trustedProxies` config to gate this; deploy accordingly, or rely solely on the global rate limit and per-key limits when running edge-exposed.
+
 Cache metrics include:
 
 - `ebeacon_cache_hits_total`
