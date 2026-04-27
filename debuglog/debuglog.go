@@ -16,7 +16,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/ebeacon/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/config"
 	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 )
 
@@ -59,6 +59,14 @@ var sensitiveHeaderKeys = map[string]struct{}{
 	"set-cookie":             {},
 	"x-api-key":              {},
 	"x-ebeacon-secret-token": {},
+}
+
+// IsSensitiveHeader reports whether name is a header that should be redacted
+// before being logged, displayed in the dashboard, or otherwise exposed.
+// The check is case-insensitive.
+func IsSensitiveHeader(name string) bool {
+	_, ok := sensitiveHeaderKeys[strings.ToLower(name)]
+	return ok
 }
 
 var sensitiveQueryKeys = map[string]struct{}{

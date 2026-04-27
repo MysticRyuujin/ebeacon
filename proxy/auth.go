@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/ebeacon/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/config"
 )
 
 // Supported authentication headers, in priority order.

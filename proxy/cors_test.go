@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ebeacon/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/config"
 )
 
 func TestWrapWithCORS_AllowedOrigin(t *testing.T) {

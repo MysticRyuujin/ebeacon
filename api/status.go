@@ -4,14 +4,16 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/ebeacon/ebeacon/config"
-	networkpkg "github.com/ebeacon/ebeacon/network"
-	"github.com/ebeacon/ebeacon/proxy"
-	"github.com/ebeacon/ebeacon/upstream"
+	"github.com/mysticryuujin/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/debuglog"
+	networkpkg "github.com/mysticryuujin/ebeacon/network"
+	"github.com/mysticryuujin/ebeacon/proxy"
+	"github.com/mysticryuujin/ebeacon/upstream"
 )
 
 // StatusAPI serves JSON status endpoints for the web UI.
@@ -216,7 +218,7 @@ func (s *StatusAPI) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 				ID:                u.ID,
 				ObfuscatedID:      networkpkg.ObfuscateUpstreamID(u.ID),
 				Network:           id,
-				URL:               u.URL,
+				URL:               sanitizeUpstreamURL(u.URL),
 				LoadBalancing:     score.LoadBalancing,
 				Health:            health,
 				HeadSlot:          u.HeadSlot(),
@@ -290,7 +292,7 @@ func (s *StatusAPI) listCacheEntries(w http.ResponseWriter, r *http.Request) {
 				Network:     id,
 				Key:         entry.Key,
 				Status:      entry.Status,
-				Headers:     entry.Headers,
+				Headers:     sanitizeCacheHeaders(entry.Headers),
 				BodySize:    entry.BodySize,
 				CreatedAt:   entry.Created,
 				ContentType: entry.Headers.Get("Content-Type"),
@@ -464,6 +466,44 @@ func (s *StatusAPI) handleUI(w http.ResponseWriter, r *http.Request) {
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(v) //nolint:errcheck
+}
+
+// sanitizeUpstreamURL strips userinfo, path, query, and fragment from an
+// upstream URL so credentials embedded in any of those components do not leak
+// to dashboard clients. Providers like QuickNode embed API keys in the path.
+func sanitizeUpstreamURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	scheme := u.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+	return scheme + "://" + u.Host
+}
+
+// sanitizeCacheHeaders returns a copy of h with sensitive header values
+// replaced by "[REDACTED]". Used to keep cached upstream auth/cookie material
+// out of the dashboard JSON.
+func sanitizeCacheHeaders(h http.Header) http.Header {
+	if len(h) == 0 {
+		return h
+	}
+	out := make(http.Header, len(h))
+	for k, v := range h {
+		if debuglog.IsSensitiveHeader(k) {
+			out[k] = []string{"[REDACTED]"}
+			continue
+		}
+		copied := make([]string, len(v))
+		copy(copied, v)
+		out[k] = copied
+	}
+	return out
 }
 
 var dashboardHTML = `<!DOCTYPE html>

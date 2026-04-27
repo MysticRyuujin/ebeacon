@@ -3,7 +3,7 @@ package proxy
 import (
 	"net/http"
 
-	"github.com/ebeacon/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/config"
 	"golang.org/x/time/rate"
 )
 

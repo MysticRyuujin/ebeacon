@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ebeacon/ebeacon/upstream"
+	"github.com/mysticryuujin/ebeacon/upstream"
 )
 
 const headCacheWarmTimeout = 5 * time.Second

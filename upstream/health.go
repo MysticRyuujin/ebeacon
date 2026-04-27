@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/ebeacon/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/config"
 )
 
 type syncStatusResponse struct {

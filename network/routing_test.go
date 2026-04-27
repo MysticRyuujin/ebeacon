@@ -4,8 +4,8 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/ebeacon/ebeacon/config"
-	"github.com/ebeacon/ebeacon/upstream"
+	"github.com/mysticryuujin/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/upstream"
 )
 
 func TestCompiledRouting_applyClientPrefix_BeaconAPI(t *testing.T) {

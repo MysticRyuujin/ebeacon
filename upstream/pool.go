@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ebeacon/ebeacon/config"
-	"github.com/ebeacon/ebeacon/state"
+	"github.com/mysticryuujin/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/state"
 )
 
 // Pool manages a set of upstream beacon nodes for a single network.

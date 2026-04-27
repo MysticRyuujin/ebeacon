@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ebeacon/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/config"
 )
 
 var cacheLabelSeq atomic.Uint64

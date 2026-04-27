@@ -1,4 +1,4 @@
-module github.com/ebeacon/ebeacon
+module github.com/mysticryuujin/ebeacon
 
 go 1.26.2
 

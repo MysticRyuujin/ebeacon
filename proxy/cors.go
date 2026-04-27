@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ebeacon/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/config"
 )
 
 func WrapWithCORS(next http.Handler, cors *config.CORSConfig) http.Handler {
