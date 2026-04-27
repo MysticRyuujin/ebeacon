@@ -2,6 +2,8 @@
 
 This guide gets eBeacon running locally with a multi-upstream Beacon API pool.
 
+> ⚠️ **Not for validators.** eBeacon is for read-heavy Beacon API workloads (RPC clients, indexers, dashboards), not for fronting a validator's beacon node. If you need a validator-safe Beacon API load balancer, see [Vero](https://github.com/serenita-org/vero).
+
 ## Prerequisites
 
 - Go 1.26+
