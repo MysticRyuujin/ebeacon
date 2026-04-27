@@ -82,9 +82,18 @@ For readiness checks, eBeacon also exposes a global `/healthz`, a per-network `/
 
 ## Docker
 
+Build locally:
+
 ```bash
 docker build -t ebeacon .
 docker run -p 5555:5555 -v $(pwd)/ebeacon.yaml:/app/ebeacon.yaml ebeacon
+```
+
+Or pull a published release image from GHCR (image names must be lowercase):
+
+```bash
+docker pull ghcr.io/mysticryuujin/ebeacon:latest
+docker run -p 5555:5555 -v $(pwd)/ebeacon.yaml:/app/ebeacon.yaml ghcr.io/mysticryuujin/ebeacon:latest
 ```
 
 The image exposes port `5555` and expects a config file at `/app/ebeacon.yaml` (override by mounting your own file as shown).

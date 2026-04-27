@@ -78,7 +78,16 @@ When you use client-route prefixes such as `/mainnet/lighthouse/eth/v1/node/heal
 
 ## 5) Docker (optional)
 
+Build locally:
+
 ```bash
 docker build -t ebeacon .
 docker run -p 5555:5555 -v $(pwd)/ebeacon.yaml:/app/ebeacon.yaml ebeacon
+```
+
+Or pull a published release from GHCR (image names must be lowercase):
+
+```bash
+docker pull ghcr.io/mysticryuujin/ebeacon:latest
+docker run -p 5555:5555 -v $(pwd)/ebeacon.yaml:/app/ebeacon.yaml ghcr.io/mysticryuujin/ebeacon:latest
 ```
