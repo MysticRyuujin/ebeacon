@@ -138,7 +138,7 @@ func (n *Network) populateCacheKey(ctx context.Context, key string, source *upst
 		return nil
 	}
 
-	body, err := readAndFinalizeResponseBody(resp)
+	body, err := readAndFinalizeResponseBody(resp, n.maxResponseBytes)
 	if err != nil {
 		return fmt.Errorf("read pre-warm response body: %w", err)
 	}

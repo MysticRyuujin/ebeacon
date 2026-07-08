@@ -66,6 +66,9 @@ type ServerConfig struct {
 	Port       int           `yaml:"port"`
 	MaxTimeout time.Duration `yaml:"maxTimeout"`
 	EnableGzip *bool         `yaml:"enableGzip"` // nil = true
+	// MaxResponseBodyBytes caps how many bytes of an upstream response body
+	// (after gzip decompression) the proxy will buffer. Default 2 GiB.
+	MaxResponseBodyBytes int64 `yaml:"maxResponseBodyBytes"`
 }
 
 type DebugLoggingConfig struct {
@@ -372,6 +375,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Server.MaxTimeout == 0 {
 		c.Server.MaxTimeout = 60 * time.Second
+	}
+	if c.Server.MaxResponseBodyBytes == 0 {
+		c.Server.MaxResponseBodyBytes = 2 << 30
 	}
 	applyDebugLoggingDefaults(&c.DebugLogging)
 	if c.Health.CheckInterval == 0 {
@@ -735,6 +741,9 @@ func validateServer(s ServerConfig) error {
 	}
 	if s.MaxTimeout <= 0 {
 		return fmt.Errorf("server.maxTimeout must be > 0")
+	}
+	if s.MaxResponseBodyBytes <= 0 {
+		return fmt.Errorf("server.maxResponseBodyBytes must be > 0")
 	}
 	return nil
 }

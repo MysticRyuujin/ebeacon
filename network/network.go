@@ -202,6 +202,9 @@ type Network struct {
 	// gzip enabled
 	gzipEnabled bool
 
+	// maxResponseBytes caps buffered upstream response bodies (post-gzip).
+	maxResponseBytes int64
+
 	reqTotal            *prometheus.CounterVec
 	reqByMethod         *prometheus.CounterVec
 	reqByPath           *prometheus.CounterVec
@@ -276,13 +279,14 @@ func New(cfg *config.NetworkConfig, globalCfg *config.Config) (*Network, error) 
 	}
 
 	n := &Network{
-		id:          cfg.ID,
-		cfg:         cfg,
-		failsafe:    fs,
-		rl:          rl,
-		pool:        pool,
-		relay:       newSSERelay(cfg.ID, pool),
-		gzipEnabled: globalCfg.Server.GzipEnabled(),
+		id:               cfg.ID,
+		cfg:              cfg,
+		failsafe:         fs,
+		rl:               rl,
+		pool:             pool,
+		relay:            newSSERelay(cfg.ID, pool),
+		gzipEnabled:      globalCfg.Server.GzipEnabled(),
+		maxResponseBytes: globalCfg.Server.MaxResponseBodyBytes,
 	}
 
 	cr, err := compileRouting(&cfg.Routing)
@@ -347,6 +351,9 @@ func New(cfg *config.NetworkConfig, globalCfg *config.Config) (*Network, error) 
 
 	// Consensus policy
 	n.consensus = NewConsensusPolicy(fs.Consensus)
+	if n.consensus != nil {
+		n.consensus.MaxBodyBytes = n.maxResponseBytes
+	}
 
 	// Prometheus metrics (per-network labels).
 	n.reqTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -692,7 +699,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return nil, err
 			}
-			body, err := readAndFinalizeResponseBody(resp)
+			body, err := readAndFinalizeResponseBody(resp, n.maxResponseBytes)
 			resp.Body.Close() //nolint:errcheck
 			if err != nil {
 				return nil, fmt.Errorf("read upstream response body: %w", err)
@@ -754,7 +761,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sess.SetSticky(u.ID)
 	}
 
-	respBody, err := readAndFinalizeResponseBody(resp)
+	respBody, err := readAndFinalizeResponseBody(resp, n.maxResponseBytes)
 	if err != nil {
 		slog.Error("failed to read upstream response body",
 			"network", n.id,
@@ -1269,7 +1276,7 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 			lastErr = err
 		} else {
 			slog.Warn("upstream bad status", "network", n.id, "upstream", u.ID, "attempt", i+1, "status", resp.StatusCode)
-			failedBody, readErr := readAndFinalizeResponseBody(resp)
+			failedBody, readErr := readAndFinalizeResponseBody(resp, n.maxResponseBytes)
 			resp.Body.Close() //nolint:errcheck
 			if readErr != nil {
 				n.logFailure(r, bodyBytes, apiPath, u.ID, resp.StatusCode, resp.Header, nil, readErr, time.Since(attemptStarted), "upstream_attempt_failed", "", i+1)
@@ -1430,7 +1437,7 @@ loop:
 				n.logFailure(r, bodyBytes, apiPath, res.u.ID, 0, nil, nil, res.err, res.duration, "hedged_attempt_failed", "", res.idx+1)
 				lastErr = res.err
 			} else {
-				failedBody, readErr := readAndFinalizeResponseBody(res.resp)
+				failedBody, readErr := readAndFinalizeResponseBody(res.resp, n.maxResponseBytes)
 				lastErr = fmt.Errorf("HTTP %d", res.resp.StatusCode)
 				res.resp.Body.Close() //nolint:errcheck
 				if readErr != nil {
@@ -1832,12 +1839,31 @@ func finalizeResponseBody(headers http.Header, body []byte) []byte {
 	return body
 }
 
-func readAndFinalizeResponseBody(resp *http.Response) ([]byte, error) {
-	body, err := io.ReadAll(resp.Body)
+func readAndFinalizeResponseBody(resp *http.Response, limit int64) ([]byte, error) {
+	body, err := readBodyCapped(resp.Body, limit)
 	if err != nil {
 		return nil, err
 	}
+	if resp.Request != nil && resp.Request.Method == http.MethodHead {
+		// HEAD bodies are empty by definition; keep the upstream's real
+		// Content-Length instead of overwriting it with 0.
+		return body, nil
+	}
 	return finalizeResponseBody(resp.Header, body), nil
+}
+
+func readBodyCapped(r io.Reader, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		return io.ReadAll(r)
+	}
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("upstream response body exceeds %d bytes", limit)
+	}
+	return body, nil
 }
 
 // peekBodyForPruning reads up to peerDASBodyPeekLimit bytes of resp.Body so

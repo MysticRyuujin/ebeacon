@@ -17,6 +17,7 @@ import (
 type ConsensusPolicy struct {
 	MaxParticipants    int
 	AgreementThreshold int
+	MaxBodyBytes       int64 // 0 = unlimited
 }
 
 // NewConsensusPolicy creates a ConsensusPolicy from config.
@@ -82,9 +83,14 @@ func (cp *ConsensusPolicy) Execute(
 				results[idx] = consensusResult{err: err, upstream: u}
 				return
 			}
-			body, _ := io.ReadAll(resp.Body)
+			body, readErr := readBodyCapped(resp.Body, cp.MaxBodyBytes)
 			resp.Body.Close() //nolint:errcheck
 			u.DecrActive()
+			if readErr != nil {
+				u.CBFailure()
+				results[idx] = consensusResult{err: readErr, upstream: u}
+				return
+			}
 			u.CBSuccess()
 			results[idx] = consensusResult{
 				body:     body,

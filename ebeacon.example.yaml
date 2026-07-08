@@ -5,6 +5,10 @@ server:
   port: 5555
   maxTimeout: 60s
   enableGzip: true  # gzip compression for client responses > 1KB (default true)
+  # Cap on buffered upstream response bodies after gzip decompression.
+  # Large beacon states can approach 1 GiB as JSON; the cap bounds memory
+  # against oversized or decompression-bomb responses. Default 2 GiB.
+  # maxResponseBodyBytes: 2147483648
 
 # pprof exposes Go runtime profiling data on a separate HTTP server.
 # Useful for diagnosing memory leaks, goroutine stacks, and CPU hotspots.

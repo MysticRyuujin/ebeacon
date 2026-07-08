@@ -2406,3 +2406,65 @@ func (b neverEnding) Read(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+
+func TestReadBodyCapped_EnforcesLimit(t *testing.T) {
+	t.Parallel()
+	body, err := readBodyCapped(strings.NewReader("12345"), 5)
+	if err != nil || string(body) != "12345" {
+		t.Fatalf("exact-limit read failed: %v %q", err, body)
+	}
+	if _, err := readBodyCapped(strings.NewReader("123456"), 5); err == nil {
+		t.Fatal("expected error for body exceeding limit")
+	}
+	body, err = readBodyCapped(strings.NewReader("123456"), 0)
+	if err != nil || string(body) != "123456" {
+		t.Fatalf("limit 0 must mean unlimited: %v %q", err, body)
+	}
+}
+
+func TestNetwork_OversizedUpstreamResponseReturns502(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(bytes.Repeat([]byte("x"), 1024)) //nolint:errcheck
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	cfg.Server.MaxResponseBodyBytes = 512
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status: got %d want 502", rec.Code)
+	}
+}
+
+func TestNetwork_HEADPreservesUpstreamContentLength(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "12345")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodHead, "/eth/v1/node/version", nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "12345" {
+		t.Fatalf("Content-Length: got %q want 12345", got)
+	}
+}
