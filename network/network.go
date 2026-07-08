@@ -1368,7 +1368,7 @@ func ensurePreferredUpstreamFirst(pool *upstream.Pool, ups []*upstream.Upstream,
 			return trimUpstreamSlice(ups, maxLen)
 		}
 	}
-	if pu := pool.ByID(preferID); pu != nil && pu.IsReady() {
+	if pu := pool.ByID(preferID); pu != nil && pu.IsReady() && pool.BlockCache().IsOnCanonicalFork(pu.ID) {
 		out := append([]*upstream.Upstream{pu}, ups...)
 		return trimUpstreamSlice(out, maxLen)
 	}

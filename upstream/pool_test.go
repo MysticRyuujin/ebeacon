@@ -451,3 +451,40 @@ func upstreamIDs(ups []*Upstream) []string {
 	}
 	return ids
 }
+
+func TestPool_GetForPath_PreferredForkedUpstreamNotReturned(t *testing.T) {
+	t.Parallel()
+	health := config.HealthConfig{MaxSyncDistance: 10, FollowDistance: 32, MaxHeadDistance: 2}
+	cb := &config.CircuitBreakerConfig{
+		FailureThreshold: 5,
+		SuccessThreshold: 2,
+		HalfOpenAfter:    30 * time.Second,
+	}
+	p, err := NewPool("test-fork", []config.UpstreamConfig{
+		{ID: "a", URL: "http://127.0.0.1:1"},
+		{ID: "b", URL: "http://127.0.0.1:2"},
+		{ID: "c", URL: "http://127.0.0.1:3"},
+	}, config.RoutingConfig{LoadBalancing: "round-robin"}, health, cb)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// With no fork data, the preferred upstream is honored (fail-open).
+	u, err := p.GetForPath("c", "")
+	if err != nil || u.ID != "c" {
+		t.Fatalf("fail-open preferred pick: got %v, %v", u, err)
+	}
+
+	// Majority sees root-canon at slot 100; c reports a competing head.
+	p.BlockCache().AddBlock("a", 100, "root-canon", "p99")
+	p.BlockCache().AddBlock("b", 100, "root-canon", "p99")
+	p.BlockCache().AddBlock("c", 100, "root-fork", "p99")
+
+	u, err = p.GetForPath("c", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.ID == "c" {
+		t.Fatal("sticky/preferred routing must not return a forked upstream")
+	}
+}
