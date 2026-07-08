@@ -191,3 +191,39 @@ func TestAutoTuner_FractionalInitialRateAllowsFirstRequest(t *testing.T) {
 		t.Fatal("fractional initial rate must yield burst >= 1")
 	}
 }
+
+func TestBlockCache_RejectsImplausibleFutureSlot(t *testing.T) {
+	t.Parallel()
+	bc := NewBlockCache(32, 2)
+	genesis := time.Now().Unix() - 1200 // ~100 slots ago
+	bc.SetGenesisTime(genesis)
+
+	bc.AddBlock("a", 98, "root-98", "p97")
+	bc.AddBlock("a", 99, "root-99", "root-98")
+
+	// A slot far beyond wall clock (wrong chain / corrupt shared state)
+	// must not poison maxSlot or the canonical head.
+	bc.AddBlock("remote", 20_000_000, "root-bogus", "p")
+	if got := bc.MaxSlot(); got != 99 {
+		t.Fatalf("maxSlot poisoned by future slot: got %d want 99", got)
+	}
+	slot, root := bc.CanonicalHead()
+	if slot != 99 || root != "root-99" {
+		t.Fatalf("canonical head poisoned: got %d %q", slot, root)
+	}
+
+	// A plausible next slot is still accepted.
+	bc.AddBlock("a", 100, "root-100", "root-99")
+	if got := bc.MaxSlot(); got != 100 {
+		t.Fatalf("plausible slot rejected: got %d", got)
+	}
+}
+
+func TestBlockCache_ZeroGenesisAcceptsAnySlot(t *testing.T) {
+	t.Parallel()
+	bc := NewBlockCache(32, 2)
+	bc.AddBlock("a", 20_000_000, "root-x", "p")
+	if got := bc.MaxSlot(); got != 20_000_000 {
+		t.Fatalf("genesisTime 0 must keep permissive behavior, got %d", got)
+	}
+}

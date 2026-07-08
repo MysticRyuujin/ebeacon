@@ -284,6 +284,7 @@ func New(cfg *config.NetworkConfig, globalCfg *config.Config) (*Network, error) 
 	if err != nil {
 		return nil, fmt.Errorf("network %s: %w", cfg.ID, err)
 	}
+	pool.BlockCache().SetGenesisTime(cfg.GenesisTime)
 
 	n := &Network{
 		id:               cfg.ID,

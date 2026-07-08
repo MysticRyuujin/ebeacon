@@ -30,6 +30,7 @@ type BlockCache struct {
 	maxSlot         uint64              // highest slot seen
 	followDistance  uint64
 	maxHeadDistance uint64
+	genesisTime     int64 // unix seconds; 0 disables future-slot rejection
 }
 
 // NewBlockCache creates a BlockCache with the given follow distance and max head distance.
@@ -42,10 +43,33 @@ func NewBlockCache(followDistance, maxHeadDistance uint64) *BlockCache {
 	}
 }
 
+// SetGenesisTime enables wall-clock plausibility checks in AddBlock.
+// Must be called before block reporting starts (i.e. before Pool.Start).
+func (bc *BlockCache) SetGenesisTime(genesisTime int64) {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	bc.genesisTime = genesisTime
+}
+
 // AddBlock records a block header seen by the given upstream.
 func (bc *BlockCache) AddBlock(upstreamID string, slot uint64, root, parentRoot string) {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
+
+	// maxSlot is monotonic and everything (canonical-head walk, cleanup,
+	// head-lag scoring) keys off it, so one implausible far-future slot —
+	// a cross-chain misconfigured upstream or corrupt shared-state replay —
+	// would poison fork detection until restart. Reject whole blocks beyond
+	// the wall-clock slot when the network's genesis time is known.
+	const slotSeconds, maxFutureSlotTolerance = 12, 2
+	if bc.genesisTime > 0 {
+		if now := time.Now().Unix(); now > bc.genesisTime {
+			currentSlot := uint64(now-bc.genesisTime) / slotSeconds
+			if slot > currentSlot+maxFutureSlotTolerance {
+				return
+			}
+		}
+	}
 
 	if slot > bc.maxSlot {
 		bc.maxSlot = slot
