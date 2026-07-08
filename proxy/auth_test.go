@@ -290,3 +290,18 @@ func TestAuthenticateRequest_PathKey(t *testing.T) {
 		t.Fatal("expected header to succeed even when path key is wrong")
 	}
 }
+
+func TestBuildAuthRateLimiters_FractionalLimitGetsBurstOne(t *testing.T) {
+	t.Parallel()
+	auth := &config.AuthConfig{
+		Tiers: []config.TierConfig{{Name: "slow", RateLimiting: &config.RateLimitConfig{Limit: 0.5}}},
+		Keys:  []config.APIKeyConfig{{ID: "k", Secret: "s", RateLimiting: &config.RateLimitConfig{Limit: 0.5}}},
+	}
+	keyLimiters, tierLimiters := buildAuthRateLimiters(auth)
+	if l := keyLimiters["k"]; l == nil || !l.Allow() {
+		t.Fatalf("fractional per-key limit must allow the first request (burst floor 1)")
+	}
+	if l := tierLimiters["slow"]; l == nil || !l.Allow() {
+		t.Fatalf("fractional tier limit must allow the first request (burst floor 1)")
+	}
+}

@@ -17,7 +17,7 @@ func buildAuthRateLimiters(auth *config.AuthConfig) (keyLimiters, tierLimiters m
 			if tier.RateLimiting != nil && tier.RateLimiting.Limit > 0 {
 				burst := tier.RateLimiting.Burst
 				if burst <= 0 {
-					burst = int(tier.RateLimiting.Limit)
+					burst = max(int(tier.RateLimiting.Limit), 1)
 				}
 				tierLimiters[tier.Name] = rate.NewLimiter(rate.Limit(tier.RateLimiting.Limit), burst)
 			}
@@ -29,7 +29,7 @@ func buildAuthRateLimiters(auth *config.AuthConfig) (keyLimiters, tierLimiters m
 			if key.RateLimiting != nil && key.RateLimiting.Limit > 0 {
 				burst := key.RateLimiting.Burst
 				if burst <= 0 {
-					burst = int(key.RateLimiting.Limit)
+					burst = max(int(key.RateLimiting.Limit), 1)
 				}
 				keyLimiters[key.ID] = rate.NewLimiter(rate.Limit(key.RateLimiting.Limit), burst)
 			}

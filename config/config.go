@@ -672,6 +672,12 @@ func (c *Config) validate() error {
 	if err := validateRateLimiting(&c.RateLimiting, "rateLimiting"); err != nil {
 		return err
 	}
+	if err := validateAuth(c.Auth, "auth"); err != nil {
+		return err
+	}
+	if err := validateAuth(c.UI.Auth, "ui.auth"); err != nil {
+		return err
+	}
 	if c.Metrics.Enabled {
 		if !strings.HasPrefix(c.Metrics.Path, "/") {
 			return fmt.Errorf("metrics.path must start with \"/\"")
@@ -957,6 +963,59 @@ func validatePartialHealth(h *HealthConfig, ctx string) error {
 	}
 	if h.FinalityInterval < 0 {
 		return fmt.Errorf("%s finalityInterval must be >= 0", ctx)
+	}
+	return nil
+}
+
+func validateAuth(auth *AuthConfig, ctx string) error {
+	if auth == nil {
+		return nil
+	}
+	validateAuthRateLimit := func(rl *RateLimitConfig, rctx string) error {
+		if rl == nil {
+			return nil
+		}
+		if rl.Limit <= 0 {
+			return fmt.Errorf("%s limit must be > 0", rctx)
+		}
+		if rl.Burst < 0 {
+			return fmt.Errorf("%s burst must be >= 0", rctx)
+		}
+		return nil
+	}
+	tierNames := make(map[string]struct{}, len(auth.Tiers))
+	for i, tier := range auth.Tiers {
+		if tier.Name == "" {
+			return fmt.Errorf("%s.tiers[%d]: name is required", ctx, i)
+		}
+		if _, dup := tierNames[tier.Name]; dup {
+			return fmt.Errorf("%s.tiers[%d]: duplicate tier name %q", ctx, i, tier.Name)
+		}
+		tierNames[tier.Name] = struct{}{}
+		if err := validateAuthRateLimit(tier.RateLimiting, fmt.Sprintf("%s.tiers[%d] rateLimiting", ctx, i)); err != nil {
+			return err
+		}
+	}
+	keyIDs := make(map[string]struct{}, len(auth.Keys))
+	for i, key := range auth.Keys {
+		if key.ID == "" {
+			return fmt.Errorf("%s.keys[%d]: id is required", ctx, i)
+		}
+		if _, dup := keyIDs[key.ID]; dup {
+			return fmt.Errorf("%s.keys[%d]: duplicate key id %q", ctx, i, key.ID)
+		}
+		keyIDs[key.ID] = struct{}{}
+		if key.Secret == "" {
+			return fmt.Errorf("%s.keys[%d] (%s): secret is required", ctx, i, key.ID)
+		}
+		if key.Tier != "" {
+			if _, ok := tierNames[key.Tier]; !ok {
+				return fmt.Errorf("%s.keys[%d] (%s): unknown tier %q", ctx, i, key.ID, key.Tier)
+			}
+		}
+		if err := validateAuthRateLimit(key.RateLimiting, fmt.Sprintf("%s.keys[%d] rateLimiting", ctx, i)); err != nil {
+			return err
+		}
 	}
 	return nil
 }

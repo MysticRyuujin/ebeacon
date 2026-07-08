@@ -44,7 +44,7 @@ func NewAutoTuner(initialRate, minRate, maxRate float64, adjustmentPeriod time.D
 	}
 
 	return &AutoTuner{
-		limiter:            rate.NewLimiter(rate.Limit(initialRate), int(initialRate)),
+		limiter:            rate.NewLimiter(rate.Limit(initialRate), max(int(initialRate), 1)),
 		lastAdjust:         time.Now(),
 		adjustmentPeriod:   adjustmentPeriod,
 		errorRateThreshold: errorRateThreshold,

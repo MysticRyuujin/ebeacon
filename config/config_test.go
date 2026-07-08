@@ -859,3 +859,40 @@ networks:
 		t.Fatalf("bare integer duration must fail yaml parsing, got: %v", err)
 	}
 }
+
+func TestValidateAuth(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		auth    AuthConfig
+		wantSub string
+	}{
+		{"key without id", AuthConfig{Keys: []APIKeyConfig{{Secret: "s"}}}, "id is required"},
+		{"key without secret", AuthConfig{Keys: []APIKeyConfig{{ID: "k"}}}, "secret is required"},
+		{"duplicate key id", AuthConfig{Keys: []APIKeyConfig{{ID: "k", Secret: "a"}, {ID: "k", Secret: "b"}}}, "duplicate key id"},
+		{"unknown tier", AuthConfig{Keys: []APIKeyConfig{{ID: "k", Secret: "s", Tier: "gold"}}}, "unknown tier"},
+		{"tier without name", AuthConfig{Tiers: []TierConfig{{}}}, "name is required"},
+		{"duplicate tier", AuthConfig{Tiers: []TierConfig{{Name: "t"}, {Name: "t"}}}, "duplicate tier name"},
+		{"bad tier limit", AuthConfig{Tiers: []TierConfig{{Name: "t", RateLimiting: &RateLimitConfig{Limit: -1}}}}, "limit must be > 0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateAuth(&tt.auth, "auth")
+			if err == nil || !strings.Contains(err.Error(), tt.wantSub) {
+				t.Fatalf("expected error containing %q, got: %v", tt.wantSub, err)
+			}
+		})
+	}
+	valid := AuthConfig{
+		Secret: "legacy",
+		Tiers:  []TierConfig{{Name: "free", RateLimiting: &RateLimitConfig{Limit: 0.5}}},
+		Keys:   []APIKeyConfig{{ID: "k", Secret: "s", Tier: "free"}},
+	}
+	if err := validateAuth(&valid, "auth"); err != nil {
+		t.Fatalf("valid auth config rejected: %v", err)
+	}
+	if err := validateAuth(nil, "auth"); err != nil {
+		t.Fatalf("nil auth must be allowed: %v", err)
+	}
+}
