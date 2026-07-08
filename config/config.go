@@ -304,22 +304,27 @@ func Load(path string) (*Config, error) {
 // EffectiveFailsafe merges global defaults with per-network overrides.
 func (c *Config) EffectiveFailsafe(net *NetworkConfig) FailsafeConfig {
 	result := c.Failsafe
-	if net.Failsafe == nil {
-		return result
+	if net.Failsafe != nil {
+		n := net.Failsafe
+		if n.Timeout != nil {
+			result.Timeout = mergeTimeoutConfig(result.Timeout, n.Timeout)
+		}
+		if n.Retry != nil {
+			result.Retry = mergeRetryConfig(result.Retry, n.Retry)
+		}
+		if n.Hedge != nil {
+			result.Hedge = mergeHedgeConfig(result.Hedge, n.Hedge)
+		}
+		if n.CircuitBreaker != nil {
+			result.CircuitBreaker = mergeCircuitBreakerConfig(result.CircuitBreaker, n.CircuitBreaker)
+		}
+		if n.Consensus != nil {
+			result.Consensus = n.Consensus
+		}
 	}
-	n := net.Failsafe
-	if n.Timeout != nil {
-		result.Timeout = mergeTimeoutConfig(result.Timeout, n.Timeout)
-	}
-	if n.Retry != nil {
-		result.Retry = mergeRetryConfig(result.Retry, n.Retry)
-	}
-	if n.Hedge != nil {
-		result.Hedge = mergeHedgeConfig(result.Hedge, n.Hedge)
-	}
-	if n.CircuitBreaker != nil {
-		result.CircuitBreaker = mergeCircuitBreakerConfig(result.CircuitBreaker, n.CircuitBreaker)
-	}
+	// Defaulting before the merge would let injected defaults (e.g. timeout
+	// 30s) override explicit global settings.
+	applyFailsafeDefaults(&result)
 	return result
 }
 
@@ -337,6 +342,12 @@ func (c *Config) EffectiveHealth(net *NetworkConfig) HealthConfig {
 	}
 	if net.Health.MaxSyncDistance != 0 {
 		result.MaxSyncDistance = net.Health.MaxSyncDistance
+	}
+	if net.Health.FollowDistance != 0 {
+		result.FollowDistance = net.Health.FollowDistance
+	}
+	if net.Health.MaxHeadDistance != 0 {
+		result.MaxHeadDistance = net.Health.MaxHeadDistance
 	}
 	return result
 }
@@ -474,9 +485,6 @@ func applyNetworkDefaults(n *NetworkConfig) {
 		if n.Upstreams[i].Weight == 0 {
 			n.Upstreams[i].Weight = 1
 		}
-	}
-	if n.Failsafe != nil {
-		applyFailsafeDefaults(n.Failsafe)
 	}
 }
 
@@ -669,6 +677,11 @@ func (c *Config) validate() error {
 			return fmt.Errorf("metrics.path must start with \"/\"")
 		}
 	}
+	switch c.State.Driver {
+	case "local", "redis", "":
+	default:
+		return fmt.Errorf("state.driver must be \"local\" or \"redis\", got %q", c.State.Driver)
+	}
 	if c.State.Driver == "redis" && (c.State.Redis == nil || c.State.Redis.URL == "") {
 		return fmt.Errorf("state.redis.url is required when state.driver is \"redis\"")
 	}
@@ -691,6 +704,10 @@ func (c *Config) validate() error {
 		}
 		seen[n.ID] = true
 		if err := validateNetwork(&n, fmt.Sprintf("networks[%d] (%s)", i, n.ID)); err != nil {
+			return err
+		}
+		effHealth := c.EffectiveHealth(&n)
+		if err := validateHealth(&effHealth, fmt.Sprintf("networks[%d] (%s) effective health", i, n.ID)); err != nil {
 			return err
 		}
 	}
@@ -775,7 +792,7 @@ func validateNetwork(n *NetworkConfig, ctx string) error {
 	if err := validateFailsafe(n.Failsafe, ctx+" failsafe"); err != nil {
 		return err
 	}
-	if err := validateHealth(n.Health, ctx+" health"); err != nil {
+	if err := validatePartialHealth(n.Health, ctx+" health"); err != nil {
 		return err
 	}
 	if err := validateRateLimiting(n.RateLimiting, ctx+" rateLimiting"); err != nil {
@@ -799,6 +816,14 @@ func validateNetwork(n *NetworkConfig, ctx string) error {
 	}
 	if n.Cache.MaxSize <= 0 {
 		return fmt.Errorf("%s cache.maxSize must be > 0", ctx)
+	}
+	switch n.Cache.Driver {
+	case "memory", "redis", "":
+	default:
+		return fmt.Errorf("%s cache.driver must be \"memory\" or \"redis\", got %q", ctx, n.Cache.Driver)
+	}
+	if n.Cache.Enabled && n.Cache.Driver == "redis" && (n.Cache.Redis == nil || n.Cache.Redis.URL == "") {
+		return fmt.Errorf("%s cache.redis.url is required when cache.driver is \"redis\"", ctx)
 	}
 	for i, p := range n.Cache.Policies {
 		if p.Pattern == "" {
@@ -834,6 +859,9 @@ func validateNetwork(n *NetworkConfig, ctx string) error {
 		}
 		if err := validateFailsafe(u.Failsafe, fmt.Sprintf("%s upstreams[%d] failsafe", ctx, i)); err != nil {
 			return err
+		}
+		if rl := u.RateLimiting; rl != nil && rl.AdjustmentPeriod < 0 {
+			return fmt.Errorf("%s upstreams[%d]: rateLimiting.adjustmentPeriod must be >= 0", ctx, i)
 		}
 	}
 
@@ -914,6 +942,21 @@ func validateHealth(h *HealthConfig, ctx string) error {
 	}
 	if h.FinalityInterval <= 0 {
 		return fmt.Errorf("%s finalityInterval must be > 0", ctx)
+	}
+	return nil
+}
+
+// validatePartialHealth checks a raw per-network health block, which may
+// legitimately omit fields that merge in from the global config.
+func validatePartialHealth(h *HealthConfig, ctx string) error {
+	if h == nil {
+		return nil
+	}
+	if h.CheckInterval < 0 {
+		return fmt.Errorf("%s checkInterval must be >= 0", ctx)
+	}
+	if h.FinalityInterval < 0 {
+		return fmt.Errorf("%s finalityInterval must be >= 0", ctx)
 	}
 	return nil
 }
