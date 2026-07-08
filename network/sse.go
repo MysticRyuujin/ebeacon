@@ -26,6 +26,15 @@ var metricSSEReconnects = promauto.NewCounterVec(prometheus.CounterOpts{
 var ssePingInterval = 15 * time.Second
 var sseClientRetry = 1 * time.Second
 
+// sseIdleTimeout bounds upstream silence before the relay reconnects. Without
+// it a half-dead upstream TCP session blocks the read loop forever while the
+// relay's own pings keep the client connection looking alive. Var for tests.
+var sseIdleTimeout = 90 * time.Second
+
+// sseMaxEventBytes caps per-event accumulation so a malicious or broken
+// upstream cannot grow relay memory without bound.
+const sseMaxEventBytes = 4 << 20
+
 // seenRing deduplicates SSE events by their FNV32 hash, using a circular buffer.
 // When reconnecting to a new upstream we may receive events already forwarded
 // to the client; the ring prevents duplicates up to its capacity.
@@ -198,7 +207,7 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Accel-Buffering", "no")
 		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Ebeacon-Upstream", u.ID)
+		w.Header().Set("X-Ebeacon-Upstream", ObfuscateUpstreamID(u.ID))
 		w.WriteHeader(http.StatusOK)
 		if _, err := w.Write([]byte("retry: " + strconv.FormatInt(sseClientRetry.Milliseconds(), 10) + "\n\n")); err != nil {
 			return true
@@ -238,9 +247,20 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 	pingTicker := time.NewTicker(ssePingInterval)
 	defer pingTicker.Stop()
 
+	idle := time.NewTimer(sseIdleTimeout)
+	defer idle.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
+			return true
+		case <-idle.C:
+			// No CBFailure: a stream subscribed to rare topics is
+			// legitimately silent; a reconnect is cheap, an opened breaker
+			// is not.
+			slog.Warn("sse: upstream idle, reconnecting",
+				"network", r.networkID, "upstream", u.ID,
+				"idle", sseIdleTimeout, "duration", time.Since(connectedAt).Round(time.Second))
 			return true
 		case <-pingTicker.C:
 			if _, err := w.Write([]byte(": ping\n\n")); err != nil {
@@ -248,7 +268,22 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 			}
 			flusher.Flush()
 		case rr := <-readCh:
+			if !idle.Stop() {
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(sseIdleTimeout)
+
 			if rr.line != "" {
+				if event.Len()+len(rr.line) > sseMaxEventBytes {
+					// Reconnect rather than skip: emitting a truncated
+					// event would hand the client corrupt data.
+					slog.Warn("sse: event exceeds size cap, reconnecting",
+						"network", r.networkID, "upstream", u.ID, "size", event.Len())
+					return true
+				}
 				event.WriteString(rr.line)
 				if rr.line == "\n" || rr.line == "\r\n" {
 					if !flushSSEEvent(w, flusher, seen, &event, false) {

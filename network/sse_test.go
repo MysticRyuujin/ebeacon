@@ -53,7 +53,7 @@ func TestSSERelay_StreamsLargeEventAndSetsHeaders(t *testing.T) {
 	if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
 		t.Fatalf("content-type: got %q", got)
 	}
-	if got := rec.Header().Get("X-Ebeacon-Upstream"); got != "u1" {
+	if got := rec.Header().Get("X-Ebeacon-Upstream"); got != ObfuscateUpstreamID("u1") {
 		t.Fatalf("upstream header: got %q", got)
 	}
 	if !strings.Contains(rec.Body.String(), topicPayload) {
@@ -158,10 +158,10 @@ networks:
 		t.Fatalf("missing SSE results: nimbus=%v caplin=%v", nimbusRec != nil, caplinRec != nil)
 	}
 
-	if got := nimbusRec.Header().Get("X-Ebeacon-Upstream"); got != "nimbus" {
+	if got := nimbusRec.Header().Get("X-Ebeacon-Upstream"); got != ObfuscateUpstreamID("nimbus") {
 		t.Fatalf("nimbus upstream header: got %q", got)
 	}
-	if got := caplinRec.Header().Get("X-Ebeacon-Upstream"); got != "caplin" {
+	if got := caplinRec.Header().Get("X-Ebeacon-Upstream"); got != ObfuscateUpstreamID("caplin") {
 		t.Fatalf("caplin upstream header: got %q", got)
 	}
 
@@ -558,5 +558,53 @@ func TestSSERelay_FlushesTerminalEventWithoutBlankLine(t *testing.T) {
 	}
 	if !strings.HasSuffix(body, "\n\n") {
 		t.Fatalf("stream missing terminating blank line: %q", body)
+	}
+}
+
+func TestSSERelay_ReconnectsOnIdleUpstream(t *testing.T) {
+	oldIdle := sseIdleTimeout
+	sseIdleTimeout = 100 * time.Millisecond
+	defer func() { sseIdleTimeout = oldIdle }()
+
+	var mu sync.Mutex
+	connects := 0
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		connects++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Go silent: never send an event, never close.
+		<-r.Context().Done()
+	}))
+	defer up.Close()
+
+	pool, err := upstream.NewPool(
+		netID(t),
+		[]config.UpstreamConfig{{ID: "u1", URL: up.URL}},
+		config.RoutingConfig{LoadBalancing: "round-robin"},
+		config.HealthConfig{CheckInterval: time.Hour, FinalityInterval: time.Hour, MaxSyncDistance: 10},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("new pool: %v", err)
+	}
+
+	relay := newSSERelay("mainnet", pool)
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/events?topics=head", nil).WithContext(ctx)
+	req.Header.Set("Accept", "text/event-stream")
+	rec := httptest.NewRecorder()
+	relay.Serve(rec, req, "", requiredUpstreamSelector{})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if connects < 2 {
+		t.Fatalf("silent upstream must trigger reconnects, got %d connects", connects)
 	}
 }
