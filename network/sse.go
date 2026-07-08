@@ -272,8 +272,8 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 			if ctx.Err() == nil {
 				slog.Warn("sse: read error", "network", r.networkID, "upstream", u.ID,
 					"err", rr.err, "duration", time.Since(connectedAt).Round(time.Second))
+				u.CBFailure()
 			}
-			u.CBFailure()
 			return true
 		}
 	}

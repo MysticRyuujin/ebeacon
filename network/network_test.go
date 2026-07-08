@@ -2655,3 +2655,78 @@ func TestNetwork_HedgeLoserConnectionsReturnToZero(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+func TestNetwork_ClientCancelDoesNotTripCircuitBreaker(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	cfg.Failsafe.CircuitBreaker = &config.CircuitBreakerConfig{
+		FailureThreshold: 1,
+		SuccessThreshold: 1,
+		HalfOpenAfter:    time.Hour,
+	}
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/eth/v1/beacon/states/head/validators",
+		strings.NewReader(`["1"]`)).WithContext(cctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		n.ServeHTTP(rec, req)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	if u := n.pool.ByID("u1"); !u.IsReady() {
+		t.Fatal("client disconnect must not trip the circuit breaker")
+	}
+}
+
+func TestNetwork_FailsafeTimeoutStillTripsCircuitBreaker(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	cfg.Failsafe.Timeout = &config.TimeoutConfig{Duration: 50 * time.Millisecond}
+	cfg.Failsafe.CircuitBreaker = &config.CircuitBreakerConfig{
+		FailureThreshold: 1,
+		SuccessThreshold: 1,
+		HalfOpenAfter:    time.Hour,
+	}
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/eth/v1/beacon/states/head/validators",
+		strings.NewReader(`["1"]`))
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status: got %d want 502", rec.Code)
+	}
+	if u := n.pool.ByID("u1"); u.IsReady() {
+		t.Fatal("failsafe timeout must still count as a circuit breaker failure")
+	}
+}

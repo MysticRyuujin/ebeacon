@@ -778,10 +778,12 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		n.reqDuration.WithLabelValues(u.ID).Observe(time.Since(start).Seconds())
 		n.reqDurationByMethod.WithLabelValues(strings.ToUpper(r.Method)).Observe(time.Since(start).Seconds())
 		n.reqDurationByPath.WithLabelValues(u.ID, apiPath).Observe(time.Since(start).Seconds())
-		u.RecordScoreErrorForPath(apiPath)
-		n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
-		u.RecordError()
-		u.CBFailure()
+		if !isClientCancel(r.Context(), err) {
+			u.RecordScoreErrorForPath(apiPath)
+			n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
+			u.RecordError()
+			u.CBFailure()
+		}
 		n.logFailure(r, bodyBytes, apiPath, u.ID, http.StatusBadGateway, resp.Header, nil, err, time.Since(start), "upstream_response_read_error", "", 0)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
@@ -888,6 +890,14 @@ func (n *Network) executeWithFailsafe(ctx context.Context, r *http.Request, body
 	return n.executeFS(ctx, r, bodyBytes, preferID, required, fs, apiPath)
 }
 
+// isClientCancel reports whether err is a context cancellation propagated
+// from the request context (client disconnect) rather than a failsafe
+// timeout — timeouts surface as context.DeadlineExceeded and must still
+// count against the upstream's circuit breaker and error rate.
+func isClientCancel(ctx context.Context, err error) bool {
+	return errors.Is(err, context.Canceled) && errors.Is(ctx.Err(), context.Canceled)
+}
+
 func (n *Network) executeSelectedFS(ctx context.Context, r *http.Request, bodyBytes []byte, required requiredUpstreamSelector, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, error) {
 	if required.upstreamID != "" {
 		u := n.pool.ByID(required.upstreamID)
@@ -900,10 +910,12 @@ func (n *Network) executeSelectedFS(ctx context.Context, r *http.Request, bodyBy
 		}
 		resp, err := n.forward(ctx, u, r, body)
 		if err != nil {
-			u.CBFailure()
-			u.RecordScoreErrorForPath(apiPath)
-			n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
-			u.RecordError()
+			if !isClientCancel(ctx, err) {
+				u.CBFailure()
+				u.RecordScoreErrorForPath(apiPath)
+				n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
+				u.RecordError()
+			}
 			return nil, nil, &selectedUpstreamUnavailableError{selector: required.label(), err: err}
 		}
 		if resp.StatusCode < 500 {
@@ -1000,6 +1012,12 @@ func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Reque
 			return resp, u, nil
 		}
 
+		if err != nil && isClientCancel(ctx, err) {
+			if lastResp != nil {
+				lastResp.Body.Close() //nolint:errcheck
+			}
+			return nil, nil, err
+		}
 		u.CBFailure()
 		if err != nil || i < len(ups)-1 {
 			u.RecordScoreErrorForPath(apiPath)
@@ -1277,6 +1295,10 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 			return wrapResponseBodyCancel(resp, timeoutCancel), u, nil
 		}
 
+		if err != nil && isClientCancel(ctx, err) {
+			cancelTimeout()
+			return nil, nil, err
+		}
 		if err != nil {
 			slog.Warn("upstream error", "network", n.id, "upstream", u.ID, "attempt", i+1, "err", err)
 			n.logFailure(r, bodyBytes, apiPath, u.ID, 0, nil, nil, err, time.Since(attemptStarted), "upstream_attempt_failed", "", i+1)
@@ -1457,6 +1479,14 @@ loop:
 				res.resp = wrapResponseBodyCancel(res.resp, cancels[res.idx])
 				res.u.CBSuccess()
 				return res.resp, res.u, nil
+			}
+			if res.err != nil && isClientCancel(ctx, res.err) {
+				triedByID[res.u.ID] = struct{}{}
+				lastErr = res.err
+				if inflight == 0 && fired >= maxFire {
+					break loop
+				}
+				continue
 			}
 			if res.err != nil {
 				n.logFailure(r, bodyBytes, apiPath, res.u.ID, 0, nil, nil, res.err, res.duration, "hedged_attempt_failed", "", res.idx+1)
