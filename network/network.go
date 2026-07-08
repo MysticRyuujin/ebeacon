@@ -1376,6 +1376,23 @@ func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, 
 			c()
 		}
 	}
+	// drainResults receives the remaining in-flight results and closes their
+	// bodies so TrackResponse accounting (DecrActive) completes for losing
+	// attempts — context cancellation tears down the connection but never
+	// calls the tracked body's Close, which would leak activeConns forever.
+	// No CB/error accounting: losers canceled by us are not upstream faults.
+	drainResults := func(remaining int) {
+		if remaining <= 0 {
+			return
+		}
+		go func() {
+			for range remaining {
+				if res := <-resultCh; res.resp != nil {
+					res.resp.Body.Close() //nolint:errcheck
+				}
+			}
+		}()
+	}
 
 	fire(ups[0])
 	fired, inflight := 1, 1
@@ -1432,6 +1449,7 @@ loop:
 				// Real success (or a non-pruning 4xx) — cancel the rest and
 				// return. If we had a buffered pruning response, close it.
 				cancelAllExcept(res.idx)
+				drainResults(inflight)
 				if pruningResp != nil {
 					pruningResp.resp.Body.Close() //nolint:errcheck
 					pruningResp = nil
@@ -1474,6 +1492,7 @@ loop:
 
 		case <-ctx.Done():
 			cancelAll()
+			drainResults(inflight)
 			if pruningResp != nil {
 				pruningResp.resp.Body.Close() //nolint:errcheck
 			}
@@ -1487,6 +1506,11 @@ loop:
 	// also fails (or no archive upstreams are selectable), return the
 	// buffered pruning response to the client unchanged.
 	if pruningResp != nil {
+		// Buffer the pruning body before cancelAll: canceling the request
+		// context that produced it closes its transport body asynchronously,
+		// which would turn the buffered 404 into a read-error 502.
+		pruneBody, pruneReadErr := readAndFinalizeResponseBody(pruningResp.resp, n.maxResponseBytes)
+		pruningResp.resp.Body.Close() //nolint:errcheck
 		cancelAll()
 		maxArchiveAttempts := maxFire
 		if fs.Retry != nil && fs.Retry.MaxAttempts > maxArchiveAttempts {
@@ -1499,7 +1523,6 @@ loop:
 		// keeps the client's overall deadline honored.
 		archiveResp, archiveU, archiveErr := n.promoteToArchive(ctx, apiPath, r, bodyBytes, triedByID, maxArchiveAttempts, target)
 		if archiveErr == nil && archiveResp != nil {
-			pruningResp.resp.Body.Close() //nolint:errcheck
 			metricArchivePromotion.WithLabelValues(n.id, archivePromotionOnError).Inc()
 			slog.Debug("promoting hedge pruning result to archive upstream", "network", n.id, "api_path", apiPath, "archive_upstream", archiveU.ID)
 			return archiveResp, archiveU, nil
@@ -1507,6 +1530,10 @@ loop:
 		if archiveErr != nil {
 			slog.Debug("archive promotion after hedge pruning failed", "network", n.id, "api_path", apiPath, "err", archiveErr)
 		}
+		if pruneReadErr != nil {
+			return nil, nil, fmt.Errorf("read hedge pruning response body: %w", pruneReadErr)
+		}
+		pruningResp.resp.Body = io.NopCloser(bytes.NewReader(pruneBody))
 		return pruningResp.resp, pruningResp.u, nil
 	}
 

@@ -2602,3 +2602,56 @@ func TestNetwork_MismatchedRepresentationIsNotCached(t *testing.T) {
 		t.Fatal("SSZ body must not be cached under a JSON-keyed entry")
 	}
 }
+
+func TestNetwork_HedgeLoserConnectionsReturnToZero(t *testing.T) {
+	bothArrived := make(chan struct{})
+	var arrived atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if arrived.Add(1) == 2 {
+			close(bothArrived)
+		}
+		select {
+		case <-bothArrived:
+		case <-time.After(2 * time.Second):
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":"ok"}`))
+	})
+	upA := httptest.NewServer(handler)
+	defer upA.Close()
+	upB := httptest.NewServer(handler)
+	defer upB.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, upA.URL, nil)
+	cfg.Networks[0].Upstreams = []config.UpstreamConfig{
+		{ID: "u1", URL: upA.URL},
+		{ID: "u2", URL: upB.URL},
+	}
+	cfg.Failsafe.Hedge = &config.HedgeConfig{Delay: time.Millisecond, MaxCount: 1}
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d", rec.Code)
+	}
+
+	u1, u2 := n.pool.ByID("u1"), n.pool.ByID("u2")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if u1.ActiveConns() == 0 && u2.ActiveConns() == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("hedge loser leaked active connections: u1=%d u2=%d",
+				u1.ActiveConns(), u2.ActiveConns())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
