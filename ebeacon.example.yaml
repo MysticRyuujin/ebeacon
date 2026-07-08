@@ -317,7 +317,7 @@ networks:
       #   username: "${REDIS_USERNAME}"   # optional; overrides URL username
       #   password: "${REDIS_PASSWORD}"   # optional; overrides URL password
       #   db: 0                           # optional; overrides URL database index
-      #   keyPrefix: "ebeacon:cache:mainnet:"
+      #   keyPrefix: "ebeacon:cache:mainnet:" # optional; defaults to ebeacon:<networkId>: — keep unique per network
       #   maxRetries: 3
       # policies:            # custom per-path TTLs; built-in defaults are used when omitted
       #   - pattern: "^/eth/v1/node/version$"

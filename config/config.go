@@ -257,7 +257,7 @@ type RedisCacheConfig struct {
 type CachePolicy struct {
 	Pattern string        `yaml:"pattern"`
 	TTL     time.Duration `yaml:"ttl"`
-	Methods []string      `yaml:"methods"` // empty defaults to [GET]
+	Methods []string      `yaml:"methods"` // empty defaults to [GET, HEAD]
 }
 
 type MetricsConfig struct {
