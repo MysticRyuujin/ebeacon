@@ -1033,7 +1033,9 @@ func (n *Network) effectiveCacheTTL(policyTTL time.Duration, path string) time.D
 		if slot, ok := pathNumericSlot(path); ok && slot <= finalizedSlot {
 			return 0 // finalized → cache forever
 		}
-		if epoch, ok := pathNumericEpoch(path); ok && epoch <= finalizedSlot/32 {
+		// Epoch-keyed data (e.g. attestation rewards for epoch N) can depend
+		// on inclusions through epoch N+1, so require N+2 <= finalized epoch.
+		if epoch, ok := pathNumericEpoch(path); ok && epoch+2 <= finalizedSlot/32 {
 			return 0 // finalized epoch → cache forever
 		}
 	}

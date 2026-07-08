@@ -253,7 +253,7 @@ func fetchChainState(ctx context.Context, baseURL string, auth string, apiKey st
 	return chainState{
 		headSlot:       headSlot,
 		finalizedEpoch: finalizedEpoch,
-		finalizedSlot:  finalizedEpoch*32 + 31,
+		finalizedSlot:  finalizedEpoch * 32,
 		prevEpoch:      prev,
 	}, nil
 }

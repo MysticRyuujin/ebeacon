@@ -65,7 +65,7 @@ func TestPool_SharedState_FinalizedEpochSeeding(t *testing.T) {
 	poolB.SetSharedState(stateB)
 	poolB.StartStateSync()
 
-	want := uint64(50*32 + 31)
+	want := uint64(50 * 32)
 	if got := poolB.FinalizedSlot(); got != want {
 		t.Fatalf("finalized slot after seeding: got %d want %d", got, want)
 	}

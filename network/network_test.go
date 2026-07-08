@@ -537,10 +537,22 @@ func TestEffectiveCacheTTL_FinalizedSlot(t *testing.T) {
 
 	n.pool.UpdateFinalizedEpoch(100)
 
-	// Path references slot 50 — finalized (50 <= 100*32+31).
+	// Path references slot 50 — finalized (50 <= 100*32).
 	ttl := n.effectiveCacheTTL(time.Minute, "/eth/v2/beacon/blocks/50")
 	if ttl != 0 {
 		t.Fatalf("expected forever (0) for finalized slot, got %v", ttl)
+	}
+
+	// The checkpoint boundary slot itself is finalized...
+	ttl = n.effectiveCacheTTL(time.Minute, "/eth/v2/beacon/blocks/3200")
+	if ttl != 0 {
+		t.Fatalf("expected forever (0) for checkpoint boundary slot, got %v", ttl)
+	}
+
+	// ...but the next slot is only justified and can still reorg.
+	ttl = n.effectiveCacheTTL(time.Minute, "/eth/v2/beacon/blocks/3201")
+	if ttl != time.Minute {
+		t.Fatalf("expected policy TTL for slot past the checkpoint, got %v", ttl)
 	}
 
 	ttl2 := n.effectiveCacheTTL(time.Minute, "/eth/v2/beacon/blocks/999999999")
@@ -565,9 +577,16 @@ func TestEffectiveCacheTTL_FinalizedEpoch(t *testing.T) {
 
 	n.pool.UpdateFinalizedEpoch(100)
 
-	ttl := n.effectiveCacheTTL(30*time.Second, "/eth/v1/beacon/rewards/attestations/99")
+	ttl := n.effectiveCacheTTL(30*time.Second, "/eth/v1/beacon/rewards/attestations/98")
 	if ttl != 0 {
 		t.Fatalf("expected forever (0) for finalized epoch rewards, got %v", ttl)
+	}
+
+	// Rewards for epoch 99 depend on inclusions in epoch 100, which is not
+	// yet fully finalized at checkpoint epoch 100.
+	ttl = n.effectiveCacheTTL(30*time.Second, "/eth/v1/beacon/rewards/attestations/99")
+	if ttl != 30*time.Second {
+		t.Fatalf("expected policy TTL for epoch within finality window, got %v", ttl)
 	}
 
 	ttl2 := n.effectiveCacheTTL(30*time.Second, "/eth/v1/validator/duties/proposer/101")

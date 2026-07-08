@@ -379,7 +379,10 @@ func (w *headWatcher) handleFinalizedCheckpoint(data string) {
 		return
 	}
 
-	finalizedSlot := epoch*32 + 31
+	// A checkpoint at epoch E finalizes the chain only up to slot E*32.
+	// Epoch-keyed data (e.g. attestation rewards for epoch N) can depend on
+	// inclusions through epoch N+1, so require N+2 <= E before promoting.
+	finalizedSlot := epoch * 32
 	n := w.cache.PromoteIf(func(key string) bool {
 		path := cacheKeyPath(key)
 		if path == "" {
@@ -388,7 +391,7 @@ func (w *headWatcher) handleFinalizedCheckpoint(data string) {
 		if slot, ok := pathNumericSlot(path); ok && slot <= finalizedSlot {
 			return true
 		}
-		if ep, ok := pathNumericEpoch(path); ok && ep <= epoch {
+		if ep, ok := pathNumericEpoch(path); ok && ep+2 <= epoch {
 			return true
 		}
 		return false

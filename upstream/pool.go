@@ -28,7 +28,7 @@ type Pool struct {
 	blockCache *BlockCache
 
 	// finalizedEpoch is the highest finalized epoch seen across all upstreams.
-	// Slots at or before epoch*32+31 can be cached forever.
+	// Slots at or before epoch*32 can be cached forever.
 	finalizedEpoch atomic.Uint64
 
 	// sharedState propagates head and finalized updates across instances.
@@ -539,15 +539,15 @@ func (p *Pool) HealthCountsForSelector(selector string) (total, up, degraded, do
 }
 
 // FinalizedSlot returns the highest finalized slot seen across all upstreams.
-// Ethereum's beacon chain organises time into epochs of exactly 32 slots each.
-// The last slot of epoch N is epoch*32 + 31. Any block at or before this slot
-// is finalized and will never be reorged, so it can be cached indefinitely.
+// A finality checkpoint at epoch N finalizes the chain only up to the epoch
+// boundary block at slot N*32; slots N*32+1..N*32+31 are justified at best
+// and can still reorg, so they must not be treated as immutable.
 func (p *Pool) FinalizedSlot() uint64 {
 	epoch := p.finalizedEpoch.Load()
 	if epoch == 0 {
 		return 0
 	}
-	return epoch*32 + 31
+	return epoch * 32
 }
 
 // UpdateFinalizedEpoch merges a finalized epoch into the pool aggregate and
