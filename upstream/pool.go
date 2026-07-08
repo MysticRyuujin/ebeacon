@@ -610,12 +610,17 @@ func (p *Pool) SyncCanonicalHead() {
 		return
 	}
 	p.lastPublished.mu.Lock()
-	defer p.lastPublished.mu.Unlock()
 	if p.lastPublished.slot == slot && p.lastPublished.root == root {
+		p.lastPublished.mu.Unlock()
 		return
 	}
 	p.lastPublished.slot = slot
 	p.lastPublished.root = root
+	p.lastPublished.mu.Unlock()
+	// Publish outside the lock: a stalled Redis (2s publish timeout) would
+	// otherwise serialize every head event and health probe behind it.
+	// Racing callers may publish out of order; consumers (RecordRemoteHead
+	// -> BlockCache.AddBlock) are order-insensitive.
 	p.sharedState.PublishHead(p.networkID, slot, root)
 }
 
