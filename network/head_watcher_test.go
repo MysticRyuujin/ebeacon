@@ -406,3 +406,69 @@ networks:
 	cancel()
 	w.wait()
 }
+
+func TestHeadWatcher_LeavesForeignNetworkKeysAlone(t *testing.T) {
+	t.Parallel()
+
+	sseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/eth/v1/events" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "data: {\"slot\":\"100\"}") //nolint:errcheck
+	}))
+	defer sseServer.Close()
+
+	id := netID(t)
+	cfg := mustCfgText(t, fmt.Sprintf(`
+logLevel: error
+server: { host: "127.0.0.1", port: 5555, maxTimeout: 30s }
+failsafe: { timeout: { duration: 10s } }
+health: { checkInterval: 1h, finalityInterval: 1h, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: %s
+    upstreams:
+      - id: u1
+        url: %q
+    cache: { enabled: true, maxSize: 32 }
+`, id, sseServer.URL))
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Emulate a shared Redis DB: the scan surface contains another
+	// network's head-keyed entry.
+	ownKey := id + ":GET:/eth/v1/beacon/headers/head"
+	foreignKey := "othernet:GET:/eth/v1/beacon/headers/head"
+	hdr := http.Header{"Content-Type": []string{"application/json"}}
+	n.cache.Set(ownKey, http.StatusOK, hdr, []byte(`{"own":true}`), 10*time.Second)
+	n.cache.Set(foreignKey, http.StatusOK, hdr, []byte(`{"foreign":true}`), 10*time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	w := startHeadWatcher(ctx, id, n.pool, n.cache, nil)
+	defer func() {
+		cancel()
+		w.wait()
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if n.cache.Get(ownKey) == nil {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	if n.cache.Get(ownKey) != nil {
+		t.Fatal("own-network head entry was not invalidated")
+	}
+	if n.cache.Get(foreignKey) == nil {
+		t.Fatal("foreign-network entry must not be purged by this network's head watcher")
+	}
+}

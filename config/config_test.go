@@ -896,3 +896,43 @@ func TestValidateAuth(t *testing.T) {
 		t.Fatalf("nil auth must be allowed: %v", err)
 	}
 }
+
+func TestLoad_RedisCacheGetsPerNetworkKeyPrefix(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ebeacon.yaml")
+	content := strings.TrimSpace(`
+server: { host: "0.0.0.0", port: 5555, maxTimeout: 60s }
+health: { checkInterval: 15s, finalityInterval: 60s, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: mainnet
+    upstreams: [{ id: a, url: "http://a" }]
+    routing: { loadBalancing: round-robin }
+    cache:
+      enabled: true
+      driver: redis
+      redis: { url: "redis://localhost:6379" }
+  - id: sepolia
+    upstreams: [{ id: b, url: "http://b" }]
+    routing: { loadBalancing: round-robin }
+    cache:
+      enabled: true
+      driver: redis
+      redis: { url: "redis://localhost:6379", keyPrefix: "custom:" }
+`)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Networks[0].Cache.Redis.KeyPrefix; got != "ebeacon:mainnet:" {
+		t.Fatalf("default keyPrefix: got %q", got)
+	}
+	if got := cfg.Networks[1].Cache.Redis.KeyPrefix; got != "custom:" {
+		t.Fatalf("explicit keyPrefix must be preserved: got %q", got)
+	}
+}

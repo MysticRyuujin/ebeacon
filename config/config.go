@@ -487,6 +487,11 @@ func applyNetworkDefaults(n *NetworkConfig) {
 	if n.Cache.Driver == "" {
 		n.Cache.Driver = "memory"
 	}
+	// Redis scan operations (promotion, purge, size) see every key under the
+	// prefix, so networks sharing a Redis DB must not share a namespace.
+	if n.Cache.Driver == "redis" && n.Cache.Redis != nil && n.Cache.Redis.KeyPrefix == "" {
+		n.Cache.Redis.KeyPrefix = "ebeacon:" + n.ID + ":"
+	}
 	for i := range n.Upstreams {
 		if n.Upstreams[i].Weight == 0 {
 			n.Upstreams[i].Weight = 1

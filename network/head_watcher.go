@@ -324,7 +324,9 @@ func (w *headWatcher) invalidateHeadCache(ctx context.Context, u *upstream.Upstr
 		return
 	}
 	// Single-pass: purge matching entries and collect their keys for warming.
-	n, keys := w.cache.PurgeCollect(isNamedHeadCacheKey)
+	n, keys := w.cache.PurgeCollect(func(key string) bool {
+		return w.ownsKey(key) && isNamedHeadCacheKey(key)
+	})
 	if n == 0 {
 		return
 	}
@@ -352,6 +354,14 @@ func (w *headWatcher) invalidateHeadCache(ctx context.Context, u *upstream.Upstr
 // named slot identifier (head, finalized, justified).
 func isNamedHeadCacheKey(key string) bool {
 	return pathHasNamedSlotID(cacheKeyPath(key))
+}
+
+// ownsKey reports whether a cache key belongs to this watcher's network.
+// Scan-based operations can see other networks' entries when a Redis DB is
+// shared, and promotion/purge decisions keyed on another chain's slots would
+// corrupt that network's cache.
+func (w *headWatcher) ownsKey(key string) bool {
+	return strings.HasPrefix(key, w.networkID+":")
 }
 
 // handleFinalizedCheckpoint processes a finalized_checkpoint SSE event.
@@ -384,6 +394,9 @@ func (w *headWatcher) handleFinalizedCheckpoint(data string) {
 	// inclusions through epoch N+1, so require N+2 <= E before promoting.
 	finalizedSlot := epoch * 32
 	n := w.cache.PromoteIf(func(key string) bool {
+		if !w.ownsKey(key) {
+			return false
+		}
 		path := cacheKeyPath(key)
 		if path == "" {
 			return false
@@ -426,6 +439,9 @@ func (w *headWatcher) handleChainReorg(data string) {
 	// Purge numeric-slot entries at or above the reorg slot, plus all
 	// named-head entries which may also reference the orphaned fork.
 	n := w.cache.PurgeIf(func(key string) bool {
+		if !w.ownsKey(key) {
+			return false
+		}
 		path := cacheKeyPath(key)
 		if path == "" {
 			return false
