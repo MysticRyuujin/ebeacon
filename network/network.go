@@ -613,6 +613,8 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	acceptBinary := acceptPrefersSSZ(r.Header.Get("Accept"))
+
 	// Cache lookup (GET only).
 	var cacheKey string
 	var cachePolicy interface{ TTL() time.Duration }
@@ -686,7 +688,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var execErr error
 
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
-		dedupKey := dedupKey(n.id, r.Method, r.URL, bodyBytes, cacheScope)
+		dedupKey := dedupKey(n.id, r.Method, r.URL, bodyBytes, cacheScope, acceptBinary)
 
 		type muxResult struct {
 			resp *http.Response
@@ -786,7 +788,8 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Cache successful responses after the body has been read in full.
-	if cachePolicy != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if cachePolicy != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 &&
+		representationMatches(acceptBinary, resp.Header) {
 		ttl := n.effectiveCacheTTL(cachePolicy.TTL(), r.URL.Path)
 		n.cache.Set(cacheKey, resp.StatusCode, resp.Header, respBody, ttl)
 	}
@@ -1021,12 +1024,17 @@ func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Reque
 	return nil, nil, &selectedUpstreamUnavailableError{selector: required.label(), err: lastErr}
 }
 
-// dedupKey computes a hash key for request deduplication.
-func dedupKey(networkID, method string, u *url.URL, body []byte, scope string) string {
+// dedupKey computes a hash key for request deduplication. acceptBinary must
+// be part of the key: SSZ and JSON requests for the same path are different
+// representations and must not share one upstream response.
+func dedupKey(networkID, method string, u *url.URL, body []byte, scope string, acceptBinary bool) string {
 	key := networkID + ":" + method + ":" + pathAndQueryForUpstream(u)
 	if len(body) > 0 {
 		h := sha256.Sum256(body)
 		key += ":" + fmt.Sprintf("%x", h[:8])
+	}
+	if acceptBinary {
+		key += ":accept=binary"
 	}
 	if scope != "" {
 		key += ":scope=" + scope
@@ -1646,13 +1654,72 @@ func (g *gzipReadCloser) Close() error {
 // namespace.
 func buildCacheKey(networkID string, r *http.Request, scope string) string {
 	key := networkID + ":" + r.Method + ":" + pathAndQueryForCache(r.URL)
-	if strings.EqualFold(r.Header.Get("Accept"), "application/octet-stream") {
+	if acceptPrefersSSZ(r.Header.Get("Accept")) {
 		key += ":accept=binary"
 	}
 	if scope != "" {
 		key += ":upstream=" + scope
 	}
 	return key
+}
+
+// acceptPrefersSSZ reports whether the Accept header prefers
+// application/octet-stream (SSZ) over application/json per RFC 9110 q-values.
+// The beacon-API spec recommends SSZ clients send
+// "application/octet-stream;q=1.0,application/json;q=0.9", which an exact
+// string match would misclassify as JSON. Ties and wildcards resolve to JSON,
+// matching beacon-node defaults.
+func acceptPrefersSSZ(accept string) bool {
+	if accept == "" {
+		return false
+	}
+	const (
+		specWildcard = iota + 1
+		specSubWildcard
+		specExact
+	)
+	var qOctet, qJSON float64
+	var specOctet, specJSON int
+	for part := range strings.SplitSeq(accept, ",") {
+		fields := strings.Split(part, ";")
+		mediaType := strings.ToLower(strings.TrimSpace(fields[0]))
+		q := 1.0
+		for _, p := range fields[1:] {
+			if v, ok := strings.CutPrefix(strings.TrimSpace(p), "q="); ok {
+				if f, err := strconv.ParseFloat(v, 64); err == nil {
+					q = f
+				}
+			}
+		}
+		apply := func(curQ *float64, curSpec *int, spec int) {
+			if spec > *curSpec {
+				*curSpec = spec
+				*curQ = q
+			}
+		}
+		switch mediaType {
+		case "application/octet-stream":
+			apply(&qOctet, &specOctet, specExact)
+		case "application/json":
+			apply(&qJSON, &specJSON, specExact)
+		case "application/*":
+			apply(&qOctet, &specOctet, specSubWildcard)
+			apply(&qJSON, &specJSON, specSubWildcard)
+		case "*/*":
+			apply(&qOctet, &specOctet, specWildcard)
+			apply(&qJSON, &specJSON, specWildcard)
+		}
+	}
+	return qOctet > 0 && qOctet > qJSON
+}
+
+// representationMatches reports whether a response's Content-Type is
+// consistent with the cache key's representation, so an SSZ body is never
+// stored under a JSON-keyed entry (or vice versa) — e.g. when an upstream
+// content-negotiates differently than the key predicted.
+func representationMatches(wantBinary bool, respHeader http.Header) bool {
+	isBinary := strings.HasPrefix(strings.ToLower(respHeader.Get("Content-Type")), "application/octet-stream")
+	return wantBinary == isBinary
 }
 
 func pathAndQueryForCache(u *url.URL) string {

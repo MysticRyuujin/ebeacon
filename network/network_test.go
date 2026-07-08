@@ -900,6 +900,7 @@ func TestNetwork_OctetStreamResponsesStayByteExact(t *testing.T) {
 	}
 
 	req1 := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blobs/123", nil)
+	req1.Header.Set("Accept", "application/octet-stream")
 	rec1 := httptest.NewRecorder()
 	n.ServeHTTP(rec1, req1)
 	if rec1.Code != http.StatusOK {
@@ -913,6 +914,7 @@ func TestNetwork_OctetStreamResponsesStayByteExact(t *testing.T) {
 	}
 
 	req2 := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blobs/123", nil)
+	req2.Header.Set("Accept", "application/octet-stream")
 	rec2 := httptest.NewRecorder()
 	n.ServeHTTP(rec2, req2)
 	if got := rec2.Header().Get("X-Ebeacon-Cache"); got != "HIT" {
@@ -1544,11 +1546,50 @@ func TestBuildCacheKey_IncludesSelectorScope(t *testing.T) {
 func TestDedupKey_IncludesSelectorScope(t *testing.T) {
 	u := &url.URL{Path: "/eth/v1/node/version"}
 
-	genericKey := dedupKey("mainnet", http.MethodGet, u, nil, "")
-	clientKey := dedupKey("mainnet", http.MethodGet, u, nil, "client:nimbus")
+	genericKey := dedupKey("mainnet", http.MethodGet, u, nil, "", false)
+	clientKey := dedupKey("mainnet", http.MethodGet, u, nil, "client:nimbus", false)
 
 	if genericKey == clientKey {
 		t.Fatalf("expected selector-scoped dedup key to differ, got %q", genericKey)
+	}
+}
+
+func TestDedupKey_IncludesAcceptRepresentation(t *testing.T) {
+	u := &url.URL{Path: "/eth/v2/beacon/blocks/12345"}
+
+	jsonKey := dedupKey("mainnet", http.MethodGet, u, nil, "", false)
+	sszKey := dedupKey("mainnet", http.MethodGet, u, nil, "", true)
+
+	if jsonKey == sszKey {
+		t.Fatalf("SSZ and JSON requests must not share a dedup key, got %q", jsonKey)
+	}
+}
+
+func TestAcceptPrefersSSZ(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		accept string
+		want   bool
+	}{
+		{"", false},
+		{"application/octet-stream", true},
+		{"Application/Octet-Stream", true},
+		{"application/json", false},
+		{"application/octet-stream;q=1.0,application/json;q=0.9", true},
+		{"application/octet-stream; q=1.0, application/json; q=0.9", true},
+		{"application/json;q=1.0,application/octet-stream;q=0.9", false},
+		{"application/octet-stream;q=0", false},
+		{"*/*", false},
+		{"application/*", false},
+		{"application/octet-stream, application/json", false},
+		{"application/octet-stream;q=0.5, */*;q=0.1", true},
+		{"text/html", false},
+		{"application/octet-stream;q=garbage", true},
+	}
+	for _, tt := range tests {
+		if got := acceptPrefersSSZ(tt.accept); got != tt.want {
+			t.Errorf("acceptPrefersSSZ(%q) = %v, want %v", tt.accept, got, tt.want)
+		}
 	}
 }
 
@@ -2466,5 +2507,98 @@ func TestNetwork_HEADPreservesUpstreamContentLength(t *testing.T) {
 	}
 	if got := rec.Header().Get("Content-Length"); got != "12345" {
 		t.Fatalf("Content-Length: got %q want 12345", got)
+	}
+}
+
+func TestNetwork_SpecAcceptHeaderKeepsRepresentationsSeparate(t *testing.T) {
+	sszBody := []byte{0x0a, 0x0b, 0x0c, 0x0d}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Emulate a CL node honoring q-values: any Accept mentioning
+		// octet-stream first is served SSZ.
+		if strings.Contains(r.Header.Get("Accept"), "application/octet-stream") {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(sszBody)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":"json"}`))
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	cfg.Networks[0].Cache.Enabled = true
+	cfg.Networks[0].Cache.Policies = []config.CachePolicy{{
+		Pattern: `^/eth/v1/beacon/blobs/\d+$`,
+		TTL:     time.Minute,
+	}}
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The beacon-API spec's recommended SSZ Accept header (q-valued).
+	sszReq := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blobs/456", nil)
+	sszReq.Header.Set("Accept", "application/octet-stream;q=1.0,application/json;q=0.9")
+	sszRec := httptest.NewRecorder()
+	n.ServeHTTP(sszRec, sszReq)
+	if sszRec.Code != http.StatusOK || !bytes.Equal(sszRec.Body.Bytes(), sszBody) {
+		t.Fatalf("ssz response: %d %q", sszRec.Code, sszRec.Body.Bytes())
+	}
+
+	jsonReq := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blobs/456", nil)
+	jsonRec := httptest.NewRecorder()
+	n.ServeHTTP(jsonRec, jsonReq)
+	if got := jsonRec.Body.String(); got != `{"data":"json"}` {
+		t.Fatalf("json client received wrong representation: %q", got)
+	}
+
+	// A second q-valued SSZ request must hit the binary-keyed cache entry.
+	sszReq2 := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blobs/456", nil)
+	sszReq2.Header.Set("Accept", "application/octet-stream;q=1.0,application/json;q=0.9")
+	sszRec2 := httptest.NewRecorder()
+	n.ServeHTTP(sszRec2, sszReq2)
+	if got := sszRec2.Header().Get("X-Ebeacon-Cache"); got != "HIT" {
+		t.Fatalf("second ssz request should be a cache hit, got %q", got)
+	}
+	if !bytes.Equal(sszRec2.Body.Bytes(), sszBody) {
+		t.Fatalf("cached ssz body: %q", sszRec2.Body.Bytes())
+	}
+}
+
+func TestNetwork_MismatchedRepresentationIsNotCached(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Misbehaving upstream: returns SSZ regardless of Accept.
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte{0x01, 0x02})
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	cfg.Networks[0].Cache.Enabled = true
+	cfg.Networks[0].Cache.Policies = []config.CachePolicy{{
+		Pattern: `^/eth/v1/beacon/blobs/\d+$`,
+		TTL:     time.Minute,
+	}}
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jsonReq := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blobs/456", nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, jsonReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d", rec.Code)
+	}
+
+	jsonReq2 := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blobs/456", nil)
+	rec2 := httptest.NewRecorder()
+	n.ServeHTTP(rec2, jsonReq2)
+	if got := rec2.Header().Get("X-Ebeacon-Cache"); got == "HIT" {
+		t.Fatal("SSZ body must not be cached under a JSON-keyed entry")
 	}
 }

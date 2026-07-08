@@ -142,6 +142,9 @@ func (n *Network) populateCacheKey(ctx context.Context, key string, source *upst
 	if err != nil {
 		return fmt.Errorf("read pre-warm response body: %w", err)
 	}
+	if !representationMatches(parsed.acceptBinary, resp.Header) {
+		return nil
+	}
 
 	ttl := n.effectiveCacheTTL(policy.TTL(), parsed.path)
 	n.cache.Set(buildCacheKey(n.id, req, parsed.scope), resp.StatusCode, resp.Header, body, ttl)
