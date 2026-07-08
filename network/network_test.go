@@ -2869,3 +2869,37 @@ func TestForward_AppendsRealPeerToXFF(t *testing.T) {
 		t.Fatalf("upstream XFF chain must end with the real peer, got %q", gotXFF)
 	}
 }
+
+func TestRequiredSelectorFromValue_GlobPrefixRoundTrip(t *testing.T) {
+	t.Parallel()
+	sel := requiredUpstreamSelector{glob: "*lighthouse*"}
+	parsed := requiredSelectorFromValue(sel.label())
+	if parsed.glob != "*lighthouse*" || parsed.upstreamID != "" || parsed.clientType != "" {
+		t.Fatalf("glob scope label must round-trip, got %+v", parsed)
+	}
+}
+
+func TestForward_PreservesPercentEncodedPath(t *testing.T) {
+	var gotURI string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURI = r.RequestURI
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target := "/eth/v1/x/head%3Ffoo"
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	if gotURI != target {
+		t.Fatalf("upstream URI: got %q want %q (encoded segment content must survive)", gotURI, target)
+	}
+}

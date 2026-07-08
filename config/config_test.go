@@ -936,3 +936,31 @@ networks:
 		t.Fatalf("explicit keyPrefix must be preserved: got %q", got)
 	}
 }
+
+func TestValidate_UIRootBasePathRejected(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ebeacon.yaml")
+	content := strings.TrimSpace(`
+server: { host: "0.0.0.0", port: 5555, maxTimeout: 60s }
+health: { checkInterval: 15s, finalityInterval: 60s, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+ui:
+  enabled: true
+  basePath: "/"
+  auth: { keys: [{ id: k, secret: s }] }
+networks:
+  - id: n1
+    upstreams: [{ id: a, url: "http://a" }]
+    routing: { loadBalancing: round-robin }
+    cache: { enabled: false }
+`)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "ui.basePath") {
+		t.Fatalf("ui.basePath \"/\" must be rejected (would panic ServeMux), got: %v", err)
+	}
+}

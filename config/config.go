@@ -710,6 +710,11 @@ func (c *Config) validate() error {
 	if c.UI.Enabled && (c.UI.Auth == nil || len(c.UI.Auth.Keys) == 0) {
 		return fmt.Errorf("ui.auth with at least one key is required when ui.enabled is true")
 	}
+	if c.UI.Enabled {
+		if !strings.HasPrefix(c.UI.BasePath, "/") || strings.TrimRight(c.UI.BasePath, "/") == "" {
+			return fmt.Errorf("ui.basePath must start with \"/\" and not be the root path, got %q", c.UI.BasePath)
+		}
+	}
 	if c.LegacyProjects.Kind != 0 {
 		return fmt.Errorf("top-level \"projects\" is no longer supported; use top-level \"networks\" and optional \"auth\"")
 	}

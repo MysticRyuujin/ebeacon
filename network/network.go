@@ -872,6 +872,13 @@ func requiredSelectorFromValue(id string) requiredUpstreamSelector {
 	if strings.HasPrefix(id, "client:") {
 		return requiredUpstreamSelector{clientType: strings.TrimPrefix(id, "client:")}
 	}
+	// "glob:" is label()'s spelling of a glob selector in cache-key scopes;
+	// without this strip the whole prefixed string is treated as the pattern
+	// and pre-warm never matches an upstream. (An upstream literally named
+	// "glob:x" would misparse — acceptable.)
+	if strings.HasPrefix(id, "glob:") {
+		return requiredUpstreamSelector{glob: strings.TrimPrefix(id, "glob:")}
+	}
 	if strings.ContainsAny(id, "*?[") {
 		return requiredUpstreamSelector{glob: id}
 	}
@@ -1814,7 +1821,7 @@ func representationMatches(wantBinary bool, respHeader http.Header) bool {
 }
 
 func pathAndQueryForCache(u *url.URL) string {
-	path := u.Path
+	path := u.EscapedPath()
 	if path == "" {
 		path = "/"
 	}
@@ -1847,7 +1854,10 @@ func upstreamDirective(r *http.Request) string {
 }
 
 func pathAndQueryForUpstream(u *url.URL) string {
-	path := u.Path
+	// EscapedPath keeps percent-encoded segment content (%2F, %3F, %23)
+	// intact; the decoded path would be re-parsed by the outbound request
+	// and change which resource the upstream sees.
+	path := u.EscapedPath()
 	if path == "" {
 		path = "/"
 	}

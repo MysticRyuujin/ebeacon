@@ -215,6 +215,10 @@ state:
 ui:
   enabled: true
   basePath: /webui
+  auth: # required when ui.enabled is true
+    keys:
+      - id: dashboard
+        secret: "${EBEACON_UI_SECRET}"
 
 networks:
   - id: mainnet
