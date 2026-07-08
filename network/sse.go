@@ -172,6 +172,7 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 		upReq.Header.Set(k, v)
 	}
 
+	u.ConsumeRateToken()
 	u.IncrActive()
 	resp, err := u.Client.Do(upReq)
 	if err != nil {

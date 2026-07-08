@@ -56,9 +56,19 @@ func NewAutoTuner(initialRate, minRate, maxRate float64, adjustmentPeriod time.D
 	}
 }
 
-// Allow returns true if the request should be allowed under the current rate.
-func (at *AutoTuner) Allow() bool {
-	return at.limiter.Allow()
+// HasCapacity reports whether a token is available without consuming one.
+// Selection uses this for candidacy checks: consuming during selection would
+// drain the bucket for every candidate on every request, starving upstreams
+// that never actually get picked.
+func (at *AutoTuner) HasCapacity() bool {
+	return at.limiter.Tokens() >= 1
+}
+
+// Consume takes one token for a request actually sent to the upstream.
+// Best-effort fail-open: an empty bucket does not block the send — the
+// 429-driven RecordResponse autotuning is the real backpressure mechanism.
+func (at *AutoTuner) Consume() {
+	at.limiter.Allow()
 }
 
 // RecordResponse records a response status code. 429 responses trigger rate adjustment.

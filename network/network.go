@@ -1677,6 +1677,7 @@ func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Req
 	}
 	req.Header.Set("X-Forwarded-Host", r.Host)
 
+	u.ConsumeRateToken()
 	u.IncrActive()
 	resp, err := u.Client.Do(req)
 	if err != nil {

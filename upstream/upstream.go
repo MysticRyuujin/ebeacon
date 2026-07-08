@@ -462,12 +462,21 @@ func (u *Upstream) RecordScoreErrorForPath(apiPath string) {
 	u.routeScorer(apiPath, true).RecordError()
 }
 
-// AllowRequest checks the auto-tuner rate limiter (returns true if no tuner configured).
+// AllowRequest is a non-consuming capacity check against the auto-tuner rate
+// limiter (returns true if no tuner configured). Tokens are consumed by
+// ConsumeRateToken when a request is actually sent.
 func (u *Upstream) AllowRequest() bool {
 	if u.rateLimiter == nil {
 		return true
 	}
-	return u.rateLimiter.Allow()
+	return u.rateLimiter.HasCapacity()
+}
+
+// ConsumeRateToken consumes one auto-tuner token for a request actually sent.
+func (u *Upstream) ConsumeRateToken() {
+	if u.rateLimiter != nil {
+		u.rateLimiter.Consume()
+	}
 }
 
 // RecordResponseStatus feeds the auto-tuner with response status codes.

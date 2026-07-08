@@ -168,3 +168,26 @@ func TestAutoTuner_AdjustsRateUpWhenHealthy(t *testing.T) {
 		t.Fatalf("expected rate increase for healthy responses, got %f from %f", at.currentRate, initial)
 	}
 }
+
+func TestAutoTuner_CandidacyCheckDoesNotConsume(t *testing.T) {
+	t.Parallel()
+	at := NewAutoTuner(2, 1, 100, time.Minute, 0.1)
+	for range 50 {
+		if !at.HasCapacity() {
+			t.Fatal("repeated capacity checks must not drain the bucket")
+		}
+	}
+	at.Consume()
+	at.Consume()
+	if at.HasCapacity() {
+		t.Fatal("two consumes at burst 2 should drain the bucket")
+	}
+}
+
+func TestAutoTuner_FractionalInitialRateAllowsFirstRequest(t *testing.T) {
+	t.Parallel()
+	at := NewAutoTuner(0.5, 0.1, 100, time.Minute, 0.1)
+	if !at.HasCapacity() {
+		t.Fatal("fractional initial rate must yield burst >= 1")
+	}
+}
