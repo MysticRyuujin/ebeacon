@@ -1255,12 +1255,12 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 					u.CBSuccess()
 					return wrapResponseBodyCancel(resp, timeoutCancel), u, nil
 				}
-				resp.Body.Close() //nolint:errcheck
-				u.CBSuccess()
-				u.RecordResponseStatus(resp.StatusCode)
 				remaining := max(maxAttempts-(i+1), 1)
 				archiveUps := n.pool.SelectForPathArchive(apiPath, remaining)
 				if len(archiveUps) > 0 {
+					resp.Body.Close() //nolint:errcheck
+					u.CBSuccess()
+					u.RecordResponseStatus(resp.StatusCode)
 					metricArchivePromotion.WithLabelValues(n.id, archivePromotionOnError).Inc()
 					slog.Debug("promoting to archive upstreams after pruning-shaped 404", "network", n.id, "upstream", u.ID, "status", resp.StatusCode, "api_path", apiPath, "remaining_attempts", len(archiveUps))
 					ups = append(ups[:i+1], archiveUps...)
@@ -1269,10 +1269,9 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 					continue
 				}
 				// Archive upstreams exist but none selectable right now (all
-				// unhealthy / circuit-broken / already tried). Return the 404
-				// to the client — no more attempts to promote on this request.
-				// We don't restore `resp` because Body is still open here, so
-				// we fall through to the normal success return.
+				// unhealthy / circuit-broken / already tried). Fall through to
+				// the normal success return with the body still open; the
+				// peeked prefix replays via the MultiReader.
 			}
 			u.CBSuccess()
 			return wrapResponseBodyCancel(resp, timeoutCancel), u, nil
