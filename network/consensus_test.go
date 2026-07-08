@@ -1,6 +1,7 @@
 package network
 
 import (
+	"compress/gzip"
 	"context"
 	"io"
 	"net/http"
@@ -94,5 +95,60 @@ func TestConsensusPolicy_ExecuteNoConsensus(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected consensus error")
+	}
+}
+
+func TestNetwork_ConsensusWithGzipUpstreams(t *testing.T) {
+	payload := `{"data":{"root":"0xabc"}}`
+	gzHandler := func(level int) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+				w.Header().Set("Content-Encoding", "gzip")
+				gz, _ := gzip.NewWriterLevel(w, level)
+				_, _ = gz.Write([]byte(payload))
+				_ = gz.Close()
+				return
+			}
+			_, _ = w.Write([]byte(payload))
+		}
+	}
+	// Different compression levels emulate per-node nondeterministic gzip
+	// output for identical JSON.
+	a := httptest.NewServer(gzHandler(gzip.BestSpeed))
+	defer a.Close()
+	b := httptest.NewServer(gzHandler(gzip.BestCompression))
+	defer b.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, a.URL, nil)
+	cfg.Networks[0].Upstreams = []config.UpstreamConfig{
+		{ID: "u1", URL: a.URL},
+		{ID: "u2", URL: b.URL},
+	}
+	cfg.Failsafe.Consensus = &config.ConsensusConfig{
+		Enabled:            true,
+		MaxParticipants:    2,
+		AgreementThreshold: 2,
+	}
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blocks/head/root", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d body %q (gzip variance must not break consensus)", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Content-Encoding") == "gzip" {
+		t.Fatalf("small consensus body should not be gzip re-encoded")
+	}
+	if got := rec.Body.String(); got != payload {
+		t.Fatalf("body: got %q want %q", got, payload)
 	}
 }

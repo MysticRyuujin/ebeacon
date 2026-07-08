@@ -1204,6 +1204,12 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 				for k, v := range u.Headers {
 					req.Header.Set(k, v)
 				}
+				// Strip the client's Accept-Encoding so Go's transport
+				// negotiates gzip itself and transparently decompresses:
+				// consensus compares bodies byte-wise, and per-node gzip
+				// output is not deterministic. It also keeps the winning
+				// (cached) body plain.
+				req.Header.Del("Accept-Encoding")
 				return req, nil
 			})
 			if err != nil {
