@@ -646,16 +646,25 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		n.observeCacheByMethod(r.Method, apiPath, "bypass_method")
 	}
 
-	// Buffer body for retry / hedge.
+	// Buffer the body: forward() builds upstream requests only from these
+	// bytes (never r.Body), and retry/hedge/dedup need a replayable copy.
+	const maxRequestBody = 32 << 20
 	var bodyBytes []byte
-	if r.Body != nil && r.Body != http.NoBody && (n.needsBodyBuffer() || debuglog.Default().Enabled()) {
+	if r.Body != nil && r.Body != http.NoBody {
 		var err error
-		bodyBytes, err = io.ReadAll(io.LimitReader(r.Body, 32<<20))
+		bodyBytes, err = io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
 		if err != nil {
 			n.observeMethodStatus(r.Method, apiPath, http.StatusBadRequest)
 			n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusBadRequest)
 			n.logFailure(r, bodyBytes, apiPath, "", http.StatusBadRequest, nil, nil, err, 0, "request_body_read_error", "", 0)
 			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		if len(bodyBytes) > maxRequestBody {
+			n.observeMethodStatus(r.Method, apiPath, http.StatusRequestEntityTooLarge)
+			n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusRequestEntityTooLarge)
+			n.logFailure(r, nil, apiPath, "", http.StatusRequestEntityTooLarge, nil, nil, nil, 0, "request_body_too_large", "", 0)
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
 		r.Body.Close() //nolint:errcheck
@@ -1621,16 +1630,6 @@ func (g *gzipReadCloser) Close() error {
 		return origErr
 	}
 	return gzipErr
-}
-
-func (n *Network) needsBodyBuffer() bool {
-	if n.failsafe.Hedge != nil {
-		return true
-	}
-	if n.failsafe.Retry != nil && n.failsafe.Retry.MaxAttempts > 1 {
-		return true
-	}
-	return false
 }
 
 // buildCacheKey produces a stable cache key from the request.

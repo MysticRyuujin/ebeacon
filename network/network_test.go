@@ -2340,3 +2340,69 @@ networks:
 		t.Error("numeric slot cache entry was unexpectedly invalidated")
 	}
 }
+
+func TestNetwork_POSTBodyForwardedWithoutRetryConfig(t *testing.T) {
+	var gotBody []byte
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	if cfg.Failsafe.Retry != nil || cfg.Failsafe.Hedge != nil {
+		t.Fatal("test requires a config without retry/hedge")
+	}
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := `["1","2","3"]`
+	req := httptest.NewRequest(http.MethodPost, "/eth/v1/beacon/states/head/validators", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d %q", rec.Code, rec.Body.String())
+	}
+	if string(gotBody) != body {
+		t.Fatalf("upstream body: got %q want %q", gotBody, body)
+	}
+}
+
+func TestNetwork_POSTBodyTooLargeReturns413(t *testing.T) {
+	upstreamCalled := false
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/eth/v1/beacon/states/head/validators",
+		io.LimitReader(neverEnding('x'), 32<<20+1))
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status: got %d want 413", rec.Code)
+	}
+	if upstreamCalled {
+		t.Fatal("oversized body must not reach the upstream")
+	}
+}
+
+type neverEnding byte
+
+func (b neverEnding) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = byte(b)
+	}
+	return len(p), nil
+}
