@@ -9,6 +9,12 @@ server:
   # Large beacon states can approach 1 GiB as JSON; the cap bounds memory
   # against oversized or decompression-bomb responses. Default 2 GiB.
   # maxResponseBodyBytes: 2147483648
+  # CIDRs/IPs whose X-Forwarded-For / X-Real-IP headers are honored for
+  # client identification (per-IP rate limiting, sticky sessions). WARNING:
+  # when unset, forwarding headers are trusted from ANY peer — a client
+  # reaching eBeacon directly can spoof its IP to evade per-IP rate limits.
+  # Set this when running behind a load balancer or reverse proxy.
+  # trustedProxies: ["10.0.0.0/8", "127.0.0.1"]
 
 # pprof exposes Go runtime profiling data on a separate HTTP server.
 # Useful for diagnosing memory leaks, goroutine stacks, and CPU hotspots.

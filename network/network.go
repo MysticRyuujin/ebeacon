@@ -11,7 +11,6 @@ import (
 	"io"
 	"log/slog"
 	"math/rand"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -1670,11 +1669,14 @@ func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Req
 		req.Header.Set("Accept-Encoding", "gzip")
 	}
 
-	clientAddr := extractClientIP(r)
+	// Append the immediate peer to the XFF chain, per convention. Appending
+	// the extracted client IP instead would duplicate the (spoofable) first
+	// XFF entry and lose the real peer address.
+	peer := remoteAddrHost(r)
 	if existing := r.Header.Get("X-Forwarded-For"); existing != "" {
-		req.Header.Set("X-Forwarded-For", existing+", "+clientAddr)
+		req.Header.Set("X-Forwarded-For", existing+", "+peer)
 	} else {
-		req.Header.Set("X-Forwarded-For", clientAddr)
+		req.Header.Set("X-Forwarded-For", peer)
 	}
 	req.Header.Set("X-Forwarded-Host", r.Host)
 
@@ -1896,20 +1898,6 @@ func copyResponseHeaders(dst, src http.Header) {
 func isHopByHopHeader(h string) bool {
 	_, ok := hopByHopHeaderSet[strings.ToLower(h)]
 	return ok
-}
-
-func extractClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return ip
 }
 
 // ObfuscateUpstreamID returns a stable 8-character hex token for an upstream ID

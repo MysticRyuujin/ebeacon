@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -69,6 +70,10 @@ type ServerConfig struct {
 	// MaxResponseBodyBytes caps how many bytes of an upstream response body
 	// (after gzip decompression) the proxy will buffer. Default 2 GiB.
 	MaxResponseBodyBytes int64 `yaml:"maxResponseBodyBytes"`
+	// TrustedProxies lists CIDRs/IPs whose X-Forwarded-For / X-Real-IP are
+	// honored for client identification. Unset = trust all (legacy), which
+	// is spoofable when eBeacon is exposed directly to clients.
+	TrustedProxies []string `yaml:"trustedProxies"`
 }
 
 type DebugLoggingConfig struct {
@@ -749,6 +754,15 @@ func validateServer(s ServerConfig) error {
 	}
 	if s.MaxResponseBodyBytes <= 0 {
 		return fmt.Errorf("server.maxResponseBodyBytes must be > 0")
+	}
+	for i, tp := range s.TrustedProxies {
+		v := strings.TrimSpace(tp)
+		if _, err := netip.ParsePrefix(v); err == nil {
+			continue
+		}
+		if _, err := netip.ParseAddr(v); err != nil {
+			return fmt.Errorf("server.trustedProxies[%d]: %q is not a valid CIDR or IP", i, tp)
+		}
 	}
 	return nil
 }

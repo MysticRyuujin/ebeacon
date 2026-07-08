@@ -2843,3 +2843,29 @@ func TestNetwork_MultiplexFollowerCancelReturnsPromptly(t *testing.T) {
 		t.Fatalf("leader status: got %d want 200", leaderRec.Code)
 	}
 }
+
+func TestForward_AppendsRealPeerToXFF(t *testing.T) {
+	var gotXFF string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotXFF = r.Header.Get("X-Forwarded-For")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+	req.RemoteAddr = "192.0.2.10:5555"
+	req.Header.Set("X-Forwarded-For", "1.2.3.4")
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	if gotXFF != "1.2.3.4, 192.0.2.10" {
+		t.Fatalf("upstream XFF chain must end with the real peer, got %q", gotXFF)
+	}
+}
