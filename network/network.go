@@ -31,6 +31,10 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// statusClientClosedRequest is nginx's non-standard 499, used only in metrics
+// to distinguish client disconnects from real error responses.
+const statusClientClosedRequest = 499
+
 // hop-by-hop headers that must not be forwarded.
 // The first group is the standard set defined in RFC 7230 §6.1.
 // The second group is ebeacon-specific: these headers carry client auth tokens
@@ -205,6 +209,9 @@ type Network struct {
 	// maxResponseBytes caps buffered upstream response bodies (post-gzip).
 	maxResponseBytes int64
 
+	// maxTimeout bounds detached multiplexed executions (server.maxTimeout).
+	maxTimeout time.Duration
+
 	reqTotal            *prometheus.CounterVec
 	reqByMethod         *prometheus.CounterVec
 	reqByPath           *prometheus.CounterVec
@@ -287,6 +294,7 @@ func New(cfg *config.NetworkConfig, globalCfg *config.Config) (*Network, error) 
 		relay:            newSSERelay(cfg.ID, pool),
 		gzipEnabled:      globalCfg.Server.GzipEnabled(),
 		maxResponseBytes: globalCfg.Server.MaxResponseBodyBytes,
+		maxTimeout:       globalCfg.Server.MaxTimeout,
 	}
 
 	cr, err := compileRouting(&cfg.Routing)
@@ -696,8 +704,14 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			body []byte
 		}
 
-		v, muxErr, shared := n.inflight.Do(dedupKey, func() (interface{}, error) {
-			resp, u, err := n.executeWithFailsafe(r.Context(), r, bodyBytes, preferID, requiredSelector, fs, apiPath)
+		ch := n.inflight.DoChan(dedupKey, func() (interface{}, error) {
+			// Detach from the caller's request context so one client's
+			// disconnect doesn't fail every deduplicated follower. The
+			// failsafe timeout still applies inside executeFS; maxTimeout
+			// backstops the case where no failsafe timeout is configured.
+			execCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), n.maxTimeout)
+			defer cancel()
+			resp, u, err := n.executeWithFailsafe(execCtx, r, bodyBytes, preferID, requiredSelector, fs, apiPath)
 			if err != nil {
 				return nil, err
 			}
@@ -708,13 +722,24 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return &muxResult{resp: resp, u: u, body: body}, nil
 		})
-		if shared {
+
+		var res singleflight.Result
+		select {
+		case res = <-ch:
+		case <-r.Context().Done():
+			// This caller's client is gone; the shared execution keeps
+			// running for any other waiters. Nothing useful can be written.
+			n.observeMethodStatus(r.Method, apiPath, statusClientClosedRequest)
+			n.observeAPIKey(apiKey, r.Method, apiPath, statusClientClosedRequest)
+			return
+		}
+		if res.Shared {
 			n.multiplexedTotal.Inc()
 		}
-		if muxErr != nil {
-			execErr = muxErr
-		} else if v != nil {
-			mr := v.(*muxResult)
+		if res.Err != nil {
+			execErr = res.Err
+		} else if res.Val != nil {
+			mr := res.Val.(*muxResult)
 			// All multiplexed callers share mr.resp, so concurrent calls to
 			// finalizeResponseBody (which writes Content-Length into the header
 			// map) and copyResponseHeaders (which iterates it) would race.

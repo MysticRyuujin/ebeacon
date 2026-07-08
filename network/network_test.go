@@ -2730,3 +2730,116 @@ func TestNetwork_FailsafeTimeoutStillTripsCircuitBreaker(t *testing.T) {
 		t.Fatal("failsafe timeout must still count as a circuit breaker failure")
 	}
 }
+
+func TestNetwork_MultiplexLeaderDisconnectDoesNotFailFollowers(t *testing.T) {
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		close(arrived)
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":"ok"}`))
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil).WithContext(leaderCtx)
+		n.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	<-arrived
+
+	followerRec := httptest.NewRecorder()
+	followerDone := make(chan struct{})
+	go func() {
+		defer close(followerDone)
+		req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+		n.ServeHTTP(followerRec, req)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	cancelLeader()
+	select {
+	case <-leaderDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("leader handler did not return after client disconnect")
+	}
+
+	close(release)
+	select {
+	case <-followerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("follower did not complete")
+	}
+	if followerRec.Code != http.StatusOK {
+		t.Fatalf("follower status: got %d want 200 (leader disconnect must not fail followers)", followerRec.Code)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("upstream hits: got %d want 1 (execution must stay shared)", hits.Load())
+	}
+}
+
+func TestNetwork_MultiplexFollowerCancelReturnsPromptly(t *testing.T) {
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(arrived)
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":"ok"}`))
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leaderRec := httptest.NewRecorder()
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+		n.ServeHTTP(leaderRec, req)
+	}()
+	<-arrived
+
+	followerCtx, cancelFollower := context.WithCancel(context.Background())
+	followerDone := make(chan struct{})
+	go func() {
+		defer close(followerDone)
+		req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil).WithContext(followerCtx)
+		n.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	cancelFollower()
+	select {
+	case <-followerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("follower must return promptly when its own client cancels")
+	}
+
+	close(release)
+	select {
+	case <-leaderDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("leader did not complete")
+	}
+	if leaderRec.Code != http.StatusOK {
+		t.Fatalf("leader status: got %d want 200", leaderRec.Code)
+	}
+}
