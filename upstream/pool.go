@@ -560,7 +560,7 @@ func (p *Pool) UpdateFinalizedEpoch(epoch uint64) {
 		}
 		if p.finalizedEpoch.CompareAndSwap(old, epoch) {
 			if p.sharedState != nil {
-				p.sharedState.PublishFinalized(epoch)
+				p.sharedState.PublishFinalized(p.networkID, epoch)
 			}
 			return
 		}
@@ -593,7 +593,7 @@ func (p *Pool) StartStateSync() {
 	if p.sharedState == nil {
 		return
 	}
-	p.seedFinalizedEpoch(p.sharedState.GetFinalized())
+	p.seedFinalizedEpoch(p.sharedState.GetFinalized(p.networkID))
 }
 
 // SyncCanonicalHead publishes the current canonical head to shared state if it

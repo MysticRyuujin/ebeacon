@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/mysticryuujin/ebeacon/config"
@@ -15,17 +14,29 @@ import (
 )
 
 const (
-	headChannel  = "ebeacon:head"
-	finalizedKey = "ebeacon:finalized_epoch"
+	headChannel        = "ebeacon:head"
+	finalizedKeyPrefix = "ebeacon:finalized_epoch:"
 )
+
+func finalizedKeyFor(network string) string {
+	return finalizedKeyPrefix + network
+}
+
+// finalizedEpochScript sets the key only when the new epoch is higher, so a
+// lagging instance cannot regress the shared value.
+var finalizedEpochScript = redis.NewScript(`
+local cur = tonumber(redis.call('GET', KEYS[1]) or '0')
+if tonumber(ARGV[1]) > cur then redis.call('SET', KEYS[1], ARGV[1]) return 1 end
+return 0`)
 
 // RedisState uses Redis pub/sub for cross-instance coordination.
 type RedisState struct {
-	client         *redis.Client
-	finalizedEpoch atomic.Uint64
-	headCh         chan HeadUpdate
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
+	client      *redis.Client
+	finalizedMu sync.Mutex
+	finalized   map[string]uint64
+	headCh      chan HeadUpdate
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
 }
 
 // NewRedisState connects to Redis and starts subscribing.
@@ -57,17 +68,10 @@ func NewRedisState(cfg *config.RedisStateConfig) (*RedisState, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	rs := &RedisState{
-		client: client,
-		headCh: make(chan HeadUpdate, 64),
-		cancel: cancel,
-	}
-
-	// Load initial finalized epoch
-	val, err := client.Get(ctx, finalizedKey).Result()
-	if err == nil {
-		if epoch, err := strconv.ParseUint(val, 10, 64); err == nil {
-			rs.finalizedEpoch.Store(epoch)
-		}
+		client:    client,
+		finalized: make(map[string]uint64),
+		headCh:    make(chan HeadUpdate, 64),
+		cancel:    cancel,
 	}
 
 	rs.wg.Add(1)
@@ -127,25 +131,38 @@ func (rs *RedisState) SubscribeHead() <-chan HeadUpdate {
 	return rs.headCh
 }
 
-func (rs *RedisState) PublishFinalized(epoch uint64) {
-	for {
-		old := rs.finalizedEpoch.Load()
-		if epoch <= old {
-			return
-		}
-		if rs.finalizedEpoch.CompareAndSwap(old, epoch) {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			if err := rs.client.Set(ctx, finalizedKey, strconv.FormatUint(epoch, 10), 0).Err(); err != nil {
-				slog.Warn("redis set finalized epoch failed", "err", err)
-			}
-			cancel()
-			return
-		}
+func (rs *RedisState) PublishFinalized(network string, epoch uint64) {
+	rs.finalizedMu.Lock()
+	if epoch <= rs.finalized[network] {
+		rs.finalizedMu.Unlock()
+		return
+	}
+	rs.finalized[network] = epoch
+	rs.finalizedMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := finalizedEpochScript.Run(ctx, rs.client, []string{finalizedKeyFor(network)}, epoch).Err(); err != nil {
+		slog.Warn("redis set finalized epoch failed", "network", network, "err", err)
 	}
 }
 
-func (rs *RedisState) GetFinalized() uint64 {
-	return rs.finalizedEpoch.Load()
+func (rs *RedisState) GetFinalized(network string) uint64 {
+	var remote uint64
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if val, err := rs.client.Get(ctx, finalizedKeyFor(network)).Result(); err == nil {
+		if epoch, err := strconv.ParseUint(val, 10, 64); err == nil {
+			remote = epoch
+		}
+	}
+
+	rs.finalizedMu.Lock()
+	defer rs.finalizedMu.Unlock()
+	if remote > rs.finalized[network] {
+		rs.finalized[network] = remote
+	}
+	return rs.finalized[network]
 }
 
 func (rs *RedisState) Close() error {

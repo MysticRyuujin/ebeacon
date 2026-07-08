@@ -11,7 +11,7 @@ type HeadUpdate struct {
 type SharedState interface {
 	PublishHead(network string, slot uint64, root string)
 	SubscribeHead() <-chan HeadUpdate
-	PublishFinalized(epoch uint64)
-	GetFinalized() uint64
+	PublishFinalized(network string, epoch uint64)
+	GetFinalized(network string) uint64
 	Close() error
 }
