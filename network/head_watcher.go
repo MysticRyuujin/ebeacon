@@ -184,7 +184,7 @@ func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error
 	go func() {
 		r := bufio.NewReader(resp.Body)
 		for {
-			line, err := r.ReadString('\n')
+			line, err := readCappedLine(r, sseMaxEventBytes)
 			select {
 			case lines <- lineResult{line, err}:
 			case <-readerDone:
@@ -239,7 +239,10 @@ func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error
 				case strings.HasPrefix(line, "data:"):
 					if inHeadEvent || inFinalizedEvent || inReorgEvent || !sawEventName {
 						sawData = true
-						dataPayload.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+						payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+						if dataPayload.Len()+len(payload) <= sseMaxEventBytes {
+							dataPayload.WriteString(payload)
+						}
 					}
 				case line == "":
 					if sawData {
@@ -389,10 +392,10 @@ func (w *headWatcher) handleFinalizedCheckpoint(data string) {
 		return
 	}
 
-	// A checkpoint at epoch E finalizes the chain only up to slot E*32.
-	// Epoch-keyed data (e.g. attestation rewards for epoch N) can depend on
-	// inclusions through epoch N+1, so require N+2 <= E before promoting.
-	finalizedSlot := epoch * 32
+	// A checkpoint at epoch E finalizes the chain only up to slot
+	// E*slotsPerEpoch. Epoch-keyed data (e.g. attestation rewards for epoch N)
+	// can depend on inclusions through epoch N+1, so require N+2 <= E.
+	finalizedSlot := epoch * w.pool.SlotsPerEpoch()
 	n := w.cache.PromoteIf(func(key string) bool {
 		if !w.ownsKey(key) {
 			return false
@@ -404,7 +407,7 @@ func (w *headWatcher) handleFinalizedCheckpoint(data string) {
 		if slot, ok := pathNumericSlot(path); ok && slot <= finalizedSlot {
 			return true
 		}
-		if ep, ok := pathNumericEpoch(path); ok && ep+2 <= epoch {
+		if ep, ok := pathNumericEpoch(path); ok && epoch >= 2 && ep <= epoch-2 {
 			return true
 		}
 		return false

@@ -62,18 +62,21 @@ func (bc *BlockCache) AddBlock(upstreamID string, slot uint64, root, parentRoot 
 	// head-lag scoring) keys off it, so one implausible far-future slot —
 	// a cross-chain misconfigured upstream or corrupt shared-state replay —
 	// would poison fork detection until restart. Reject whole blocks beyond
-	// the wall-clock slot when the network's genesis time is known. The
-	// divisor must match the chain's real slot duration or legitimate blocks
-	// get rejected (e.g. 5s Gnosis slots against a 12s assumption).
-	const maxFutureSlotTolerance = 2
+	// the wall-clock slot when the network's genesis time is known. The margin
+	// must absorb realistic host-clock lag (NTP outage, VM suspend); a slow
+	// clock otherwise drops every real head and silently freezes fork
+	// detection. Cross-chain/corrupt slots are off by millions, so a generous
+	// margin still catches them.
+	const clockSkewTolerance = 10 * time.Minute
 	slotSeconds := bc.secondsPerSlot
 	if slotSeconds <= 0 {
 		slotSeconds = 12
 	}
 	if bc.genesisTime > 0 {
 		if now := time.Now().Unix(); now > bc.genesisTime {
-			currentSlot := uint64(now-bc.genesisTime) / uint64(slotSeconds)
-			if slot > currentSlot+maxFutureSlotTolerance {
+			elapsed := now - bc.genesisTime + int64(clockSkewTolerance.Seconds())
+			currentSlot := uint64(elapsed) / uint64(slotSeconds)
+			if slot > currentSlot {
 				return
 			}
 		}

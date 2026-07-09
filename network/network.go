@@ -284,6 +284,7 @@ func New(cfg *config.NetworkConfig, globalCfg *config.Config) (*Network, error) 
 		return nil, fmt.Errorf("network %s: %w", cfg.ID, err)
 	}
 	pool.BlockCache().SetSlotTiming(cfg.GenesisTime, cfg.SecondsPerSlot)
+	pool.SetSlotsPerEpoch(uint64(cfg.SlotsPerEpoch))
 
 	n := &Network{
 		id:               cfg.ID,
@@ -913,17 +914,24 @@ func (n *Network) effectiveFailsafe(method, path string) config.FailsafeConfig {
 
 func mergeFailsafe(base, override config.FailsafeConfig) config.FailsafeConfig {
 	result := base
+	// Clone overridden sections: they alias the shared compiled override and
+	// ApplyFailsafeDefaults mutates in place, so aliasing would race concurrent
+	// requests. base's sections are already defaulted and never written.
 	if override.Timeout != nil {
-		result.Timeout = override.Timeout
+		t := *override.Timeout
+		result.Timeout = &t
 	}
 	if override.Retry != nil {
-		result.Retry = override.Retry
+		r := *override.Retry
+		result.Retry = &r
 	}
 	if override.Hedge != nil {
-		result.Hedge = override.Hedge
+		h := *override.Hedge
+		result.Hedge = &h
 	}
 	if override.CircuitBreaker != nil {
-		result.CircuitBreaker = override.CircuitBreaker
+		cb := *override.CircuitBreaker
+		result.CircuitBreaker = &cb
 	}
 	// A path override replaces whole sections with raw (undefaulted) config;
 	// default the merged result so an override that sets only retry.maxAttempts
@@ -1130,8 +1138,11 @@ func (n *Network) effectiveCacheTTL(policyTTL time.Duration, path string) time.D
 		}
 		// Epoch-keyed data (e.g. attestation rewards for epoch N) can depend
 		// on inclusions through epoch N+1, so require N+2 <= finalized epoch.
-		if epoch, ok := pathNumericEpoch(path); ok && epoch+2 <= finalizedSlot/32 {
-			return 0 // finalized epoch → cache forever
+		// Written as epoch <= finalized-2 to avoid uint64 wrap on a huge epoch.
+		if fe := n.pool.FinalizedEpoch(); fe >= 2 {
+			if epoch, ok := pathNumericEpoch(path); ok && epoch <= fe-2 {
+				return 0 // finalized epoch → cache forever
+			}
 		}
 	}
 	if policyTTL > 0 && n.cfg.GenesisTime != 0 && pathHasNamedSlotID(path) {
@@ -1393,6 +1404,9 @@ func ensurePreferredUpstreamFirst(pool *upstream.Pool, ups []*upstream.Upstream,
 	}
 	for i, u := range ups {
 		if u.ID == preferID {
+			if pool.BlockCache().IsForked(u.ID) {
+				return ups
+			}
 			if i != 0 {
 				ups[0], ups[i] = ups[i], ups[0]
 			}
@@ -1658,6 +1672,9 @@ func (n *Network) promoteToArchive(ctx context.Context, apiPath string, r *http.
 		resp, err := n.forward(ctx, u, r, body)
 		if err != nil {
 			lastErr = err
+			if isClientCancel(ctx, err) {
+				return nil, nil, err
+			}
 			u.CBFailure()
 			continue
 		}

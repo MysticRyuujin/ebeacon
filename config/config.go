@@ -98,6 +98,7 @@ type NetworkConfig struct {
 	ID                string              `yaml:"id"`
 	GenesisTime       int64               `yaml:"genesisTime"`    // unix timestamp of network genesis; enables slot-boundary TTL alignment
 	SecondsPerSlot    int64               `yaml:"secondsPerSlot"` // seconds per slot (default 12); set for non-12s chains like Gnosis
+	SlotsPerEpoch     int64               `yaml:"slotsPerEpoch"`  // slots per epoch (default 32); set to 16 for Gnosis
 	Upstreams         []UpstreamConfig    `yaml:"upstreams"`
 	Failsafe          *FailsafeConfig     `yaml:"failsafe"` // overrides global
 	FailsafeOverrides []FailsafeOverride  `yaml:"failsafeOverrides"`
@@ -463,6 +464,12 @@ var knownGenesisTimes = map[string]int64{
 	"hoodi":   1742213400,
 }
 
+// knownSlotsPerEpoch overrides the 32-slot default for chains that differ.
+var knownSlotsPerEpoch = map[string]int64{
+	"gnosis": 16,
+	"chiado": 16,
+}
+
 func applyNetworkDefaults(n *NetworkConfig) {
 	if n.GenesisTime == 0 {
 		if t, ok := knownGenesisTimes[strings.ToLower(n.ID)]; ok {
@@ -471,6 +478,13 @@ func applyNetworkDefaults(n *NetworkConfig) {
 	}
 	if n.SecondsPerSlot == 0 {
 		n.SecondsPerSlot = 12
+	}
+	if n.SlotsPerEpoch == 0 {
+		if s, ok := knownSlotsPerEpoch[strings.ToLower(n.ID)]; ok {
+			n.SlotsPerEpoch = s
+		} else {
+			n.SlotsPerEpoch = 32
+		}
 	}
 	if n.Routing.LoadBalancing == "" {
 		n.Routing.LoadBalancing = "round-robin"
@@ -841,6 +855,9 @@ func validateNetwork(n *NetworkConfig, ctx string) error {
 	}
 	if n.SecondsPerSlot <= 0 {
 		return fmt.Errorf("%s: secondsPerSlot must be > 0", ctx)
+	}
+	if n.SlotsPerEpoch <= 0 {
+		return fmt.Errorf("%s: slotsPerEpoch must be > 0", ctx)
 	}
 	if err := validateFailsafe(n.Failsafe, ctx+" failsafe"); err != nil {
 		return err

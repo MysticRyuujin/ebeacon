@@ -520,6 +520,41 @@ func TestApplyDefaults_SetsGlobalFailsafeTimeout(t *testing.T) {
 	}
 }
 
+func TestApplyNetworkDefaults_SlotsPerEpoch(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		id   string
+		set  int64
+		want int64
+	}{
+		{"mainnet", 0, 32},
+		{"gnosis", 0, 16},
+		{"chiado", 0, 16},
+		{"somedevnet", 0, 32},
+		{"gnosis", 64, 64}, // explicit override wins over the known default
+	}
+	for _, tc := range tests {
+		n := &NetworkConfig{ID: tc.id, SlotsPerEpoch: tc.set}
+		applyNetworkDefaults(n)
+		if n.SlotsPerEpoch != tc.want {
+			t.Errorf("%s (set=%d): SlotsPerEpoch=%d want %d", tc.id, tc.set, n.SlotsPerEpoch, tc.want)
+		}
+	}
+}
+
+func TestValidateNetwork_RejectsNonPositiveSlotsPerEpoch(t *testing.T) {
+	t.Parallel()
+	n := &NetworkConfig{
+		ID:             "x",
+		Upstreams:      []UpstreamConfig{{ID: "a", URL: "http://127.0.0.1:5052"}},
+		SecondsPerSlot: 12,
+		SlotsPerEpoch:  0,
+	}
+	if err := validateNetwork(n, "networks[0]"); err == nil {
+		t.Fatal("expected error for slotsPerEpoch <= 0")
+	}
+}
+
 func TestLoad_UpstreamHeaderAndURLEnvExpansion(t *testing.T) {
 	t.Setenv("EBEACON_TEST_UPSTREAM_TOKEN", "real-token-9001")
 	t.Setenv("EBEACON_TEST_UPSTREAM_HOST", "node.example.com")

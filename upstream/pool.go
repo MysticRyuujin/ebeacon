@@ -28,8 +28,11 @@ type Pool struct {
 	blockCache *BlockCache
 
 	// finalizedEpoch is the highest finalized epoch seen across all upstreams.
-	// Slots at or before epoch*32 can be cached forever.
+	// Slots at or before epoch*slotsPerEpoch can be cached forever.
 	finalizedEpoch atomic.Uint64
+
+	// slotsPerEpoch is the chain's SLOTS_PER_EPOCH; 0 means the 32 default.
+	slotsPerEpoch atomic.Uint64
 
 	// sharedState propagates head and finalized updates across instances.
 	sharedState state.SharedState
@@ -542,16 +545,35 @@ func (p *Pool) HealthCountsForSelector(selector string) (total, up, degraded, do
 	return
 }
 
+// SetSlotsPerEpoch sets the chain's SLOTS_PER_EPOCH. Call once before Start.
+func (p *Pool) SetSlotsPerEpoch(n uint64) {
+	p.slotsPerEpoch.Store(n)
+}
+
+// SlotsPerEpoch returns the chain's SLOTS_PER_EPOCH, defaulting to 32.
+func (p *Pool) SlotsPerEpoch() uint64 {
+	if n := p.slotsPerEpoch.Load(); n != 0 {
+		return n
+	}
+	return 32
+}
+
+// FinalizedEpoch returns the highest finalized epoch seen across all upstreams.
+func (p *Pool) FinalizedEpoch() uint64 {
+	return p.finalizedEpoch.Load()
+}
+
 // FinalizedSlot returns the highest finalized slot seen across all upstreams.
 // A finality checkpoint at epoch N finalizes the chain only up to the epoch
-// boundary block at slot N*32; slots N*32+1..N*32+31 are justified at best
-// and can still reorg, so they must not be treated as immutable.
+// boundary block at slot N*slotsPerEpoch; later slots in that epoch are
+// justified at best and can still reorg, so they must not be treated as
+// immutable.
 func (p *Pool) FinalizedSlot() uint64 {
 	epoch := p.finalizedEpoch.Load()
 	if epoch == 0 {
 		return 0
 	}
-	return epoch * 32
+	return epoch * p.SlotsPerEpoch()
 }
 
 // UpdateFinalizedEpoch merges a finalized epoch into the pool aggregate and

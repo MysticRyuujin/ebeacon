@@ -401,7 +401,6 @@ func (h *HealthMonitor) checkNodeHealth(ctx context.Context, u *Upstream) {
 		slog.Debug("node health check returned unexpected status, deferring to sync poll",
 			"network", u.NetworkID, "upstream", u.ID, "status", resp.StatusCode)
 		u.SetNodeProbeDown(false)
-		h.recordProbeError(u)
 	}
 }
 

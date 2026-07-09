@@ -601,6 +601,122 @@ func TestEffectiveCacheTTL_FinalizedEpoch(t *testing.T) {
 	}
 }
 
+func TestEffectiveCacheTTL_SlotsPerEpoch16(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	cfg.Networks[0].SlotsPerEpoch = 16 // Gnosis-style
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n.pool.UpdateFinalizedEpoch(100) // finalized slot = 100*16 = 1600
+
+	if ttl := n.effectiveCacheTTL(time.Minute, "/eth/v2/beacon/blocks/1600"); ttl != 0 {
+		t.Fatalf("expected forever (0) for finalized slot 1600, got %v", ttl)
+	}
+	// Slot 3200 would be "finalized" under a hardcoded 32 slots/epoch, but on a
+	// 16-slot chain it is far past the finalized checkpoint and can still reorg.
+	if ttl := n.effectiveCacheTTL(time.Minute, "/eth/v2/beacon/blocks/3200"); ttl != time.Minute {
+		t.Fatalf("expected policy TTL for non-finalized slot 3200 at 16 slots/epoch, got %v", ttl)
+	}
+	if ttl := n.effectiveCacheTTL(time.Minute, "/eth/v2/beacon/blocks/1601"); ttl != time.Minute {
+		t.Fatalf("expected policy TTL for slot past the checkpoint, got %v", ttl)
+	}
+}
+
+func TestEffectiveCacheTTL_EpochOverflowNotFinalized(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n.pool.UpdateFinalizedEpoch(100)
+
+	// A near-max epoch must not wrap (epoch+2 == 1) and be treated as finalized.
+	path := "/eth/v1/beacon/rewards/attestations/18446744073709551615"
+	if ttl := n.effectiveCacheTTL(30*time.Second, path); ttl != 30*time.Second {
+		t.Fatalf("expected policy TTL for overflowing epoch, got %v", ttl)
+	}
+}
+
+func TestEnsurePreferredUpstreamFirst_SkipsForkedPreferred(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfgText(t, fmt.Sprintf(`
+logLevel: error
+server: { host: "127.0.0.1", port: 5555, maxTimeout: 30s }
+failsafe: { timeout: { duration: 10s } }
+health: { checkInterval: 1h, finalityInterval: 1h, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: %s
+    upstreams:
+      - id: u1
+        url: %q
+      - id: u2
+        url: %q
+    cache: { enabled: false }
+`, id, up.URL, up.URL))
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Make u2 forked: majority reports root-canon at the head slot, u2 differs.
+	bc := n.pool.BlockCache()
+	bc.AddBlock("u1", 100, "root-canon", "p99")
+	bc.AddBlock("pad", 100, "root-canon", "p99")
+	bc.AddBlock("u2", 100, "root-fork", "p99")
+	if !bc.IsForked("u2") {
+		t.Fatal("test setup: u2 should be forked")
+	}
+
+	ups := []*upstream.Upstream{n.pool.ByID("u1"), n.pool.ByID("u2")}
+	got := ensurePreferredUpstreamFirst(n.pool, ups, "u2", 0)
+	if got[0].ID != "u1" {
+		t.Fatalf("forked preferred upstream was moved to front: head=%s", got[0].ID)
+	}
+}
+
+func TestMergeFailsafe_DoesNotMutateOverride(t *testing.T) {
+	t.Parallel()
+	base := config.FailsafeConfig{Retry: &config.RetryConfig{MaxAttempts: 3, Delay: 100 * time.Millisecond, Backoff: 2.0}}
+	override := config.FailsafeConfig{Retry: &config.RetryConfig{MaxAttempts: 1}}
+
+	result := mergeFailsafe(base, override)
+
+	if override.Retry.Delay != 0 || override.Retry.Backoff != 0 {
+		t.Fatalf("mergeFailsafe mutated the shared override: delay=%v backoff=%v", override.Retry.Delay, override.Retry.Backoff)
+	}
+	if result.Retry.Delay != 100*time.Millisecond || result.Retry.Backoff != 2.0 {
+		t.Fatalf("merged result not defaulted: delay=%v backoff=%v", result.Retry.Delay, result.Retry.Backoff)
+	}
+	if result.Retry == override.Retry {
+		t.Fatal("merged result aliases the shared override pointer")
+	}
+}
+
 func TestNetwork_StartStop(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

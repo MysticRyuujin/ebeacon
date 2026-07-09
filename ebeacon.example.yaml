@@ -177,6 +177,7 @@ networks:
     # genesisTime: 1606824023  # unix timestamp of genesis; enables slot-boundary TTL alignment
     #                          # Auto-set for mainnet/sepolia/hoodi — only needed for other networks
     # secondsPerSlot: 12       # chain slot duration (default 12); set for non-12s chains (e.g. Gnosis = 5)
+    # slotsPerEpoch: 32        # slots per epoch (default 32); auto-set to 16 for gnosis/chiado
     upstreams:
       - id: lighthouse
         url: "http://lh-mainnet:5052"

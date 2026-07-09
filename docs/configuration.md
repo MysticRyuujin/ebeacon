@@ -219,6 +219,8 @@ For any other network, set `genesisTime` to the unix timestamp of its genesis bl
 
 Set `secondsPerSlot` (default `12`) for chains that don't use 12-second slots — e.g. Gnosis/Chiado use `5`. It drives both slot-boundary TTL alignment and the block cache's future-slot plausibility guard; leaving it at the 12s default on a faster chain would cause eBeacon to reject legitimate blocks and silently disable fork detection.
 
+Set `slotsPerEpoch` (default `32`) for chains with a different epoch length — Gnosis/Chiado use `16` and are auto-detected by network `id`. It drives finality-aware cache promotion: with the wrong value, slots past the true finalized checkpoint are treated as immutable and cached forever, so reorgeable data can be served permanently.
+
 ### Preferred local + backup public provider
 
 This is the recommended pattern when you want self-hosted nodes to absorb normal traffic and a third-party provider to act only as fallback:

@@ -219,6 +219,26 @@ func TestBlockCache_RejectsImplausibleFutureSlot(t *testing.T) {
 	}
 }
 
+func TestBlockCache_ToleratesClockSkew(t *testing.T) {
+	t.Parallel()
+	// Host clock lags real network time: wall-clock slot computes to ~100 but
+	// real heads report ahead of that. Blocks within the skew margin (~10min =
+	// 50 slots at 12s) must still be accepted, or fork detection freezes.
+	bc := NewBlockCache(32, 2)
+	bc.SetSlotTiming(time.Now().Unix()-1200, 12)
+
+	bc.AddBlock("a", 140, "root-140", "p139")
+	if got := bc.MaxSlot(); got != 140 {
+		t.Fatalf("block within clock-skew margin rejected: maxSlot=%d want 140", got)
+	}
+
+	// A grossly-future slot is still rejected.
+	bc.AddBlock("remote", 100_000, "root-bogus", "p")
+	if got := bc.MaxSlot(); got != 140 {
+		t.Fatalf("maxSlot poisoned by future slot: got %d want 140", got)
+	}
+}
+
 func TestBlockCache_ZeroGenesisAcceptsAnySlot(t *testing.T) {
 	t.Parallel()
 	bc := NewBlockCache(32, 2)
