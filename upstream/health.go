@@ -355,10 +355,14 @@ func (h *HealthMonitor) monitorNodeHealth(ctx context.Context, u *Upstream) {
 	}
 }
 
-// checkNodeHealth polls /eth/v1/node/health. A 503 response (or connection
-// failure) marks the upstream down; 206 marks it degraded. A 200 is not
-// applied here — monitorSync is authoritative for the up/degraded distinction
-// so that sync distance thresholds are respected.
+// checkNodeHealth polls /eth/v1/node/health. The Beacon API spec defines only
+// 200 (ready), 206 (syncing), and 503 (not ready) as health verdicts, so only
+// 503 (or a transport failure) latches the upstream down. Any other status
+// (404/429/etc.) means the endpoint isn't answering the health question — a
+// path-restricted gateway or a provider rate-limiting /health — so we clear
+// the latch and defer to the sync poller rather than excluding a node that
+// serves every other Beacon path. A 200 is not applied here either;
+// monitorSync is authoritative for the up/degraded distinction.
 func (h *HealthMonitor) checkNodeHealth(ctx context.Context, u *Upstream) {
 	started := time.Now()
 	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -388,10 +392,15 @@ func (h *HealthMonitor) checkNodeHealth(ctx context.Context, u *Upstream) {
 		u.SetNodeProbeDown(false)
 		u.SetHealth(HealthDegraded)
 		h.recordProbeSuccess(u, started)
-	default: // 503 or unexpected: not ready
+	case http.StatusServiceUnavailable: // 503: not ready
 		slog.Warn("node health check unhealthy", "network", u.NetworkID, "upstream", u.ID, "status", resp.StatusCode)
 		u.SetNodeProbeDown(true)
 		u.SetHealth(HealthDown)
+		h.recordProbeError(u)
+	default: // endpoint not answering the health question — defer to sync poller
+		slog.Debug("node health check returned unexpected status, deferring to sync poll",
+			"network", u.NetworkID, "upstream", u.ID, "status", resp.StatusCode)
+		u.SetNodeProbeDown(false)
 		h.recordProbeError(u)
 	}
 }

@@ -91,6 +91,54 @@ func TestCheckNodeHealth_503_Down(t *testing.T) {
 	}
 }
 
+func TestCheckNodeHealth_404DoesNotLatchDown(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/eth/v1/node/health":
+			w.WriteHeader(http.StatusNotFound) // gateway doesn't proxy /health
+		case "/eth/v1/node/syncing":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"head_slot":"100","sync_distance":"0","is_syncing":false}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h, u := testMonitor(t, srv.URL)
+	h.checkNodeHealth(context.Background(), u)
+	// A healthy /syncing poll must be able to bring the node Up — a 404 on
+	// /health is not a health verdict and must not latch it down.
+	h.checkSync(context.Background(), u)
+	if u.Health() != HealthUp {
+		t.Fatalf("404 on /health must not exclude an otherwise-healthy node, got %v", u.Health())
+	}
+}
+
+func TestCheckNodeHealth_429DoesNotLatchDown(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/eth/v1/node/health":
+			w.WriteHeader(http.StatusTooManyRequests)
+		case "/eth/v1/node/syncing":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"head_slot":"100","sync_distance":"0","is_syncing":false}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h, u := testMonitor(t, srv.URL)
+	h.checkNodeHealth(context.Background(), u)
+	h.checkSync(context.Background(), u)
+	if u.Health() != HealthUp {
+		t.Fatalf("429 on /health must not exclude an otherwise-healthy node, got %v", u.Health())
+	}
+}
+
 func TestCheckNodeHealth_ConnError_Down(t *testing.T) {
 	t.Parallel()
 	h, u := testMonitor(t, "http://127.0.0.1:1")
