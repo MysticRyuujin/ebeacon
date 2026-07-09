@@ -248,17 +248,18 @@ func (p *Pool) Get(preferID string) (*Upstream, error) {
 }
 
 // GetForPath returns a single upstream, preferring the one matching preferID
-// if ready and on the canonical fork, otherwise using route-scoped score
-// ordering when available. The fork check keeps sticky sessions from pinning
-// clients to a healthy-but-forked node indefinitely; IsOnCanonicalFork fails
-// open when no fork data exists.
+// if ready and not on a competing fork, otherwise using route-scoped score
+// ordering when available. Only a forked upstream is rejected here — a merely
+// lagging (transiently behind) node keeps its sticky/preferred slot, so head
+// hiccups don't churn sessions. The fork check fails open when no fork data
+// exists.
 func (p *Pool) GetForPath(preferID, apiPath string) (*Upstream, error) {
 	if preferID != "" {
 		if strings.ContainsAny(preferID, "*?[") {
-			if u := p.ByGlob(preferID); u != nil && u.IsReady() && p.blockCache.IsOnCanonicalFork(u.ID) {
+			if u := p.ByGlob(preferID); u != nil && u.IsReady() && !p.blockCache.IsForked(u.ID) {
 				return u, nil
 			}
-		} else if u := p.ByID(preferID); u != nil && u.IsReady() && p.blockCache.IsOnCanonicalFork(u.ID) {
+		} else if u := p.ByID(preferID); u != nil && u.IsReady() && !p.blockCache.IsForked(u.ID) {
 			return u, nil
 		}
 	}
