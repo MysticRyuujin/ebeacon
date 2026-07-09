@@ -96,7 +96,8 @@ type CORSConfig struct {
 // NetworkConfig represents a single beacon chain network (e.g. mainnet, hoodi, sepolia).
 type NetworkConfig struct {
 	ID                string              `yaml:"id"`
-	GenesisTime       int64               `yaml:"genesisTime"` // unix timestamp of network genesis; enables slot-boundary TTL alignment
+	GenesisTime       int64               `yaml:"genesisTime"`    // unix timestamp of network genesis; enables slot-boundary TTL alignment
+	SecondsPerSlot    int64               `yaml:"secondsPerSlot"` // seconds per slot (default 12); set for non-12s chains like Gnosis
 	Upstreams         []UpstreamConfig    `yaml:"upstreams"`
 	Failsafe          *FailsafeConfig     `yaml:"failsafe"` // overrides global
 	FailsafeOverrides []FailsafeOverride  `yaml:"failsafeOverrides"`
@@ -468,6 +469,9 @@ func applyNetworkDefaults(n *NetworkConfig) {
 			n.GenesisTime = t
 		}
 	}
+	if n.SecondsPerSlot == 0 {
+		n.SecondsPerSlot = 12
+	}
 	if n.Routing.LoadBalancing == "" {
 		n.Routing.LoadBalancing = "round-robin"
 	}
@@ -632,6 +636,13 @@ func mergeCircuitBreakerConfig(base, override *CircuitBreakerConfig) *CircuitBre
 	}
 	return out
 }
+
+// ApplyFailsafeDefaults fills unset failsafe fields with their defaults.
+// Exported so per-path failsafeOverride blocks, merged at request time in the
+// network layer, get the same defaults as network- and global-level blocks
+// (otherwise a path override of retry.maxAttempts would run with zero delay
+// and zero backoff — a retry storm).
+func ApplyFailsafeDefaults(fs *FailsafeConfig) { applyFailsafeDefaults(fs) }
 
 func applyFailsafeDefaults(fs *FailsafeConfig) {
 	if fs.Timeout == nil {
@@ -827,6 +838,9 @@ func validateCORS(cors *CORSConfig) error {
 func validateNetwork(n *NetworkConfig, ctx string) error {
 	if len(n.Upstreams) == 0 {
 		return fmt.Errorf("%s: at least one upstream is required", ctx)
+	}
+	if n.SecondsPerSlot <= 0 {
+		return fmt.Errorf("%s: secondsPerSlot must be > 0", ctx)
 	}
 	if err := validateFailsafe(n.Failsafe, ctx+" failsafe"); err != nil {
 		return err

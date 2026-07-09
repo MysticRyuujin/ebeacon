@@ -195,8 +195,8 @@ func TestAutoTuner_FractionalInitialRateAllowsFirstRequest(t *testing.T) {
 func TestBlockCache_RejectsImplausibleFutureSlot(t *testing.T) {
 	t.Parallel()
 	bc := NewBlockCache(32, 2)
-	genesis := time.Now().Unix() - 1200 // ~100 slots ago
-	bc.SetGenesisTime(genesis)
+	genesis := time.Now().Unix() - 1200 // ~100 slots ago at 12s
+	bc.SetSlotTiming(genesis, 12)
 
 	bc.AddBlock("a", 98, "root-98", "p97")
 	bc.AddBlock("a", 99, "root-99", "root-98")
@@ -225,5 +225,24 @@ func TestBlockCache_ZeroGenesisAcceptsAnySlot(t *testing.T) {
 	bc.AddBlock("a", 20_000_000, "root-x", "p")
 	if got := bc.MaxSlot(); got != 20_000_000 {
 		t.Fatalf("genesisTime 0 must keep permissive behavior, got %d", got)
+	}
+}
+
+func TestBlockCache_ShorterSlotTimeAcceptsRealSlots(t *testing.T) {
+	t.Parallel()
+	// 5s-slot chain (Gnosis-style): 1200s since genesis == slot 240.
+	bc := NewBlockCache(32, 2)
+	bc.SetSlotTiming(time.Now().Unix()-1200, 5)
+
+	bc.AddBlock("a", 240, "root-240", "p239")
+	if got := bc.MaxSlot(); got != 240 {
+		t.Fatalf("legitimate 5s-slot block rejected: maxSlot=%d want 240", got)
+	}
+	// The same slot would be rejected under a 12s assumption (1200/12 = 100).
+	bc12 := NewBlockCache(32, 2)
+	bc12.SetSlotTiming(time.Now().Unix()-1200, 12)
+	bc12.AddBlock("a", 240, "root-240", "p239")
+	if got := bc12.MaxSlot(); got != 0 {
+		t.Fatalf("sanity: 12s cache should reject slot 240 at 1200s, got %d", got)
 	}
 }

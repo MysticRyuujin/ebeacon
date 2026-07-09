@@ -31,6 +31,7 @@ type BlockCache struct {
 	followDistance  uint64
 	maxHeadDistance uint64
 	genesisTime     int64 // unix seconds; 0 disables future-slot rejection
+	secondsPerSlot  int64 // chain slot duration; 0 falls back to 12
 }
 
 // NewBlockCache creates a BlockCache with the given follow distance and max head distance.
@@ -43,12 +44,13 @@ func NewBlockCache(followDistance, maxHeadDistance uint64) *BlockCache {
 	}
 }
 
-// SetGenesisTime enables wall-clock plausibility checks in AddBlock.
+// SetSlotTiming enables wall-clock plausibility checks in AddBlock.
 // Must be called before block reporting starts (i.e. before Pool.Start).
-func (bc *BlockCache) SetGenesisTime(genesisTime int64) {
+func (bc *BlockCache) SetSlotTiming(genesisTime, secondsPerSlot int64) {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 	bc.genesisTime = genesisTime
+	bc.secondsPerSlot = secondsPerSlot
 }
 
 // AddBlock records a block header seen by the given upstream.
@@ -60,11 +62,17 @@ func (bc *BlockCache) AddBlock(upstreamID string, slot uint64, root, parentRoot 
 	// head-lag scoring) keys off it, so one implausible far-future slot —
 	// a cross-chain misconfigured upstream or corrupt shared-state replay —
 	// would poison fork detection until restart. Reject whole blocks beyond
-	// the wall-clock slot when the network's genesis time is known.
-	const slotSeconds, maxFutureSlotTolerance = 12, 2
+	// the wall-clock slot when the network's genesis time is known. The
+	// divisor must match the chain's real slot duration or legitimate blocks
+	// get rejected (e.g. 5s Gnosis slots against a 12s assumption).
+	const maxFutureSlotTolerance = 2
+	slotSeconds := bc.secondsPerSlot
+	if slotSeconds <= 0 {
+		slotSeconds = 12
+	}
 	if bc.genesisTime > 0 {
 		if now := time.Now().Unix(); now > bc.genesisTime {
-			currentSlot := uint64(now-bc.genesisTime) / slotSeconds
+			currentSlot := uint64(now-bc.genesisTime) / uint64(slotSeconds)
 			if slot > currentSlot+maxFutureSlotTolerance {
 				return
 			}
@@ -244,6 +252,14 @@ func (bc *BlockCache) ForkStatus(upstreamID string) string {
 
 	// Too far behind to determine — lagging, not necessarily forked.
 	return "lagging"
+}
+
+// IsForked reports whether the upstream is on a competing minority chain
+// (reported a different block at the canonical slot). It returns false for
+// canonical and merely-lagging upstreams, so transient lag does not exclude
+// an otherwise-healthy node from sticky/preferred routing.
+func (bc *BlockCache) IsForked(upstreamID string) bool {
+	return bc.ForkStatus(upstreamID) == "forked"
 }
 
 func (bc *BlockCache) canonicalHeadLocked() (uint64, string) {
