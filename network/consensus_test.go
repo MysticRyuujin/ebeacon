@@ -152,3 +152,76 @@ func TestNetwork_ConsensusWithGzipUpstreams(t *testing.T) {
 		t.Fatalf("body: got %q want %q", got, payload)
 	}
 }
+
+func TestConsensusPolicy_ConsumesRateTokens(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":"same"}`))
+	}))
+	defer srv.Close()
+
+	mkLimited := func(id string) *upstream.Upstream {
+		return upstream.New("testnet", config.UpstreamConfig{
+			ID:  id,
+			URL: srv.URL,
+			RateLimiting: &config.UpstreamRateLimitConfig{
+				AutoTune:    true,
+				InitialRate: 1, // burst 1: one request drains the bucket
+				MinRate:     1,
+				MaxRate:     10,
+			},
+		}, nil, 100)
+	}
+
+	ups := []*upstream.Upstream{mkLimited("a"), mkLimited("b")}
+	if !ups[0].AllowRequest() {
+		t.Fatal("precondition: fresh limiter should have capacity")
+	}
+
+	cp := &ConsensusPolicy{MaxParticipants: 2, AgreementThreshold: 2}
+	_, _, err := cp.Execute(context.Background(), ups, func(u *upstream.Upstream) (*http.Request, error) {
+		return http.NewRequest(http.MethodGet, u.URL, nil)
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	for _, u := range ups {
+		if u.AllowRequest() {
+			t.Fatalf("upstream %s should have no capacity after consensus consumed its token", u.ID)
+		}
+	}
+}
+
+func TestConsensusPolicy_ClientCancelDoesNotTripBreaker(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done() // block until the request context is canceled
+	}))
+	defer srv.Close()
+
+	// failureThreshold 1: a single CBFailure would open the breaker.
+	mk := func(id string) *upstream.Upstream {
+		return upstream.New("testnet", config.UpstreamConfig{ID: id, URL: srv.URL},
+			&config.CircuitBreakerConfig{FailureThreshold: 1, SuccessThreshold: 1, HalfOpenAfter: time.Hour}, 100)
+	}
+	ups := []*upstream.Upstream{mk("a"), mk("b")}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	cp := &ConsensusPolicy{MaxParticipants: 2, AgreementThreshold: 2}
+	_, _, _ = cp.Execute(ctx, ups, func(u *upstream.Upstream) (*http.Request, error) {
+		return http.NewRequest(http.MethodGet, u.URL, nil)
+	})
+
+	for _, u := range ups {
+		if !u.IsReady() {
+			t.Fatalf("client cancel must not open %s's circuit breaker", u.ID)
+		}
+	}
+}

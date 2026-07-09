@@ -75,17 +75,23 @@ func (cp *ConsensusPolicy) Execute(
 				return
 			}
 			req = req.WithContext(ctx)
+			u.ConsumeRateToken()
 			u.IncrActive()
 			resp, err := u.Client.Do(req)
 			if err != nil {
 				u.DecrActive()
-				u.CBFailure()
+				// A client disconnect cancels every participant's request;
+				// that is not an upstream fault, so don't open breakers.
+				if !isClientCancel(ctx, err) {
+					u.CBFailure()
+				}
 				results[idx] = consensusResult{err: err, upstream: u}
 				return
 			}
 			body, readErr := readBodyCapped(resp.Body, cp.MaxBodyBytes)
 			resp.Body.Close() //nolint:errcheck
 			u.DecrActive()
+			u.RecordResponseStatus(resp.StatusCode)
 			if readErr != nil {
 				u.CBFailure()
 				results[idx] = consensusResult{err: readErr, upstream: u}
