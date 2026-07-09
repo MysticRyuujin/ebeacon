@@ -41,6 +41,19 @@ auth:
   secret: "${EBEACON_API_SECRET}"
 ```
 
+Named keys require a non-empty, unique `id` and a non-empty `secret`, and a key's `tier` must name a defined tier — config validation rejects anything else. The `id` is what per-key rate limits and per-key metrics are attached to.
+
+```yaml
+auth:
+  tiers:
+    - name: free
+      rateLimiting: { limit: 10 }
+  keys:
+    - id: indexer
+      secret: "${INDEXER_KEY}"
+      tier: free
+```
+
 ## Path-embedded API Keys
 
 For clients where setting HTTP headers is not possible, the API key can be embedded in the URL path in either position relative to the network prefix:
@@ -274,6 +287,8 @@ Selector-driven requests use a separate cache namespace from unselected traffic,
 Response headers include the selected upstream:
 
 - `X-Ebeacon-Upstream`
+
+The value is a stable obfuscated token rather than the configured upstream ID (the same ID always yields the same token, on both regular and SSE responses). It lets you correlate requests to an upstream in bug reports without exposing internal node naming.
 
 ## Routing Controls
 

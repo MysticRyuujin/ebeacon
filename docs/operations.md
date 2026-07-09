@@ -2,6 +2,20 @@
 
 This guide focuses on day-2 operations: visibility, reliability tuning, and incident handling.
 
+## Deployment topology
+
+eBeacon derives the client IP for per-IP rate limiting and sticky sessions from `X-Forwarded-For` / `X-Real-IP`. How much those headers are trusted is controlled by `server.trustedProxies`:
+
+- **Unset (default):** forwarding headers are trusted from any peer. This is correct behind a reverse proxy or load balancer (NGINX, Envoy, AWS ALB, Caddy, HAProxy) that overwrites client-supplied headers — but if eBeacon is exposed directly to the public internet, a client can spoof either header to mint a fresh per-IP bucket on every request and evade the limiter.
+- **Set:** forwarding headers are honored only when the connecting peer is inside one of the listed CIDRs, and the `X-Forwarded-For` chain is walked right-to-left past trusted hops to find the real client. Untrusted peers are identified by their connection address, so spoofed headers have no effect.
+
+Set `trustedProxies` to your proxy tier's addresses whenever eBeacon is reachable by untrusted clients:
+
+```yaml
+server:
+  trustedProxies: ["10.0.0.0/8", "127.0.0.1"]
+```
+
 ## Health and Dashboard Endpoints
 
 eBeacon exposes lightweight health endpoints for external load balancers and orchestration systems:
@@ -52,11 +66,7 @@ metrics:
 
 Then scrape `http://<host>:<port>/metrics`.
 
-> ⚠️ **`/metrics` is not authenticated.** The handler is mounted on the same listener as the proxy and is not gated by `auth.keys`. Anyone who can reach the proxy port can read it. The endpoint does not expose credentials, but it does enumerate upstream IDs, request rates, error rates, and latency percentiles — useful recon for an attacker. Either restrict the listener to a private network / loopback, scrape it from inside a trusted network only, or front it with a firewall or auth-aware reverse proxy. The same applies to `/healthz` and `/ready`.
-
-## Deployment topology
-
-eBeacon expects to run **behind a trusted reverse proxy or load balancer** (NGINX, Envoy, AWS ALB, Caddy, etc.) that sets the `X-Forwarded-For` and `X-Real-IP` headers correctly and strips any client-supplied versions of those headers. Per-IP rate limiting trusts those headers verbatim — if eBeacon is exposed directly to the public internet without a fronting proxy, a client can spoof either header to evade the per-IP limiter. There is no current `trustedProxies` config to gate this; deploy accordingly, or rely solely on the global rate limit and per-key limits when running edge-exposed.
+> ⚠️ **`/metrics` is not authenticated.** The handler is mounted on the same listener as the proxy and is not gated by `auth.keys`. Anyone who can reach the proxy port can read it. The endpoint does not expose credentials, but it does enumerate upstream IDs, request rates, error rates, and latency percentiles — useful recon for an attacker. Either restrict the listener to a private network / loopback, scrape it from inside a trusted network only, or front it with a firewall or auth-aware reverse proxy. The same applies to `/healthz`.
 
 Cache metrics include:
 
@@ -139,7 +149,7 @@ Enable the pprof debug server in config:
 ```yaml
 pprof:
   enabled: true
-  host: \"0.0.0.0\" # use 0.0.0.0 inside containers
+  host: "0.0.0.0" # use 0.0.0.0 inside containers
   port: 6060
 ```
 
@@ -251,9 +261,13 @@ cache:
     username: "${REDIS_USERNAME}" # optional; overrides URL username
     password: "${REDIS_PASSWORD}" # optional; overrides URL password
     db: 0 # optional; database index
-    keyPrefix: "ebeacon:cache:mainnet:"
+    keyPrefix: "ebeacon:cache:mainnet:" # optional; defaults to ebeacon:<networkId>:
     maxRetries: 3
 ```
+
+`keyPrefix` defaults to `ebeacon:<networkId>:`, which keeps networks sharing a Redis database isolated from each other's scan-based cache operations (finality promotion, reorg purge, size metrics). If you override it, keep the prefix unique per network.
+
+> **Upgrade note:** deployments that previously ran with no explicit `keyPrefix` will see a one-time cold cache after upgrading — entries under the old empty prefix are orphaned. They expire on their own: finalized ("cache forever") entries carry a finite 365-day TTL rather than being persisted indefinitely, so orphaned keys clear without a manual flush.
 
 For shared state across replicas:
 
@@ -269,6 +283,8 @@ state:
 ```
 
 Credentials can also be embedded directly in the URL (`redis://user:pass@host:port/db`), but separate fields are recommended so secrets can be injected via environment variables.
+
+Shared state stores the finalized epoch per network (`ebeacon:finalized_epoch:<networkId>`), so multiple networks can safely share one Redis database. A freshly started instance that finds no per-network value simply re-learns finality from its upstreams within one `health.finalityInterval`.
 
 ## Common Runbook Checks
 
@@ -303,11 +319,16 @@ EBEACON_API_KEY=<key> go run ./scripts/reliability/ \
   -duration 30m -report 1m
 ```
 
-The reliability script validates three properties continuously:
+The loadtest generates a weighted real-world request mix, including POSTs (validator-set and attester-duty queries) whose responses are validated against the request body — a proxy that forwards a POST with a mangled body fails the `vfails` column, not just the error count. `4xx` responses are reported in their own column.
+
+The reliability script validates these properties continuously:
 
 1. **Correctness** — eBeacon responses for immutable data (genesis, config) are byte-identical to direct upstream responses.
 2. **Cache accuracy** — when eBeacon returns a cache HIT for a specific slot, the body matches what the upstream returns for that same slot.
 3. **SSE health** — long-running event-stream connections receive head/finality events at expected intervals with monotonically increasing slot numbers.
+4. **Metrics invariants** — `ebeacon_upstream_active_connections` must return to zero once traffic stops; a nonzero value after quiesce indicates a response-lifecycle accounting leak. The metrics URL is derived from `-ebeacon` (override with `-metrics`, disable with `-metrics off`).
+
+The reliability script **exits non-zero** when any issue is detected, when eBeacon returned request errors during the run, or when a checker completed zero checks (a proxy failing every request must not produce a green report). This makes it suitable for CI and cron gating.
 
 Auth flags apply to all requests including the SSE connection:
 
@@ -320,4 +341,6 @@ Auth flags apply to all requests including the SSE connection:
 
 - Cached responses are transport-encoding agnostic: a cached plain response can be served gzip-compressed, and a cached gzip-origin response can be served plain.
 - Cached responses are not representation-agnostic: JSON and `application/octet-stream` remain distinct cache entries.
+- `Accept` headers are parsed with q-values, so the beacon-API spec's recommended SSZ form (`application/octet-stream;q=1.0,application/json;q=0.9`) is keyed into the binary namespace. Concurrent JSON and SSZ requests for the same path never share an upstream response.
+- A response whose `Content-Type` contradicts the request's negotiated representation (e.g. an upstream returning SSZ to a JSON request) is served but never cached.
 - When validating cache behavior, compare decoded payloads for gzip/plain checks and raw bytes for octet-stream checks.

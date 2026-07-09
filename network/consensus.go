@@ -17,6 +17,7 @@ import (
 type ConsensusPolicy struct {
 	MaxParticipants    int
 	AgreementThreshold int
+	MaxBodyBytes       int64 // 0 = unlimited
 }
 
 // NewConsensusPolicy creates a ConsensusPolicy from config.
@@ -74,17 +75,28 @@ func (cp *ConsensusPolicy) Execute(
 				return
 			}
 			req = req.WithContext(ctx)
+			u.ConsumeRateToken()
 			u.IncrActive()
 			resp, err := u.Client.Do(req)
 			if err != nil {
 				u.DecrActive()
-				u.CBFailure()
+				// A client disconnect cancels every participant's request;
+				// that is not an upstream fault, so don't open breakers.
+				if !isClientCancel(ctx, err) {
+					u.CBFailure()
+				}
 				results[idx] = consensusResult{err: err, upstream: u}
 				return
 			}
-			body, _ := io.ReadAll(resp.Body)
+			body, readErr := readBodyCapped(resp.Body, cp.MaxBodyBytes)
 			resp.Body.Close() //nolint:errcheck
 			u.DecrActive()
+			u.RecordResponseStatus(resp.StatusCode)
+			if readErr != nil {
+				u.CBFailure()
+				results[idx] = consensusResult{err: readErr, upstream: u}
+				return
+			}
 			u.CBSuccess()
 			results[idx] = consensusResult{
 				body:     body,

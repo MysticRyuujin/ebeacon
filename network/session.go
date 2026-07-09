@@ -2,11 +2,14 @@ package network
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mysticryuujin/ebeacon/upstream"
@@ -220,20 +223,98 @@ func (sm *SessionManager) StickyCounts() map[string]int {
 	return counts
 }
 
-// ClientIP extracts the originating IP from the request.
-func ClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			return strings.TrimSpace(xff[:i])
+// trustedProxies holds the CIDR set whose X-Forwarded-For / X-Real-IP headers
+// are honored. nil = legacy behavior: trust forwarding headers from any peer.
+var trustedProxies atomic.Pointer[[]netip.Prefix]
+
+// SetTrustedProxies configures which peers' forwarding headers ClientIP
+// honors. Entries may be CIDRs or bare IPs. Empty resets to the legacy
+// trust-everyone behavior; forwarding headers are then spoofable, so
+// deployments exposed directly to clients should set server.trustedProxies.
+func SetTrustedProxies(cidrs []string) error {
+	if len(cidrs) == 0 {
+		trustedProxies.Store(nil)
+		return nil
+	}
+	prefixes := make([]netip.Prefix, 0, len(cidrs))
+	for _, c := range cidrs {
+		c = strings.TrimSpace(c)
+		if p, err := netip.ParsePrefix(c); err == nil {
+			prefixes = append(prefixes, p.Masked())
+			continue
 		}
-		return strings.TrimSpace(xff)
+		a, err := netip.ParseAddr(c)
+		if err != nil {
+			return fmt.Errorf("invalid trusted proxy %q (want CIDR or IP)", c)
+		}
+		prefixes = append(prefixes, netip.PrefixFrom(a, a.BitLen()))
 	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return strings.TrimSpace(xri)
+	trustedProxies.Store(&prefixes)
+	return nil
+}
+
+func isTrustedProxyAddr(prefixes []netip.Prefix, ip string) bool {
+	a, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
 	}
+	a = a.Unmap()
+	for _, p := range prefixes {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+func remoteAddrHost(r *http.Request) string {
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
 	return ip
+}
+
+// ClientIP extracts the originating IP from the request. When trusted proxies
+// are configured, forwarding headers are honored only from trusted peers, and
+// the X-Forwarded-For chain is walked right-to-left past trusted hops so a
+// client cannot spoof its own address into per-IP rate limiting or sessions.
+func ClientIP(r *http.Request) string {
+	prefixes := trustedProxies.Load()
+	if prefixes == nil {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if i := strings.IndexByte(xff, ','); i >= 0 {
+				return strings.TrimSpace(xff[:i])
+			}
+			return strings.TrimSpace(xff)
+		}
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			return strings.TrimSpace(xri)
+		}
+		return remoteAddrHost(r)
+	}
+
+	peer := remoteAddrHost(r)
+	if !isTrustedProxyAddr(*prefixes, peer) {
+		return peer
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			entry := strings.TrimSpace(parts[i])
+			if entry == "" {
+				continue
+			}
+			if !isTrustedProxyAddr(*prefixes, entry) {
+				return entry
+			}
+		}
+		if first := strings.TrimSpace(parts[0]); first != "" {
+			return first
+		}
+	}
+	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+		return xri
+	}
+	return peer
 }

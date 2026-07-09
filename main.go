@@ -34,6 +34,10 @@ func main() {
 	}
 
 	setupLogging(cfg.LogLevel)
+	if err := networkpkg.SetTrustedProxies(cfg.Server.TrustedProxies); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid server.trustedProxies: %v\n", err)
+		os.Exit(1)
+	}
 	debugLogCloser, err := debuglog.ConfigureDefault(cfg.DebugLogging)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to set up debug logging: %v\n", err)

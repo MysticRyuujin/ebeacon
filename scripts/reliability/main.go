@@ -42,6 +42,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -60,6 +61,7 @@ import (
 type config struct {
 	ebeaconBase  string
 	upstreamURLs []string
+	metricsURL   string
 	pprofAddr    string
 	pprofDir     string
 	pprofEvery   time.Duration
@@ -73,6 +75,7 @@ type config struct {
 func loadConfig() config {
 	ebeacon := flag.String("ebeacon", "http://127.0.0.1:5555/mainnet", "eBeacon base URL including network prefix")
 	upstream := flag.String("upstream", "http://localhost:5052", "comma-separated direct upstream URLs")
+	metrics := flag.String("metrics", "", "eBeacon Prometheus metrics URL (default: derived from -ebeacon; empty string after explicit '-metrics off' disables)")
 	pprofAddr := flag.String("pprof", "http://localhost:6060", "eBeacon pprof base URL")
 	pprofDir := flag.String("pprof-dir", "/tmp/ebeacon-reliability", "directory for pprof output files")
 	pprofEvery := flag.Duration("pprof-every", 10*time.Minute, "interval between pprof snapshots")
@@ -111,6 +114,17 @@ func loadConfig() config {
 			cfg.upstreamURLs = append(cfg.upstreamURLs, strings.TrimRight(u, "/"))
 		}
 	}
+
+	switch *metrics {
+	case "off":
+	case "":
+		if u, err := url.Parse(cfg.ebeaconBase); err == nil && u.Host != "" {
+			u.Path = "/metrics"
+			cfg.metricsURL = u.String()
+		}
+	default:
+		cfg.metricsURL = *metrics
+	}
 	return cfg
 }
 
@@ -147,6 +161,15 @@ type counters struct {
 
 	// Upstream reachability
 	upstreamErrors atomic.Int64
+
+	// eBeacon-side fetch failures (error or non-200). Without this counter a
+	// proxy that errors on every request produces zero checks and a green
+	// report.
+	ebeaconErrors atomic.Int64
+
+	// Metrics invariants (active-connections quiesce check)
+	metricsChecks atomic.Int64
+	metricsFails  atomic.Int64
 }
 
 // ── mismatch log ──────────────────────────────────────────────────────────────
@@ -271,6 +294,16 @@ func fetchWithOptions(ctx context.Context, client *http.Client, url string, opts
 	}, nil
 }
 
+// recordEbeaconError counts an eBeacon-side fetch failure. Shutdown
+// cancellations are excluded so a clean exit doesn't register as proxy errors.
+func recordEbeaconError(ctx context.Context, c *counters, checker, endpoint string, status int, err error) {
+	if ctx.Err() != nil {
+		return
+	}
+	c.ebeaconErrors.Add(1)
+	slog.Warn("eBeacon fetch failed", "checker", checker, "endpoint", endpoint, "status", status, "err", err)
+}
+
 // normalizeJSON round-trips JSON to produce a canonical (sorted-key) representation
 // so that key-order differences don't count as mismatches.
 func normalizeJSON(b []byte) ([]byte, error) {
@@ -343,7 +376,7 @@ func runImmutableChecks(ctx context.Context, cfg config, c *counters, log *misma
 		for _, ep := range immutableEndpoints {
 			ebRes, err := fetch(ctx, client, cfg.ebeaconBase+ep, cfg.auth, cfg.apiKey)
 			if err != nil || ebRes.status != http.StatusOK {
-				slog.Debug("immutable: eBeacon fetch failed", "endpoint", ep, "err", err)
+				recordEbeaconError(ctx, c, "immutable", ep, ebRes.status, err)
 				continue
 			}
 			ebNorm, err := normalizeJSON(ebRes.body)
@@ -427,6 +460,7 @@ func runCacheAccuracyChecks(ctx context.Context, cfg config, c *counters, log *m
 			// when polled every 30s (head slot has changed by then).
 			ebRes, err := fetch(ctx, client, cfg.ebeaconBase+ep.ebeaconPath, cfg.auth, cfg.apiKey)
 			if err != nil || ebRes.status != http.StatusOK {
+				recordEbeaconError(ctx, c, "cache-accuracy", ep.ebeaconPath, ebRes.status, err)
 				continue
 			}
 			if ebRes.cacheHit {
@@ -439,6 +473,7 @@ func runCacheAccuracyChecks(ctx context.Context, cfg config, c *counters, log *m
 			// should be a HIT within the same TTL window (< 1s elapsed).
 			ebRes2, err := fetch(ctx, client, cfg.ebeaconBase+ep.ebeaconPath, cfg.auth, cfg.apiKey)
 			if err != nil || ebRes2.status != http.StatusOK {
+				recordEbeaconError(ctx, c, "cache-accuracy", ep.ebeaconPath, ebRes2.status, err)
 				continue
 			}
 			if ebRes2.cacheHit {
@@ -520,6 +555,7 @@ func runCacheFreshnessChecks(ctx context.Context, cfg config, c *counters, log *
 
 		res, err := fetch(ctx, client, cfg.ebeaconBase+ep, cfg.auth, cfg.apiKey)
 		if err != nil || res.status != http.StatusOK {
+			recordEbeaconError(ctx, c, "cache-freshness", ep, res.status, err)
 			continue
 		}
 		slot, ok := extractSlot(res.body)
@@ -573,17 +609,21 @@ func runEncodingCompatibilityChecks(ctx context.Context, cfg config, c *counters
 			first, err := fetchWithOptions(ctx, client, cfg.ebeaconBase+path, fetchOptions{
 				accept:         accept,
 				auth:           cfg.auth,
+				apiKey:         cfg.apiKey,
 				acceptEncoding: seq.first,
 			})
 			if err != nil || first.status != http.StatusOK {
+				recordEbeaconError(ctx, c, "encoding-compat", path, first.status, err)
 				continue
 			}
 			second, err := fetchWithOptions(ctx, client, cfg.ebeaconBase+path, fetchOptions{
 				accept:         accept,
 				auth:           cfg.auth,
+				apiKey:         cfg.apiKey,
 				acceptEncoding: seq.second,
 			})
 			if err != nil || second.status != http.StatusOK {
+				recordEbeaconError(ctx, c, "encoding-compat", path, second.status, err)
 				continue
 			}
 
@@ -602,20 +642,19 @@ func runEncodingCompatibilityChecks(ctx context.Context, cfg config, c *counters
 		}
 	}
 
+	// Use the finalized header's own slot: head-1 can be a missed (empty) slot
+	// that legitimately 404s, and finalized resolves to a real, immutable block.
 	resolveStableBinaryPath := func() (string, error) {
-		res, err := fetch(ctx, client, cfg.ebeaconBase+"/eth/v1/beacon/headers/head", cfg.auth, cfg.apiKey)
+		res, err := fetch(ctx, client, cfg.ebeaconBase+"/eth/v1/beacon/headers/finalized", cfg.auth, cfg.apiKey)
 		if err != nil {
 			return "", err
 		}
 		if res.status != http.StatusOK {
-			return "", fmt.Errorf("headers/head returned %d", res.status)
+			return "", fmt.Errorf("headers/finalized returned %d", res.status)
 		}
 		slot, ok := extractSlot(res.body)
 		if !ok {
-			return "", fmt.Errorf("could not extract slot from headers/head")
-		}
-		if slot > 0 {
-			slot--
+			return "", fmt.Errorf("could not extract slot from headers/finalized")
 		}
 		return "/eth/v2/beacon/blocks/" + strconv.FormatUint(slot, 10), nil
 	}
@@ -797,6 +836,103 @@ func streamSSE(ctx context.Context, cfg config, url string, onEvent func(sseEven
 	return io.EOF
 }
 
+// ── metrics invariants ────────────────────────────────────────────────────────
+// Scrapes eBeacon's Prometheus endpoint for lifecycle-accounting invariants
+// that per-request checks can't see, e.g. the hedge-loser leak where
+// active_connections drifted upward forever.
+
+func scrapeActiveConns(ctx context.Context, client *http.Client, metricsURL string) (map[string]float64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metricsURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	const metric = "ebeacon_upstream_active_connections{"
+	out := make(map[string]float64)
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, metric) {
+			continue
+		}
+		labelsEnd := strings.IndexByte(line, '}')
+		if labelsEnd < 0 {
+			continue
+		}
+		v, err := strconv.ParseFloat(strings.TrimSpace(line[labelsEnd+1:]), 64)
+		if err != nil {
+			continue
+		}
+		out[line[len(metric):labelsEnd]] = v
+	}
+	return out, scanner.Err()
+}
+
+// runMetricsWatchdog samples active connections during the run (Warn-level
+// trend signal only; harness traffic makes instantaneous values noisy).
+// The authoritative check is checkQuiescedActiveConns after traffic stops.
+func runMetricsWatchdog(ctx context.Context, cfg config, c *counters) {
+	if cfg.metricsURL == "" {
+		return
+	}
+	client := newHTTPClient(cfg.timeout)
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		conns, err := scrapeActiveConns(ctx, client, cfg.metricsURL)
+		if err != nil {
+			if ctx.Err() == nil {
+				slog.Warn("metrics: scrape failed", "url", cfg.metricsURL, "err", err)
+			}
+			continue
+		}
+		c.metricsChecks.Add(1)
+		for upstream, v := range conns {
+			if v > 8 {
+				slog.Warn("metrics: high active connections (possible leak)", "labels", upstream, "value", v)
+			}
+		}
+	}
+}
+
+// checkQuiescedActiveConns runs after all harness traffic (including the SSE
+// stream) has stopped: every upstream's active-connection gauge must be zero,
+// or response lifecycle accounting leaked.
+func checkQuiescedActiveConns(cfg config, c *counters, log *mismatchLog) {
+	if cfg.metricsURL == "" {
+		return
+	}
+	time.Sleep(2 * time.Second)
+	client := newHTTPClient(cfg.timeout)
+	conns, err := scrapeActiveConns(context.Background(), client, cfg.metricsURL)
+	if err != nil {
+		slog.Warn("metrics: final quiesce scrape failed", "url", cfg.metricsURL, "err", err)
+		return
+	}
+	c.metricsChecks.Add(1)
+	for upstream, v := range conns {
+		if v != 0 {
+			c.metricsFails.Add(1)
+			log.add("metrics-active-conns-leak", "ebeacon_upstream_active_connections",
+				fmt.Sprintf("{%s} = %g after quiesce; expected 0", upstream, v))
+		}
+	}
+}
+
 // ── pprof collector ───────────────────────────────────────────────────────────
 // Fetches heap snapshots, CPU profiles, and goroutine dumps from eBeacon's
 // pprof endpoint. Also captures its own goroutine profile to help detect
@@ -959,12 +1095,13 @@ func printReport(c *counters, start time.Time) {
 		c.freshnessChecks.Load(), c.freshnessStalls.Load())
 	fmt.Printf("  SSE events:              %d  gaps: %d  reorders: %d  reconnects: %d\n",
 		c.sseEvents.Load(), c.sseGaps.Load(), c.sseReorderings.Load(), c.sseReconnects.Load())
+	fmt.Printf("  eBeacon errors:          %d\n", c.ebeaconErrors.Load())
 	fmt.Printf("  Upstream errors:         %d\n", c.upstreamErrors.Load())
 	fmt.Printf("  pprof snapshots:         %d  errors: %d\n",
 		c.pprofSnapshots.Load(), c.pprofErrors.Load())
 }
 
-func printFinalReport(c *counters, log *mismatchLog, files *pprofFiles, start time.Time) {
+func printFinalReport(cfg config, c *counters, log *mismatchLog, files *pprofFiles, start time.Time) bool {
 	elapsed := time.Since(start).Round(time.Second)
 	fmt.Println()
 	fmt.Println("══════════════════════════════════════════════════════════════════════")
@@ -972,12 +1109,44 @@ func printFinalReport(c *counters, log *mismatchLog, files *pprofFiles, start ti
 	fmt.Println("══════════════════════════════════════════════════════════════════════")
 
 	total := c.immutableMismatches.Load() + c.cacheAccuracyFails.Load() +
-		c.encodingFailures.Load() + c.freshnessStalls.Load() + c.sseGaps.Load() + c.sseReorderings.Load()
+		c.encodingFailures.Load() + c.freshnessStalls.Load() + c.sseGaps.Load() +
+		c.sseReorderings.Load() + c.metricsFails.Load()
 
-	if total == 0 {
+	// Zero completed checks means the run proved nothing — a proxy that
+	// errors on every request must not produce a green report. Only enforced
+	// past 2 minutes so brief smoke runs don't trip on slow tickers.
+	var zeroActivity []string
+	if elapsed >= 2*time.Minute {
+		if len(cfg.upstreamURLs) > 0 {
+			if c.immutableChecks.Load() == 0 {
+				zeroActivity = append(zeroActivity, "immutable")
+			}
+			if c.cacheHITs.Load()+c.cacheMISSes.Load() == 0 {
+				zeroActivity = append(zeroActivity, "cache-accuracy")
+			}
+		}
+		if c.encodingChecks.Load() == 0 {
+			zeroActivity = append(zeroActivity, "encoding")
+		}
+		if c.freshnessChecks.Load() == 0 {
+			zeroActivity = append(zeroActivity, "freshness")
+		}
+		if c.sseEvents.Load() == 0 {
+			zeroActivity = append(zeroActivity, "sse")
+		}
+	}
+
+	passed := total == 0 && len(zeroActivity) == 0 && c.ebeaconErrors.Load() == 0
+
+	switch {
+	case len(zeroActivity) > 0:
+		fmt.Printf("  ✗ FAIL: checker(s) completed zero checks: %s\n", strings.Join(zeroActivity, ", "))
+	case total > 0:
+		fmt.Printf("  ✗ FAIL: %d total issue(s) detected\n", total)
+	case c.ebeaconErrors.Load() > 0:
+		fmt.Printf("  ✗ FAIL: %d eBeacon request error(s) during the run\n", c.ebeaconErrors.Load())
+	default:
 		fmt.Println("  ✓ No correctness issues detected")
-	} else {
-		fmt.Printf("  ✗ %d total issue(s) detected\n", total)
 	}
 	fmt.Println()
 
@@ -1008,6 +1177,13 @@ func printFinalReport(c *counters, log *mismatchLog, files *pprofFiles, start ti
 	fmt.Printf("    Reconnects:            %d\n", c.sseReconnects.Load())
 	fmt.Printf("    Slot gaps detected:    %d\n", c.sseGaps.Load())
 	fmt.Printf("    Slot reorderings:      %d\n", c.sseReorderings.Load())
+	fmt.Println()
+
+	fmt.Println("  Errors / Metrics")
+	fmt.Printf("    eBeacon errors:        %d\n", c.ebeaconErrors.Load())
+	fmt.Printf("    Upstream errors:       %d\n", c.upstreamErrors.Load())
+	fmt.Printf("    Metrics scrapes:       %d  (invariant fails: %d)\n",
+		c.metricsChecks.Load(), c.metricsFails.Load())
 	fmt.Println()
 
 	mismatches := log.snapshot()
@@ -1046,6 +1222,7 @@ func printFinalReport(c *counters, log *mismatchLog, files *pprofFiles, start ti
 		}
 	}
 	fmt.Println("══════════════════════════════════════════════════════════════════════")
+	return passed
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -1151,6 +1328,12 @@ func main() {
 		runPprofCollector(ctx, cfg, &c, &pfiles)
 	}()
 
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runMetricsWatchdog(ctx, cfg, &c)
+	}()
+
 	// Periodic progress reporter.
 	wg.Add(1)
 	go func() {
@@ -1168,5 +1351,8 @@ func main() {
 	}()
 
 	wg.Wait()
-	printFinalReport(&c, &mlog, &pfiles, start)
+	checkQuiescedActiveConns(cfg, &c, &mlog)
+	if !printFinalReport(cfg, &c, &mlog, &pfiles, start) {
+		os.Exit(1)
+	}
 }

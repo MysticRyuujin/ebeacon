@@ -572,3 +572,39 @@ func TestArchiveRouting_PeerDAS400Promotes(t *testing.T) {
 		t.Fatalf("archive should have been hit exactly once, got %d", archiveHits.Load())
 	}
 }
+
+// Hedged variant of the pruning fallback: both hedged upstreams return
+// pruning-shaped 404s and archive promotion has nothing left to try, so the
+// buffered 404 must reach the client readable — not as a 502 from a body
+// whose request context was already canceled.
+func TestArchiveRouting_HedgePruningFallbackReturns404(t *testing.T) {
+	notFound := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+	pruned := httptest.NewServer(notFound)
+	defer pruned.Close()
+	archive := httptest.NewServer(notFound)
+	defer archive.Close()
+
+	id := netID(t)
+	cfg := buildArchiveTestConfig(t, id, pruned.URL, archive.URL, true)
+	cfg.Failsafe.Retry = nil
+	cfg.Failsafe.Hedge = &config.HedgeConfig{Delay: time.Millisecond, MaxCount: 1}
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seedHeadSlot(t, n, 20_000_000)
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v2/beacon/blocks/0xabcdef0123456789", nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status: got %d body %q, want 404", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "not found") {
+		t.Fatalf("404 body must be readable, got %q", rec.Body.String())
+	}
+}

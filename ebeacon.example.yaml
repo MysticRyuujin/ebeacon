@@ -5,6 +5,16 @@ server:
   port: 5555
   maxTimeout: 60s
   enableGzip: true  # gzip compression for client responses > 1KB (default true)
+  # Cap on buffered upstream response bodies after gzip decompression.
+  # Large beacon states can approach 1 GiB as JSON; the cap bounds memory
+  # against oversized or decompression-bomb responses. Default 2 GiB.
+  # maxResponseBodyBytes: 2147483648
+  # CIDRs/IPs whose X-Forwarded-For / X-Real-IP headers are honored for
+  # client identification (per-IP rate limiting, sticky sessions). WARNING:
+  # when unset, forwarding headers are trusted from ANY peer — a client
+  # reaching eBeacon directly can spoof its IP to evade per-IP rate limits.
+  # Set this when running behind a load balancer or reverse proxy.
+  # trustedProxies: ["10.0.0.0/8", "127.0.0.1"]
 
 # pprof exposes Go runtime profiling data on a separate HTTP server.
 # Useful for diagnosing memory leaks, goroutine stacks, and CPU hotspots.
@@ -166,6 +176,8 @@ networks:
   - id: mainnet
     # genesisTime: 1606824023  # unix timestamp of genesis; enables slot-boundary TTL alignment
     #                          # Auto-set for mainnet/sepolia/hoodi — only needed for other networks
+    # secondsPerSlot: 12       # chain slot duration (default 12); set for non-12s chains (e.g. Gnosis = 5)
+    # slotsPerEpoch: 32        # slots per epoch (default 32); auto-set to 16 for gnosis/chiado
     upstreams:
       - id: lighthouse
         url: "http://lh-mainnet:5052"
@@ -307,7 +319,7 @@ networks:
       #   username: "${REDIS_USERNAME}"   # optional; overrides URL username
       #   password: "${REDIS_PASSWORD}"   # optional; overrides URL password
       #   db: 0                           # optional; overrides URL database index
-      #   keyPrefix: "ebeacon:cache:mainnet:"
+      #   keyPrefix: "ebeacon:cache:mainnet:" # optional; defaults to ebeacon:<networkId>: — keep unique per network
       #   maxRetries: 3
       # policies:            # custom per-path TTLs; built-in defaults are used when omitted
       #   - pattern: "^/eth/v1/node/version$"

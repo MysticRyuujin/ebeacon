@@ -1,6 +1,7 @@
 package network
 
 import (
+	"compress/gzip"
 	"context"
 	"io"
 	"net/http"
@@ -94,5 +95,133 @@ func TestConsensusPolicy_ExecuteNoConsensus(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected consensus error")
+	}
+}
+
+func TestNetwork_ConsensusWithGzipUpstreams(t *testing.T) {
+	payload := `{"data":{"root":"0xabc"}}`
+	gzHandler := func(level int) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+				w.Header().Set("Content-Encoding", "gzip")
+				gz, _ := gzip.NewWriterLevel(w, level)
+				_, _ = gz.Write([]byte(payload))
+				_ = gz.Close()
+				return
+			}
+			_, _ = w.Write([]byte(payload))
+		}
+	}
+	// Different compression levels emulate per-node nondeterministic gzip
+	// output for identical JSON.
+	a := httptest.NewServer(gzHandler(gzip.BestSpeed))
+	defer a.Close()
+	b := httptest.NewServer(gzHandler(gzip.BestCompression))
+	defer b.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, a.URL, nil)
+	cfg.Networks[0].Upstreams = []config.UpstreamConfig{
+		{ID: "u1", URL: a.URL},
+		{ID: "u2", URL: b.URL},
+	}
+	cfg.Failsafe.Consensus = &config.ConsensusConfig{
+		Enabled:            true,
+		MaxParticipants:    2,
+		AgreementThreshold: 2,
+	}
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blocks/head/root", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d body %q (gzip variance must not break consensus)", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Content-Encoding") == "gzip" {
+		t.Fatalf("small consensus body should not be gzip re-encoded")
+	}
+	if got := rec.Body.String(); got != payload {
+		t.Fatalf("body: got %q want %q", got, payload)
+	}
+}
+
+func TestConsensusPolicy_ConsumesRateTokens(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":"same"}`))
+	}))
+	defer srv.Close()
+
+	mkLimited := func(id string) *upstream.Upstream {
+		return upstream.New("testnet", config.UpstreamConfig{
+			ID:  id,
+			URL: srv.URL,
+			RateLimiting: &config.UpstreamRateLimitConfig{
+				AutoTune:    true,
+				InitialRate: 1, // burst 1: one request drains the bucket
+				MinRate:     1,
+				MaxRate:     10,
+			},
+		}, nil, 100)
+	}
+
+	ups := []*upstream.Upstream{mkLimited("a"), mkLimited("b")}
+	if !ups[0].AllowRequest() {
+		t.Fatal("precondition: fresh limiter should have capacity")
+	}
+
+	cp := &ConsensusPolicy{MaxParticipants: 2, AgreementThreshold: 2}
+	_, _, err := cp.Execute(context.Background(), ups, func(u *upstream.Upstream) (*http.Request, error) {
+		return http.NewRequest(http.MethodGet, u.URL, nil)
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	for _, u := range ups {
+		if u.AllowRequest() {
+			t.Fatalf("upstream %s should have no capacity after consensus consumed its token", u.ID)
+		}
+	}
+}
+
+func TestConsensusPolicy_ClientCancelDoesNotTripBreaker(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done() // block until the request context is canceled
+	}))
+	defer srv.Close()
+
+	// failureThreshold 1: a single CBFailure would open the breaker.
+	mk := func(id string) *upstream.Upstream {
+		return upstream.New("testnet", config.UpstreamConfig{ID: id, URL: srv.URL},
+			&config.CircuitBreakerConfig{FailureThreshold: 1, SuccessThreshold: 1, HalfOpenAfter: time.Hour}, 100)
+	}
+	ups := []*upstream.Upstream{mk("a"), mk("b")}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	cp := &ConsensusPolicy{MaxParticipants: 2, AgreementThreshold: 2}
+	_, _, _ = cp.Execute(ctx, ups, func(u *upstream.Upstream) (*http.Request, error) {
+		return http.NewRequest(http.MethodGet, u.URL, nil)
+	})
+
+	for _, u := range ups {
+		if !u.IsReady() {
+			t.Fatalf("client cancel must not open %s's circuit breaker", u.ID)
+		}
 	}
 }

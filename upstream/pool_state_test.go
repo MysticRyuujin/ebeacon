@@ -52,7 +52,8 @@ func TestPool_SharedState_FinalizedEpochSeeding(t *testing.T) {
 	t.Parallel()
 	mr := miniredis.RunT(t)
 
-	// Instance A discovers epoch 50 and publishes it.
+	// Instance A discovers epoch 50 and publishes it. Both instances serve
+	// the same network; the finalized epoch is shared per network.
 	stateA := newRedisState(t, mr)
 	poolA := newMinimalPool(t, "net-a1")
 	poolA.SetSharedState(stateA)
@@ -60,13 +61,32 @@ func TestPool_SharedState_FinalizedEpochSeeding(t *testing.T) {
 
 	// Instance B starts up and seeds finalized epoch from Redis.
 	stateB := newRedisState(t, mr)
-	poolB := newMinimalPool(t, "net-b1")
+	poolB := newMinimalPool(t, "net-a1")
 	poolB.SetSharedState(stateB)
 	poolB.StartStateSync()
 
-	want := uint64(50*32 + 31)
+	want := uint64(50 * 32)
 	if got := poolB.FinalizedSlot(); got != want {
 		t.Fatalf("finalized slot after seeding: got %d want %d", got, want)
+	}
+}
+
+func TestPool_SharedState_FinalizedEpochDoesNotCrossNetworks(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+
+	stateA := newRedisState(t, mr)
+	poolMainnet := newMinimalPool(t, "mainnet-x")
+	poolMainnet.SetSharedState(stateA)
+	poolMainnet.UpdateFinalizedEpoch(300000)
+
+	stateB := newRedisState(t, mr)
+	poolSepolia := newMinimalPool(t, "sepolia-x")
+	poolSepolia.SetSharedState(stateB)
+	poolSepolia.StartStateSync()
+
+	if got := poolSepolia.FinalizedSlot(); got != 0 {
+		t.Fatalf("sepolia pool seeded from mainnet's finalized epoch: got slot %d", got)
 	}
 }
 
@@ -83,7 +103,7 @@ func TestPool_SharedState_FinalizedEpochPublish(t *testing.T) {
 	poolA.UpdateFinalizedEpoch(100)
 
 	// Verify the epoch is visible in shared state (simulating what a new instance reads).
-	if got := stateA.GetFinalized(); got != 100 {
+	if got := stateA.GetFinalized("net-a2"); got != 100 {
 		t.Fatalf("shared state finalized epoch: got %d want 100", got)
 	}
 }

@@ -30,6 +30,8 @@ func TestBuildEndpoints_RealWorldHTTPWeights(t *testing.T) {
 		endpointRewardsAttestations:  1,
 		endpointBeaconBlobSidecars:   1,
 		endpointNodeHealth:           1,
+		endpointPostStateValidators:  2,
+		endpointPostAttesterDuties:   1,
 	}
 
 	if len(got) != len(want) {
@@ -39,6 +41,37 @@ func TestBuildEndpoints_RealWorldHTTPWeights(t *testing.T) {
 		if gotWeight := got[name]; gotWeight != wantWeight {
 			t.Fatalf("weight for %s: got %d want %d", name, gotWeight, wantWeight)
 		}
+	}
+}
+
+func TestBuildEndpoints_POSTsCarryBodyAndValidator(t *testing.T) {
+	cs := chainState{headSlot: 12_345, finalizedEpoch: 384, finalizedSlot: 12_288, prevEpoch: 383}
+	for _, ep := range buildEndpoints(cs) {
+		if ep.method != methodPOST {
+			continue
+		}
+		if ep.body == nil {
+			t.Fatalf("POST endpoint %s has no body", ep.name)
+		}
+		if ep.validate == nil {
+			t.Fatalf("POST endpoint %s has no response validator", ep.name)
+		}
+	}
+}
+
+func TestValidateDataArrayLen(t *testing.T) {
+	v := validateDataArrayLen(3)
+	if err := v(200, []byte(`{"data":[{},{},{}]}`)); err != nil {
+		t.Fatalf("expected pass, got %v", err)
+	}
+	if err := v(200, []byte(`{"data":[{}]}`)); err == nil {
+		t.Fatal("wrong entry count must fail validation")
+	}
+	if err := v(400, []byte(`{"message":"empty body"}`)); err == nil {
+		t.Fatal("non-200 must fail validation")
+	}
+	if err := v(200, []byte(`not-json`)); err == nil {
+		t.Fatal("unparseable body must fail validation")
 	}
 }
 

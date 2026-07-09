@@ -151,6 +151,7 @@ type Upstream struct {
 	// Health state
 	mu             sync.RWMutex
 	health         HealthStatus
+	nodeProbeDown  bool
 	headSlot       uint64
 	headRoot       string
 	syncDistance   uint64
@@ -302,6 +303,16 @@ func (u *Upstream) SetHealth(h HealthStatus) {
 	metricHealth.WithLabelValues(u.NetworkID, u.ID).Set(float64(h))
 }
 
+// SetNodeProbeDown latches the latest /eth/v1/node/health verdict. While
+// latched, UpdateSyncStatus will not raise health above HealthDown — the two
+// pollers run independently and a healthy /syncing response used to flap the
+// upstream back Up between failing node-health probes.
+func (u *Upstream) SetNodeProbeDown(down bool) {
+	u.mu.Lock()
+	u.nodeProbeDown = down
+	u.mu.Unlock()
+}
+
 // UpdateSyncStatus records the latest sync status.
 func (u *Upstream) UpdateSyncStatus(isSyncing bool, headSlot, syncDistance uint64) {
 	u.mu.Lock()
@@ -309,9 +320,12 @@ func (u *Upstream) UpdateSyncStatus(isSyncing bool, headSlot, syncDistance uint6
 	u.headSlot = headSlot
 	u.syncDistance = syncDistance
 	old := u.health
-	if isSyncing {
+	switch {
+	case u.nodeProbeDown:
+		u.health = HealthDown
+	case isSyncing:
 		u.health = HealthDegraded
-	} else {
+	default:
 		u.health = HealthUp
 	}
 	h := u.health
@@ -462,12 +476,21 @@ func (u *Upstream) RecordScoreErrorForPath(apiPath string) {
 	u.routeScorer(apiPath, true).RecordError()
 }
 
-// AllowRequest checks the auto-tuner rate limiter (returns true if no tuner configured).
+// AllowRequest is a non-consuming capacity check against the auto-tuner rate
+// limiter (returns true if no tuner configured). Tokens are consumed by
+// ConsumeRateToken when a request is actually sent.
 func (u *Upstream) AllowRequest() bool {
 	if u.rateLimiter == nil {
 		return true
 	}
-	return u.rateLimiter.Allow()
+	return u.rateLimiter.HasCapacity()
+}
+
+// ConsumeRateToken consumes one auto-tuner token for a request actually sent.
+func (u *Upstream) ConsumeRateToken() {
+	if u.rateLimiter != nil {
+		u.rateLimiter.Consume()
+	}
 }
 
 // RecordResponseStatus feeds the auto-tuner with response status codes.

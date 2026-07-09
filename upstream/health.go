@@ -18,6 +18,7 @@ type syncStatusResponse struct {
 		HeadSlot     string `json:"head_slot"`
 		SyncDistance string `json:"sync_distance"`
 		IsSyncing    bool   `json:"is_syncing"`
+		ElOffline    bool   `json:"el_offline"`
 	} `json:"data"`
 }
 
@@ -163,14 +164,17 @@ func (h *HealthMonitor) checkSync(ctx context.Context, u *Upstream) {
 	// Nodes can report is_syncing=false while still many slots behind (e.g. they
 	// consider themselves synced to a minority fork). Apply our own threshold so
 	// we don't route validator traffic to a node that is effectively lagging.
-	isSyncing := s.Data.IsSyncing || syncDistance > h.cfg.MaxSyncDistance
+	// el_offline means the beacon node still serves CL data but cannot follow
+	// the head reliably — degraded, not down.
+	isSyncing := s.Data.IsSyncing || syncDistance > h.cfg.MaxSyncDistance || s.Data.ElOffline
 
 	u.UpdateSyncStatus(isSyncing, headSlot, syncDistance)
 	h.recordProbeSuccess(u, started)
 
 	slog.Debug("health check ok",
 		"network", u.NetworkID, "upstream", u.ID,
-		"head_slot", headSlot, "sync_distance", syncDistance, "is_syncing", s.Data.IsSyncing)
+		"head_slot", headSlot, "sync_distance", syncDistance,
+		"is_syncing", s.Data.IsSyncing, "el_offline", s.Data.ElOffline)
 }
 
 func (h *HealthMonitor) checkFinality(ctx context.Context, u *Upstream) {
@@ -351,10 +355,14 @@ func (h *HealthMonitor) monitorNodeHealth(ctx context.Context, u *Upstream) {
 	}
 }
 
-// checkNodeHealth polls /eth/v1/node/health. A 503 response (or connection
-// failure) marks the upstream down; 206 marks it degraded. A 200 is not
-// applied here — monitorSync is authoritative for the up/degraded distinction
-// so that sync distance thresholds are respected.
+// checkNodeHealth polls /eth/v1/node/health. The Beacon API spec defines only
+// 200 (ready), 206 (syncing), and 503 (not ready) as health verdicts, so only
+// 503 (or a transport failure) latches the upstream down. Any other status
+// (404/429/etc.) means the endpoint isn't answering the health question — a
+// path-restricted gateway or a provider rate-limiting /health — so we clear
+// the latch and defer to the sync poller rather than excluding a node that
+// serves every other Beacon path. A 200 is not applied here either;
+// monitorSync is authoritative for the up/degraded distinction.
 func (h *HealthMonitor) checkNodeHealth(ctx context.Context, u *Upstream) {
 	started := time.Now()
 	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -369,6 +377,7 @@ func (h *HealthMonitor) checkNodeHealth(ctx context.Context, u *Upstream) {
 	resp, err := u.Client.Do(req)
 	if err != nil {
 		slog.Warn("node health check failed", "network", u.NetworkID, "upstream", u.ID, "err", err)
+		u.SetNodeProbeDown(true)
 		u.SetHealth(HealthDown)
 		h.recordProbeError(u)
 		return
@@ -377,14 +386,21 @@ func (h *HealthMonitor) checkNodeHealth(ctx context.Context, u *Upstream) {
 
 	switch resp.StatusCode {
 	case http.StatusOK: // 200: ready — defer to monitorSync for exact status
+		u.SetNodeProbeDown(false)
 		h.recordProbeSuccess(u, started)
 	case http.StatusPartialContent: // 206: syncing
+		u.SetNodeProbeDown(false)
 		u.SetHealth(HealthDegraded)
 		h.recordProbeSuccess(u, started)
-	default: // 503 or unexpected: not ready
+	case http.StatusServiceUnavailable: // 503: not ready
 		slog.Warn("node health check unhealthy", "network", u.NetworkID, "upstream", u.ID, "status", resp.StatusCode)
+		u.SetNodeProbeDown(true)
 		u.SetHealth(HealthDown)
 		h.recordProbeError(u)
+	default: // endpoint not answering the health question — defer to sync poller
+		slog.Debug("node health check returned unexpected status, deferring to sync poll",
+			"network", u.NetworkID, "upstream", u.ID, "status", resp.StatusCode)
+		u.SetNodeProbeDown(false)
 	}
 }
 

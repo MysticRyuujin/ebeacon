@@ -520,6 +520,41 @@ func TestApplyDefaults_SetsGlobalFailsafeTimeout(t *testing.T) {
 	}
 }
 
+func TestApplyNetworkDefaults_SlotsPerEpoch(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		id   string
+		set  int64
+		want int64
+	}{
+		{"mainnet", 0, 32},
+		{"gnosis", 0, 16},
+		{"chiado", 0, 16},
+		{"somedevnet", 0, 32},
+		{"gnosis", 64, 64}, // explicit override wins over the known default
+	}
+	for _, tc := range tests {
+		n := &NetworkConfig{ID: tc.id, SlotsPerEpoch: tc.set}
+		applyNetworkDefaults(n)
+		if n.SlotsPerEpoch != tc.want {
+			t.Errorf("%s (set=%d): SlotsPerEpoch=%d want %d", tc.id, tc.set, n.SlotsPerEpoch, tc.want)
+		}
+	}
+}
+
+func TestValidateNetwork_RejectsNonPositiveSlotsPerEpoch(t *testing.T) {
+	t.Parallel()
+	n := &NetworkConfig{
+		ID:             "x",
+		Upstreams:      []UpstreamConfig{{ID: "a", URL: "http://127.0.0.1:5052"}},
+		SecondsPerSlot: 12,
+		SlotsPerEpoch:  0,
+	}
+	if err := validateNetwork(n, "networks[0]"); err == nil {
+		t.Fatal("expected error for slotsPerEpoch <= 0")
+	}
+}
+
 func TestLoad_UpstreamHeaderAndURLEnvExpansion(t *testing.T) {
 	t.Setenv("EBEACON_TEST_UPSTREAM_TOKEN", "real-token-9001")
 	t.Setenv("EBEACON_TEST_UPSTREAM_HOST", "node.example.com")
@@ -675,5 +710,292 @@ func TestValidate_ConsensusDisabledSkipsBounds(t *testing.T) {
 	}
 	if err := validateFailsafe(&fs, "test"); err != nil {
 		t.Fatalf("disabled consensus should skip bounds, got %v", err)
+	}
+}
+
+func TestEffectiveFailsafe_NetworkConsensusOverride(t *testing.T) {
+	t.Parallel()
+	global := &Config{
+		Failsafe: FailsafeConfig{
+			Consensus: &ConsensusConfig{Enabled: false},
+		},
+	}
+	net := &NetworkConfig{
+		Failsafe: &FailsafeConfig{
+			Consensus: &ConsensusConfig{Enabled: true, MaxParticipants: 3, AgreementThreshold: 2},
+		},
+	}
+	got := global.EffectiveFailsafe(net)
+	if got.Consensus == nil || !got.Consensus.Enabled {
+		t.Fatalf("expected network consensus override, got %+v", got.Consensus)
+	}
+	if got.Consensus.MaxParticipants != 3 || got.Consensus.AgreementThreshold != 2 {
+		t.Fatalf("consensus fields lost in merge: %+v", got.Consensus)
+	}
+}
+
+func TestEffectiveFailsafe_NetworkBlockInheritsGlobalTimeout(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ebeacon.yaml")
+	content := strings.TrimSpace(`
+server: { host: "0.0.0.0", port: 5555, maxTimeout: 60s }
+failsafe:
+  timeout: { duration: 120s }
+  retry: { maxAttempts: 5 }
+health: { checkInterval: 15s, finalityInterval: 60s, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: n1
+    upstreams: [{ id: a, url: "http://a" }]
+    failsafe:
+      retry: { delay: 50ms }
+    routing: { loadBalancing: round-robin }
+    cache: { enabled: false }
+`)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := cfg.EffectiveFailsafe(&cfg.Networks[0])
+	if got.Timeout == nil || got.Timeout.Duration != 120*time.Second {
+		t.Fatalf("network failsafe block must inherit global timeout 120s, got %+v", got.Timeout)
+	}
+	if got.Retry == nil || got.Retry.MaxAttempts != 5 {
+		t.Fatalf("partial retry override must inherit global maxAttempts 5, got %+v", got.Retry)
+	}
+	if got.Retry.Delay != 50*time.Millisecond {
+		t.Fatalf("network retry delay override lost, got %v", got.Retry.Delay)
+	}
+}
+
+func TestEffectiveHealth_MergesFollowAndHeadDistance(t *testing.T) {
+	t.Parallel()
+	global := &Config{
+		Health: HealthConfig{
+			CheckInterval:    15 * time.Second,
+			FinalityInterval: 60 * time.Second,
+			MaxSyncDistance:  10,
+			FollowDistance:   32,
+			MaxHeadDistance:  2,
+		},
+	}
+	net := &NetworkConfig{
+		Health: &HealthConfig{
+			FollowDistance:  64,
+			MaxHeadDistance: 6,
+		},
+	}
+	got := global.EffectiveHealth(net)
+	if got.FollowDistance != 64 {
+		t.Fatalf("followDistance: got %d", got.FollowDistance)
+	}
+	if got.MaxHeadDistance != 6 {
+		t.Fatalf("maxHeadDistance: got %d", got.MaxHeadDistance)
+	}
+	if got.CheckInterval != 15*time.Second {
+		t.Fatalf("checkInterval should inherit global: got %v", got.CheckInterval)
+	}
+}
+
+func TestLoad_PartialNetworkHealthAccepted(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ebeacon.yaml")
+	content := strings.TrimSpace(`
+server: { host: "0.0.0.0", port: 5555, maxTimeout: 60s }
+health: { checkInterval: 15s, finalityInterval: 60s, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: n1
+    upstreams: [{ id: a, url: "http://a" }]
+    health: { maxHeadDistance: 6 }
+    routing: { loadBalancing: round-robin }
+    cache: { enabled: false }
+`)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("partial network health block must be accepted: %v", err)
+	}
+	if got := cfg.EffectiveHealth(&cfg.Networks[0]); got.MaxHeadDistance != 6 || got.CheckInterval != 15*time.Second {
+		t.Fatalf("effective health merge wrong: %+v", got)
+	}
+}
+
+func TestValidate_DriverStrings(t *testing.T) {
+	t.Parallel()
+	base := `
+server: { host: "0.0.0.0", port: 5555, maxTimeout: 60s }
+health: { checkInterval: 15s, finalityInterval: 60s, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+%s
+networks:
+  - id: n1
+    upstreams: [{ id: a, url: "http://a" }]
+    routing: { loadBalancing: round-robin }
+    cache: { enabled: %s }
+`
+	tests := []struct {
+		name    string
+		state   string
+		cache   string
+		wantSub string
+	}{
+		{"state typo", `state: { driver: Redis }`, "false", `state.driver`},
+		{"cache typo", ``, `true, driver: rediss `, `cache.driver`},
+		{"cache redis missing url", ``, `true, driver: redis `, `cache.redis.url`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			path := filepath.Join(dir, "ebeacon.yaml")
+			content := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(base, "%s\nnetworks", tt.state+"\nnetworks"), "enabled: %s", "enabled: "+tt.cache))
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), tt.wantSub) {
+				t.Fatalf("expected error containing %q, got: %v", tt.wantSub, err)
+			}
+		})
+	}
+}
+
+func TestValidate_BareIntegerDurationRejected(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ebeacon.yaml")
+	content := strings.TrimSpace(`
+server: { host: "0.0.0.0", port: 5555, maxTimeout: 60s }
+health: { checkInterval: 15, finalityInterval: 60s, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: n1
+    upstreams: [{ id: a, url: "http://a" }]
+    routing: { loadBalancing: round-robin }
+    cache: { enabled: false }
+`)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "cannot unmarshal") {
+		t.Fatalf("bare integer duration must fail yaml parsing, got: %v", err)
+	}
+}
+
+func TestValidateAuth(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		auth    AuthConfig
+		wantSub string
+	}{
+		{"key without id", AuthConfig{Keys: []APIKeyConfig{{Secret: "s"}}}, "id is required"},
+		{"key without secret", AuthConfig{Keys: []APIKeyConfig{{ID: "k"}}}, "secret is required"},
+		{"duplicate key id", AuthConfig{Keys: []APIKeyConfig{{ID: "k", Secret: "a"}, {ID: "k", Secret: "b"}}}, "duplicate key id"},
+		{"unknown tier", AuthConfig{Keys: []APIKeyConfig{{ID: "k", Secret: "s", Tier: "gold"}}}, "unknown tier"},
+		{"tier without name", AuthConfig{Tiers: []TierConfig{{}}}, "name is required"},
+		{"duplicate tier", AuthConfig{Tiers: []TierConfig{{Name: "t"}, {Name: "t"}}}, "duplicate tier name"},
+		{"bad tier limit", AuthConfig{Tiers: []TierConfig{{Name: "t", RateLimiting: &RateLimitConfig{Limit: -1}}}}, "limit must be > 0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateAuth(&tt.auth, "auth")
+			if err == nil || !strings.Contains(err.Error(), tt.wantSub) {
+				t.Fatalf("expected error containing %q, got: %v", tt.wantSub, err)
+			}
+		})
+	}
+	valid := AuthConfig{
+		Secret: "legacy",
+		Tiers:  []TierConfig{{Name: "free", RateLimiting: &RateLimitConfig{Limit: 0.5}}},
+		Keys:   []APIKeyConfig{{ID: "k", Secret: "s", Tier: "free"}},
+	}
+	if err := validateAuth(&valid, "auth"); err != nil {
+		t.Fatalf("valid auth config rejected: %v", err)
+	}
+	if err := validateAuth(nil, "auth"); err != nil {
+		t.Fatalf("nil auth must be allowed: %v", err)
+	}
+}
+
+func TestLoad_RedisCacheGetsPerNetworkKeyPrefix(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ebeacon.yaml")
+	content := strings.TrimSpace(`
+server: { host: "0.0.0.0", port: 5555, maxTimeout: 60s }
+health: { checkInterval: 15s, finalityInterval: 60s, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: mainnet
+    upstreams: [{ id: a, url: "http://a" }]
+    routing: { loadBalancing: round-robin }
+    cache:
+      enabled: true
+      driver: redis
+      redis: { url: "redis://localhost:6379" }
+  - id: sepolia
+    upstreams: [{ id: b, url: "http://b" }]
+    routing: { loadBalancing: round-robin }
+    cache:
+      enabled: true
+      driver: redis
+      redis: { url: "redis://localhost:6379", keyPrefix: "custom:" }
+`)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Networks[0].Cache.Redis.KeyPrefix; got != "ebeacon:mainnet:" {
+		t.Fatalf("default keyPrefix: got %q", got)
+	}
+	if got := cfg.Networks[1].Cache.Redis.KeyPrefix; got != "custom:" {
+		t.Fatalf("explicit keyPrefix must be preserved: got %q", got)
+	}
+}
+
+func TestValidate_UIRootBasePathRejected(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ebeacon.yaml")
+	content := strings.TrimSpace(`
+server: { host: "0.0.0.0", port: 5555, maxTimeout: 60s }
+health: { checkInterval: 15s, finalityInterval: 60s, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+ui:
+  enabled: true
+  basePath: "/"
+  auth: { keys: [{ id: k, secret: s }] }
+networks:
+  - id: n1
+    upstreams: [{ id: a, url: "http://a" }]
+    routing: { loadBalancing: round-robin }
+    cache: { enabled: false }
+`)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "ui.basePath") {
+		t.Fatalf("ui.basePath \"/\" must be rejected (would panic ServeMux), got: %v", err)
 	}
 }

@@ -168,3 +168,101 @@ func TestAutoTuner_AdjustsRateUpWhenHealthy(t *testing.T) {
 		t.Fatalf("expected rate increase for healthy responses, got %f from %f", at.currentRate, initial)
 	}
 }
+
+func TestAutoTuner_CandidacyCheckDoesNotConsume(t *testing.T) {
+	t.Parallel()
+	at := NewAutoTuner(2, 1, 100, time.Minute, 0.1)
+	for range 50 {
+		if !at.HasCapacity() {
+			t.Fatal("repeated capacity checks must not drain the bucket")
+		}
+	}
+	at.Consume()
+	at.Consume()
+	if at.HasCapacity() {
+		t.Fatal("two consumes at burst 2 should drain the bucket")
+	}
+}
+
+func TestAutoTuner_FractionalInitialRateAllowsFirstRequest(t *testing.T) {
+	t.Parallel()
+	at := NewAutoTuner(0.5, 0.1, 100, time.Minute, 0.1)
+	if !at.HasCapacity() {
+		t.Fatal("fractional initial rate must yield burst >= 1")
+	}
+}
+
+func TestBlockCache_RejectsImplausibleFutureSlot(t *testing.T) {
+	t.Parallel()
+	bc := NewBlockCache(32, 2)
+	genesis := time.Now().Unix() - 1200 // ~100 slots ago at 12s
+	bc.SetSlotTiming(genesis, 12)
+
+	bc.AddBlock("a", 98, "root-98", "p97")
+	bc.AddBlock("a", 99, "root-99", "root-98")
+
+	// A slot far beyond wall clock (wrong chain / corrupt shared state)
+	// must not poison maxSlot or the canonical head.
+	bc.AddBlock("remote", 20_000_000, "root-bogus", "p")
+	if got := bc.MaxSlot(); got != 99 {
+		t.Fatalf("maxSlot poisoned by future slot: got %d want 99", got)
+	}
+	slot, root := bc.CanonicalHead()
+	if slot != 99 || root != "root-99" {
+		t.Fatalf("canonical head poisoned: got %d %q", slot, root)
+	}
+
+	// A plausible next slot is still accepted.
+	bc.AddBlock("a", 100, "root-100", "root-99")
+	if got := bc.MaxSlot(); got != 100 {
+		t.Fatalf("plausible slot rejected: got %d", got)
+	}
+}
+
+func TestBlockCache_ToleratesClockSkew(t *testing.T) {
+	t.Parallel()
+	// Host clock lags real network time: wall-clock slot computes to ~100 but
+	// real heads report ahead of that. Blocks within the skew margin (~10min =
+	// 50 slots at 12s) must still be accepted, or fork detection freezes.
+	bc := NewBlockCache(32, 2)
+	bc.SetSlotTiming(time.Now().Unix()-1200, 12)
+
+	bc.AddBlock("a", 140, "root-140", "p139")
+	if got := bc.MaxSlot(); got != 140 {
+		t.Fatalf("block within clock-skew margin rejected: maxSlot=%d want 140", got)
+	}
+
+	// A grossly-future slot is still rejected.
+	bc.AddBlock("remote", 100_000, "root-bogus", "p")
+	if got := bc.MaxSlot(); got != 140 {
+		t.Fatalf("maxSlot poisoned by future slot: got %d want 140", got)
+	}
+}
+
+func TestBlockCache_ZeroGenesisAcceptsAnySlot(t *testing.T) {
+	t.Parallel()
+	bc := NewBlockCache(32, 2)
+	bc.AddBlock("a", 20_000_000, "root-x", "p")
+	if got := bc.MaxSlot(); got != 20_000_000 {
+		t.Fatalf("genesisTime 0 must keep permissive behavior, got %d", got)
+	}
+}
+
+func TestBlockCache_ShorterSlotTimeAcceptsRealSlots(t *testing.T) {
+	t.Parallel()
+	// 5s-slot chain (Gnosis-style): 1200s since genesis == slot 240.
+	bc := NewBlockCache(32, 2)
+	bc.SetSlotTiming(time.Now().Unix()-1200, 5)
+
+	bc.AddBlock("a", 240, "root-240", "p239")
+	if got := bc.MaxSlot(); got != 240 {
+		t.Fatalf("legitimate 5s-slot block rejected: maxSlot=%d want 240", got)
+	}
+	// The same slot would be rejected under a 12s assumption (1200/12 = 100).
+	bc12 := NewBlockCache(32, 2)
+	bc12.SetSlotTiming(time.Now().Unix()-1200, 12)
+	bc12.AddBlock("a", 240, "root-240", "p239")
+	if got := bc12.MaxSlot(); got != 0 {
+		t.Fatalf("sanity: 12s cache should reject slot 240 at 1200s, got %d", got)
+	}
+}

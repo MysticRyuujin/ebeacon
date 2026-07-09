@@ -28,8 +28,11 @@ type Pool struct {
 	blockCache *BlockCache
 
 	// finalizedEpoch is the highest finalized epoch seen across all upstreams.
-	// Slots at or before epoch*32+31 can be cached forever.
+	// Slots at or before epoch*slotsPerEpoch can be cached forever.
 	finalizedEpoch atomic.Uint64
+
+	// slotsPerEpoch is the chain's SLOTS_PER_EPOCH; 0 means the 32 default.
+	slotsPerEpoch atomic.Uint64
 
 	// sharedState propagates head and finalized updates across instances.
 	sharedState state.SharedState
@@ -248,14 +251,18 @@ func (p *Pool) Get(preferID string) (*Upstream, error) {
 }
 
 // GetForPath returns a single upstream, preferring the one matching preferID
-// if ready and otherwise using route-scoped score ordering when available.
+// if ready and not on a competing fork, otherwise using route-scoped score
+// ordering when available. Only a forked upstream is rejected here — a merely
+// lagging (transiently behind) node keeps its sticky/preferred slot, so head
+// hiccups don't churn sessions. The fork check fails open when no fork data
+// exists.
 func (p *Pool) GetForPath(preferID, apiPath string) (*Upstream, error) {
 	if preferID != "" {
 		if strings.ContainsAny(preferID, "*?[") {
-			if u := p.ByGlob(preferID); u != nil && u.IsReady() {
+			if u := p.ByGlob(preferID); u != nil && u.IsReady() && !p.blockCache.IsForked(u.ID) {
 				return u, nil
 			}
-		} else if u := p.ByID(preferID); u != nil && u.IsReady() {
+		} else if u := p.ByID(preferID); u != nil && u.IsReady() && !p.blockCache.IsForked(u.ID) {
 			return u, nil
 		}
 	}
@@ -538,16 +545,35 @@ func (p *Pool) HealthCountsForSelector(selector string) (total, up, degraded, do
 	return
 }
 
+// SetSlotsPerEpoch sets the chain's SLOTS_PER_EPOCH. Call once before Start.
+func (p *Pool) SetSlotsPerEpoch(n uint64) {
+	p.slotsPerEpoch.Store(n)
+}
+
+// SlotsPerEpoch returns the chain's SLOTS_PER_EPOCH, defaulting to 32.
+func (p *Pool) SlotsPerEpoch() uint64 {
+	if n := p.slotsPerEpoch.Load(); n != 0 {
+		return n
+	}
+	return 32
+}
+
+// FinalizedEpoch returns the highest finalized epoch seen across all upstreams.
+func (p *Pool) FinalizedEpoch() uint64 {
+	return p.finalizedEpoch.Load()
+}
+
 // FinalizedSlot returns the highest finalized slot seen across all upstreams.
-// Ethereum's beacon chain organises time into epochs of exactly 32 slots each.
-// The last slot of epoch N is epoch*32 + 31. Any block at or before this slot
-// is finalized and will never be reorged, so it can be cached indefinitely.
+// A finality checkpoint at epoch N finalizes the chain only up to the epoch
+// boundary block at slot N*slotsPerEpoch; later slots in that epoch are
+// justified at best and can still reorg, so they must not be treated as
+// immutable.
 func (p *Pool) FinalizedSlot() uint64 {
 	epoch := p.finalizedEpoch.Load()
 	if epoch == 0 {
 		return 0
 	}
-	return epoch*32 + 31
+	return epoch * p.SlotsPerEpoch()
 }
 
 // UpdateFinalizedEpoch merges a finalized epoch into the pool aggregate and
@@ -560,7 +586,7 @@ func (p *Pool) UpdateFinalizedEpoch(epoch uint64) {
 		}
 		if p.finalizedEpoch.CompareAndSwap(old, epoch) {
 			if p.sharedState != nil {
-				p.sharedState.PublishFinalized(epoch)
+				p.sharedState.PublishFinalized(p.networkID, epoch)
 			}
 			return
 		}
@@ -593,7 +619,7 @@ func (p *Pool) StartStateSync() {
 	if p.sharedState == nil {
 		return
 	}
-	p.seedFinalizedEpoch(p.sharedState.GetFinalized())
+	p.seedFinalizedEpoch(p.sharedState.GetFinalized(p.networkID))
 }
 
 // SyncCanonicalHead publishes the current canonical head to shared state if it
@@ -607,12 +633,17 @@ func (p *Pool) SyncCanonicalHead() {
 		return
 	}
 	p.lastPublished.mu.Lock()
-	defer p.lastPublished.mu.Unlock()
 	if p.lastPublished.slot == slot && p.lastPublished.root == root {
+		p.lastPublished.mu.Unlock()
 		return
 	}
 	p.lastPublished.slot = slot
 	p.lastPublished.root = root
+	p.lastPublished.mu.Unlock()
+	// Publish outside the lock: a stalled Redis (2s publish timeout) would
+	// otherwise serialize every head event and health probe behind it.
+	// Racing callers may publish out of order; consumers (RecordRemoteHead
+	// -> BlockCache.AddBlock) are order-insensitive.
 	p.sharedState.PublishHead(p.networkID, slot, root)
 }
 

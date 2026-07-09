@@ -51,7 +51,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	networkID, rest, pathKey, ok := p.routeRequest(r)
+	networkID, rest, pathKey, strip, ok := p.routeRequest(r)
 	if !ok {
 		r2, allowed := p.authenticate(w, r, "")
 		if !allowed {
@@ -85,12 +85,28 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// saves ~1 GB of allocations under load.
 	u2 := *r2.URL
 	u2.Path = rest
+	// Preserve percent-encoded segment content by stripping the same number
+	// of leading segments from the escaped path. net/url ignores RawPath
+	// unless it is a valid encoding of Path, so a mismatch degrades safely.
 	u2.RawPath = ""
+	if esc := r2.URL.EscapedPath(); esc != rest {
+		if er := stripPathSegments(esc, strip); er != rest {
+			u2.RawPath = er
+		}
+	}
 	r3 := new(http.Request)
 	*r3 = *r2
 	r3.URL = &u2
 
 	n.ServeHTTP(w, r3)
+}
+
+func stripPathSegments(path string, n int) string {
+	segments := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	if n >= len(segments) {
+		return "/"
+	}
+	return "/" + strings.Join(segments[n:], "/")
 }
 
 func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request, pathKey string) (*http.Request, bool) {
@@ -115,25 +131,25 @@ func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request, pathKey str
 	return r, true
 }
 
-func (p *Proxy) routeRequest(r *http.Request) (networkID, rest, pathKey string, ok bool) {
+func (p *Proxy) routeRequest(r *http.Request) (networkID, rest, pathKey string, strip int, ok bool) {
 	path := strings.TrimPrefix(r.URL.Path, "/")
 	if path == "" {
-		return "", "", "", false
+		return "", "", "", 0, false
 	}
 	segments := strings.Split(path, "/")
 	if _, exists := p.networks[segments[0]]; exists {
 		// Support /{network}/{api-key}/... in addition to /{network}/...
 		if len(segments) >= 2 && p.isPathKey(segments[1]) {
-			return segments[0], joinRest(segments[2:]), segments[1], true
+			return segments[0], joinRest(segments[2:]), segments[1], 2, true
 		}
-		return segments[0], joinRest(segments[1:]), "", true
+		return segments[0], joinRest(segments[1:]), "", 1, true
 	}
 	if p.auth != nil && len(segments) >= 2 {
 		if _, exists := p.networks[segments[1]]; exists {
-			return segments[1], joinRest(segments[2:]), segments[0], true
+			return segments[1], joinRest(segments[2:]), segments[0], 2, true
 		}
 	}
-	return "", "", "", false
+	return "", "", "", 0, false
 }
 
 // isPathKey reports whether candidate matches a configured secret, used to

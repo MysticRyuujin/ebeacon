@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -66,6 +67,13 @@ type ServerConfig struct {
 	Port       int           `yaml:"port"`
 	MaxTimeout time.Duration `yaml:"maxTimeout"`
 	EnableGzip *bool         `yaml:"enableGzip"` // nil = true
+	// MaxResponseBodyBytes caps how many bytes of an upstream response body
+	// (after gzip decompression) the proxy will buffer. Default 2 GiB.
+	MaxResponseBodyBytes int64 `yaml:"maxResponseBodyBytes"`
+	// TrustedProxies lists CIDRs/IPs whose X-Forwarded-For / X-Real-IP are
+	// honored for client identification. Unset = trust all (legacy), which
+	// is spoofable when eBeacon is exposed directly to clients.
+	TrustedProxies []string `yaml:"trustedProxies"`
 }
 
 type DebugLoggingConfig struct {
@@ -88,7 +96,9 @@ type CORSConfig struct {
 // NetworkConfig represents a single beacon chain network (e.g. mainnet, hoodi, sepolia).
 type NetworkConfig struct {
 	ID                string              `yaml:"id"`
-	GenesisTime       int64               `yaml:"genesisTime"` // unix timestamp of network genesis; enables slot-boundary TTL alignment
+	GenesisTime       int64               `yaml:"genesisTime"`    // unix timestamp of network genesis; enables slot-boundary TTL alignment
+	SecondsPerSlot    int64               `yaml:"secondsPerSlot"` // seconds per slot (default 12); set for non-12s chains like Gnosis
+	SlotsPerEpoch     int64               `yaml:"slotsPerEpoch"`  // slots per epoch (default 32); set to 16 for Gnosis
 	Upstreams         []UpstreamConfig    `yaml:"upstreams"`
 	Failsafe          *FailsafeConfig     `yaml:"failsafe"` // overrides global
 	FailsafeOverrides []FailsafeOverride  `yaml:"failsafeOverrides"`
@@ -249,7 +259,7 @@ type RedisCacheConfig struct {
 type CachePolicy struct {
 	Pattern string        `yaml:"pattern"`
 	TTL     time.Duration `yaml:"ttl"`
-	Methods []string      `yaml:"methods"` // empty defaults to [GET]
+	Methods []string      `yaml:"methods"` // empty defaults to [GET, HEAD]
 }
 
 type MetricsConfig struct {
@@ -304,22 +314,27 @@ func Load(path string) (*Config, error) {
 // EffectiveFailsafe merges global defaults with per-network overrides.
 func (c *Config) EffectiveFailsafe(net *NetworkConfig) FailsafeConfig {
 	result := c.Failsafe
-	if net.Failsafe == nil {
-		return result
+	if net.Failsafe != nil {
+		n := net.Failsafe
+		if n.Timeout != nil {
+			result.Timeout = mergeTimeoutConfig(result.Timeout, n.Timeout)
+		}
+		if n.Retry != nil {
+			result.Retry = mergeRetryConfig(result.Retry, n.Retry)
+		}
+		if n.Hedge != nil {
+			result.Hedge = mergeHedgeConfig(result.Hedge, n.Hedge)
+		}
+		if n.CircuitBreaker != nil {
+			result.CircuitBreaker = mergeCircuitBreakerConfig(result.CircuitBreaker, n.CircuitBreaker)
+		}
+		if n.Consensus != nil {
+			result.Consensus = n.Consensus
+		}
 	}
-	n := net.Failsafe
-	if n.Timeout != nil {
-		result.Timeout = mergeTimeoutConfig(result.Timeout, n.Timeout)
-	}
-	if n.Retry != nil {
-		result.Retry = mergeRetryConfig(result.Retry, n.Retry)
-	}
-	if n.Hedge != nil {
-		result.Hedge = mergeHedgeConfig(result.Hedge, n.Hedge)
-	}
-	if n.CircuitBreaker != nil {
-		result.CircuitBreaker = mergeCircuitBreakerConfig(result.CircuitBreaker, n.CircuitBreaker)
-	}
+	// Defaulting before the merge would let injected defaults (e.g. timeout
+	// 30s) override explicit global settings.
+	applyFailsafeDefaults(&result)
 	return result
 }
 
@@ -337,6 +352,12 @@ func (c *Config) EffectiveHealth(net *NetworkConfig) HealthConfig {
 	}
 	if net.Health.MaxSyncDistance != 0 {
 		result.MaxSyncDistance = net.Health.MaxSyncDistance
+	}
+	if net.Health.FollowDistance != 0 {
+		result.FollowDistance = net.Health.FollowDistance
+	}
+	if net.Health.MaxHeadDistance != 0 {
+		result.MaxHeadDistance = net.Health.MaxHeadDistance
 	}
 	return result
 }
@@ -361,6 +382,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Server.MaxTimeout == 0 {
 		c.Server.MaxTimeout = 60 * time.Second
+	}
+	if c.Server.MaxResponseBodyBytes == 0 {
+		c.Server.MaxResponseBodyBytes = 2 << 30
 	}
 	applyDebugLoggingDefaults(&c.DebugLogging)
 	if c.Health.CheckInterval == 0 {
@@ -440,10 +464,26 @@ var knownGenesisTimes = map[string]int64{
 	"hoodi":   1742213400,
 }
 
+// knownSlotsPerEpoch overrides the 32-slot default for chains that differ.
+var knownSlotsPerEpoch = map[string]int64{
+	"gnosis": 16,
+	"chiado": 16,
+}
+
 func applyNetworkDefaults(n *NetworkConfig) {
 	if n.GenesisTime == 0 {
 		if t, ok := knownGenesisTimes[strings.ToLower(n.ID)]; ok {
 			n.GenesisTime = t
+		}
+	}
+	if n.SecondsPerSlot == 0 {
+		n.SecondsPerSlot = 12
+	}
+	if n.SlotsPerEpoch == 0 {
+		if s, ok := knownSlotsPerEpoch[strings.ToLower(n.ID)]; ok {
+			n.SlotsPerEpoch = s
+		} else {
+			n.SlotsPerEpoch = 32
 		}
 	}
 	if n.Routing.LoadBalancing == "" {
@@ -470,13 +510,15 @@ func applyNetworkDefaults(n *NetworkConfig) {
 	if n.Cache.Driver == "" {
 		n.Cache.Driver = "memory"
 	}
+	// Redis scan operations (promotion, purge, size) see every key under the
+	// prefix, so networks sharing a Redis DB must not share a namespace.
+	if n.Cache.Driver == "redis" && n.Cache.Redis != nil && n.Cache.Redis.KeyPrefix == "" {
+		n.Cache.Redis.KeyPrefix = "ebeacon:" + n.ID + ":"
+	}
 	for i := range n.Upstreams {
 		if n.Upstreams[i].Weight == 0 {
 			n.Upstreams[i].Weight = 1
 		}
-	}
-	if n.Failsafe != nil {
-		applyFailsafeDefaults(n.Failsafe)
 	}
 }
 
@@ -609,6 +651,13 @@ func mergeCircuitBreakerConfig(base, override *CircuitBreakerConfig) *CircuitBre
 	return out
 }
 
+// ApplyFailsafeDefaults fills unset failsafe fields with their defaults.
+// Exported so per-path failsafeOverride blocks, merged at request time in the
+// network layer, get the same defaults as network- and global-level blocks
+// (otherwise a path override of retry.maxAttempts would run with zero delay
+// and zero backoff — a retry storm).
+func ApplyFailsafeDefaults(fs *FailsafeConfig) { applyFailsafeDefaults(fs) }
+
 func applyFailsafeDefaults(fs *FailsafeConfig) {
 	if fs.Timeout == nil {
 		fs.Timeout = &TimeoutConfig{Duration: 30 * time.Second}
@@ -664,16 +713,32 @@ func (c *Config) validate() error {
 	if err := validateRateLimiting(&c.RateLimiting, "rateLimiting"); err != nil {
 		return err
 	}
+	if err := validateAuth(c.Auth, "auth"); err != nil {
+		return err
+	}
+	if err := validateAuth(c.UI.Auth, "ui.auth"); err != nil {
+		return err
+	}
 	if c.Metrics.Enabled {
 		if !strings.HasPrefix(c.Metrics.Path, "/") {
 			return fmt.Errorf("metrics.path must start with \"/\"")
 		}
+	}
+	switch c.State.Driver {
+	case "local", "redis", "":
+	default:
+		return fmt.Errorf("state.driver must be \"local\" or \"redis\", got %q", c.State.Driver)
 	}
 	if c.State.Driver == "redis" && (c.State.Redis == nil || c.State.Redis.URL == "") {
 		return fmt.Errorf("state.redis.url is required when state.driver is \"redis\"")
 	}
 	if c.UI.Enabled && (c.UI.Auth == nil || len(c.UI.Auth.Keys) == 0) {
 		return fmt.Errorf("ui.auth with at least one key is required when ui.enabled is true")
+	}
+	if c.UI.Enabled {
+		if !strings.HasPrefix(c.UI.BasePath, "/") || strings.TrimRight(c.UI.BasePath, "/") == "" {
+			return fmt.Errorf("ui.basePath must start with \"/\" and not be the root path, got %q", c.UI.BasePath)
+		}
 	}
 	if c.LegacyProjects.Kind != 0 {
 		return fmt.Errorf("top-level \"projects\" is no longer supported; use top-level \"networks\" and optional \"auth\"")
@@ -691,6 +756,10 @@ func (c *Config) validate() error {
 		}
 		seen[n.ID] = true
 		if err := validateNetwork(&n, fmt.Sprintf("networks[%d] (%s)", i, n.ID)); err != nil {
+			return err
+		}
+		effHealth := c.EffectiveHealth(&n)
+		if err := validateHealth(&effHealth, fmt.Sprintf("networks[%d] (%s) effective health", i, n.ID)); err != nil {
 			return err
 		}
 	}
@@ -712,6 +781,18 @@ func validateServer(s ServerConfig) error {
 	}
 	if s.MaxTimeout <= 0 {
 		return fmt.Errorf("server.maxTimeout must be > 0")
+	}
+	if s.MaxResponseBodyBytes <= 0 {
+		return fmt.Errorf("server.maxResponseBodyBytes must be > 0")
+	}
+	for i, tp := range s.TrustedProxies {
+		v := strings.TrimSpace(tp)
+		if _, err := netip.ParsePrefix(v); err == nil {
+			continue
+		}
+		if _, err := netip.ParseAddr(v); err != nil {
+			return fmt.Errorf("server.trustedProxies[%d]: %q is not a valid CIDR or IP", i, tp)
+		}
 	}
 	return nil
 }
@@ -772,10 +853,16 @@ func validateNetwork(n *NetworkConfig, ctx string) error {
 	if len(n.Upstreams) == 0 {
 		return fmt.Errorf("%s: at least one upstream is required", ctx)
 	}
+	if n.SecondsPerSlot <= 0 {
+		return fmt.Errorf("%s: secondsPerSlot must be > 0", ctx)
+	}
+	if n.SlotsPerEpoch <= 0 {
+		return fmt.Errorf("%s: slotsPerEpoch must be > 0", ctx)
+	}
 	if err := validateFailsafe(n.Failsafe, ctx+" failsafe"); err != nil {
 		return err
 	}
-	if err := validateHealth(n.Health, ctx+" health"); err != nil {
+	if err := validatePartialHealth(n.Health, ctx+" health"); err != nil {
 		return err
 	}
 	if err := validateRateLimiting(n.RateLimiting, ctx+" rateLimiting"); err != nil {
@@ -799,6 +886,14 @@ func validateNetwork(n *NetworkConfig, ctx string) error {
 	}
 	if n.Cache.MaxSize <= 0 {
 		return fmt.Errorf("%s cache.maxSize must be > 0", ctx)
+	}
+	switch n.Cache.Driver {
+	case "memory", "redis", "":
+	default:
+		return fmt.Errorf("%s cache.driver must be \"memory\" or \"redis\", got %q", ctx, n.Cache.Driver)
+	}
+	if n.Cache.Enabled && n.Cache.Driver == "redis" && (n.Cache.Redis == nil || n.Cache.Redis.URL == "") {
+		return fmt.Errorf("%s cache.redis.url is required when cache.driver is \"redis\"", ctx)
 	}
 	for i, p := range n.Cache.Policies {
 		if p.Pattern == "" {
@@ -834,6 +929,9 @@ func validateNetwork(n *NetworkConfig, ctx string) error {
 		}
 		if err := validateFailsafe(u.Failsafe, fmt.Sprintf("%s upstreams[%d] failsafe", ctx, i)); err != nil {
 			return err
+		}
+		if rl := u.RateLimiting; rl != nil && rl.AdjustmentPeriod < 0 {
+			return fmt.Errorf("%s upstreams[%d]: rateLimiting.adjustmentPeriod must be >= 0", ctx, i)
 		}
 	}
 
@@ -914,6 +1012,74 @@ func validateHealth(h *HealthConfig, ctx string) error {
 	}
 	if h.FinalityInterval <= 0 {
 		return fmt.Errorf("%s finalityInterval must be > 0", ctx)
+	}
+	return nil
+}
+
+// validatePartialHealth checks a raw per-network health block, which may
+// legitimately omit fields that merge in from the global config.
+func validatePartialHealth(h *HealthConfig, ctx string) error {
+	if h == nil {
+		return nil
+	}
+	if h.CheckInterval < 0 {
+		return fmt.Errorf("%s checkInterval must be >= 0", ctx)
+	}
+	if h.FinalityInterval < 0 {
+		return fmt.Errorf("%s finalityInterval must be >= 0", ctx)
+	}
+	return nil
+}
+
+func validateAuth(auth *AuthConfig, ctx string) error {
+	if auth == nil {
+		return nil
+	}
+	validateAuthRateLimit := func(rl *RateLimitConfig, rctx string) error {
+		if rl == nil {
+			return nil
+		}
+		if rl.Limit <= 0 {
+			return fmt.Errorf("%s limit must be > 0", rctx)
+		}
+		if rl.Burst < 0 {
+			return fmt.Errorf("%s burst must be >= 0", rctx)
+		}
+		return nil
+	}
+	tierNames := make(map[string]struct{}, len(auth.Tiers))
+	for i, tier := range auth.Tiers {
+		if tier.Name == "" {
+			return fmt.Errorf("%s.tiers[%d]: name is required", ctx, i)
+		}
+		if _, dup := tierNames[tier.Name]; dup {
+			return fmt.Errorf("%s.tiers[%d]: duplicate tier name %q", ctx, i, tier.Name)
+		}
+		tierNames[tier.Name] = struct{}{}
+		if err := validateAuthRateLimit(tier.RateLimiting, fmt.Sprintf("%s.tiers[%d] rateLimiting", ctx, i)); err != nil {
+			return err
+		}
+	}
+	keyIDs := make(map[string]struct{}, len(auth.Keys))
+	for i, key := range auth.Keys {
+		if key.ID == "" {
+			return fmt.Errorf("%s.keys[%d]: id is required", ctx, i)
+		}
+		if _, dup := keyIDs[key.ID]; dup {
+			return fmt.Errorf("%s.keys[%d]: duplicate key id %q", ctx, i, key.ID)
+		}
+		keyIDs[key.ID] = struct{}{}
+		if key.Secret == "" {
+			return fmt.Errorf("%s.keys[%d] (%s): secret is required", ctx, i, key.ID)
+		}
+		if key.Tier != "" {
+			if _, ok := tierNames[key.Tier]; !ok {
+				return fmt.Errorf("%s.keys[%d] (%s): unknown tier %q", ctx, i, key.ID, key.Tier)
+			}
+		}
+		if err := validateAuthRateLimit(key.RateLimiting, fmt.Sprintf("%s.keys[%d] rateLimiting", ctx, i)); err != nil {
+			return err
+		}
 	}
 	return nil
 }

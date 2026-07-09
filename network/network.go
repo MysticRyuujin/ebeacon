@@ -11,7 +11,6 @@ import (
 	"io"
 	"log/slog"
 	"math/rand"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -30,6 +29,10 @@ import (
 	"golang.org/x/sync/singleflight"
 	"golang.org/x/time/rate"
 )
+
+// statusClientClosedRequest is nginx's non-standard 499, used only in metrics
+// to distinguish client disconnects from real error responses.
+const statusClientClosedRequest = 499
 
 // hop-by-hop headers that must not be forwarded.
 // The first group is the standard set defined in RFC 7230 §6.1.
@@ -202,6 +205,12 @@ type Network struct {
 	// gzip enabled
 	gzipEnabled bool
 
+	// maxResponseBytes caps buffered upstream response bodies (post-gzip).
+	maxResponseBytes int64
+
+	// maxTimeout bounds detached multiplexed executions (server.maxTimeout).
+	maxTimeout time.Duration
+
 	reqTotal            *prometheus.CounterVec
 	reqByMethod         *prometheus.CounterVec
 	reqByPath           *prometheus.CounterVec
@@ -274,15 +283,19 @@ func New(cfg *config.NetworkConfig, globalCfg *config.Config) (*Network, error) 
 	if err != nil {
 		return nil, fmt.Errorf("network %s: %w", cfg.ID, err)
 	}
+	pool.BlockCache().SetSlotTiming(cfg.GenesisTime, cfg.SecondsPerSlot)
+	pool.SetSlotsPerEpoch(uint64(cfg.SlotsPerEpoch))
 
 	n := &Network{
-		id:          cfg.ID,
-		cfg:         cfg,
-		failsafe:    fs,
-		rl:          rl,
-		pool:        pool,
-		relay:       newSSERelay(cfg.ID, pool),
-		gzipEnabled: globalCfg.Server.GzipEnabled(),
+		id:               cfg.ID,
+		cfg:              cfg,
+		failsafe:         fs,
+		rl:               rl,
+		pool:             pool,
+		relay:            newSSERelay(cfg.ID, pool),
+		gzipEnabled:      globalCfg.Server.GzipEnabled(),
+		maxResponseBytes: globalCfg.Server.MaxResponseBodyBytes,
+		maxTimeout:       globalCfg.Server.MaxTimeout,
 	}
 
 	cr, err := compileRouting(&cfg.Routing)
@@ -347,6 +360,9 @@ func New(cfg *config.NetworkConfig, globalCfg *config.Config) (*Network, error) 
 
 	// Consensus policy
 	n.consensus = NewConsensusPolicy(fs.Consensus)
+	if n.consensus != nil {
+		n.consensus.MaxBodyBytes = n.maxResponseBytes
+	}
 
 	// Prometheus metrics (per-network labels).
 	n.reqTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -606,6 +622,8 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	acceptBinary := acceptPrefersSSZ(r.Header.Get("Accept"))
+
 	// Cache lookup (GET only).
 	var cacheKey string
 	var cachePolicy interface{ TTL() time.Duration }
@@ -646,16 +664,25 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		n.observeCacheByMethod(r.Method, apiPath, "bypass_method")
 	}
 
-	// Buffer body for retry / hedge.
+	// Buffer the body: forward() builds upstream requests only from these
+	// bytes (never r.Body), and retry/hedge/dedup need a replayable copy.
+	const maxRequestBody = 32 << 20
 	var bodyBytes []byte
-	if r.Body != nil && r.Body != http.NoBody && (n.needsBodyBuffer() || debuglog.Default().Enabled()) {
+	if r.Body != nil && r.Body != http.NoBody {
 		var err error
-		bodyBytes, err = io.ReadAll(io.LimitReader(r.Body, 32<<20))
+		bodyBytes, err = io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
 		if err != nil {
 			n.observeMethodStatus(r.Method, apiPath, http.StatusBadRequest)
 			n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusBadRequest)
 			n.logFailure(r, bodyBytes, apiPath, "", http.StatusBadRequest, nil, nil, err, 0, "request_body_read_error", "", 0)
 			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		if len(bodyBytes) > maxRequestBody {
+			n.observeMethodStatus(r.Method, apiPath, http.StatusRequestEntityTooLarge)
+			n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusRequestEntityTooLarge)
+			n.logFailure(r, nil, apiPath, "", http.StatusRequestEntityTooLarge, nil, nil, nil, 0, "request_body_too_large", "", 0)
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
 		r.Body.Close() //nolint:errcheck
@@ -670,7 +697,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var execErr error
 
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
-		dedupKey := dedupKey(n.id, r.Method, r.URL, bodyBytes, cacheScope)
+		dedupKey := dedupKey(n.id, r.Method, r.URL, bodyBytes, cacheScope, acceptBinary)
 
 		type muxResult struct {
 			resp *http.Response
@@ -678,25 +705,53 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			body []byte
 		}
 
-		v, muxErr, shared := n.inflight.Do(dedupKey, func() (interface{}, error) {
-			resp, u, err := n.executeWithFailsafe(r.Context(), r, bodyBytes, preferID, requiredSelector, fs, apiPath)
+		ch := n.inflight.DoChan(dedupKey, func() (val interface{}, err error) {
+			// A panic here must not escape the closure: singleflight
+			// re-panics on a separate goroutine when callers are waiting
+			// (go panic(e)), which is unrecoverable and crashes the whole
+			// process. Convert it to an error so only this request fails.
+			defer func() {
+				if p := recover(); p != nil {
+					val, err = nil, fmt.Errorf("panic in multiplexed request: %v", p)
+					slog.Error("recovered panic in multiplexed request",
+						"network", n.id, "method", r.Method, "path", r.URL.Path, "panic", p)
+				}
+			}()
+			// Detach from the caller's request context so one client's
+			// disconnect doesn't fail every deduplicated follower. The
+			// failsafe timeout still applies inside executeFS; maxTimeout
+			// backstops the case where no failsafe timeout is configured.
+			execCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), n.maxTimeout)
+			defer cancel()
+			resp, u, err := n.executeWithFailsafe(execCtx, r, bodyBytes, preferID, requiredSelector, fs, apiPath)
 			if err != nil {
 				return nil, err
 			}
-			body, err := readAndFinalizeResponseBody(resp)
+			body, err := readAndFinalizeResponseBody(resp, n.maxResponseBytes)
 			resp.Body.Close() //nolint:errcheck
 			if err != nil {
 				return nil, fmt.Errorf("read upstream response body: %w", err)
 			}
 			return &muxResult{resp: resp, u: u, body: body}, nil
 		})
-		if shared {
+
+		var res singleflight.Result
+		select {
+		case res = <-ch:
+		case <-r.Context().Done():
+			// This caller's client is gone; the shared execution keeps
+			// running for any other waiters. Nothing useful can be written.
+			n.observeMethodStatus(r.Method, apiPath, statusClientClosedRequest)
+			n.observeAPIKey(apiKey, r.Method, apiPath, statusClientClosedRequest)
+			return
+		}
+		if res.Shared {
 			n.multiplexedTotal.Inc()
 		}
-		if muxErr != nil {
-			execErr = muxErr
-		} else if v != nil {
-			mr := v.(*muxResult)
+		if res.Err != nil {
+			execErr = res.Err
+		} else if res.Val != nil {
+			mr := res.Val.(*muxResult)
 			// All multiplexed callers share mr.resp, so concurrent calls to
 			// finalizeResponseBody (which writes Content-Length into the header
 			// map) and copyResponseHeaders (which iterates it) would race.
@@ -745,7 +800,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sess.SetSticky(u.ID)
 	}
 
-	respBody, err := readAndFinalizeResponseBody(resp)
+	respBody, err := readAndFinalizeResponseBody(resp, n.maxResponseBytes)
 	if err != nil {
 		slog.Error("failed to read upstream response body",
 			"network", n.id,
@@ -760,17 +815,20 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		n.reqDuration.WithLabelValues(u.ID).Observe(time.Since(start).Seconds())
 		n.reqDurationByMethod.WithLabelValues(strings.ToUpper(r.Method)).Observe(time.Since(start).Seconds())
 		n.reqDurationByPath.WithLabelValues(u.ID, apiPath).Observe(time.Since(start).Seconds())
-		u.RecordScoreErrorForPath(apiPath)
-		n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
-		u.RecordError()
-		u.CBFailure()
+		if !isClientCancel(r.Context(), err) {
+			u.RecordScoreErrorForPath(apiPath)
+			n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
+			u.RecordError()
+			u.CBFailure()
+		}
 		n.logFailure(r, bodyBytes, apiPath, u.ID, http.StatusBadGateway, resp.Header, nil, err, time.Since(start), "upstream_response_read_error", "", 0)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
 
 	// Cache successful responses after the body has been read in full.
-	if cachePolicy != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if cachePolicy != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 &&
+		representationMatches(acceptBinary, resp.Header) {
 		ttl := n.effectiveCacheTTL(cachePolicy.TTL(), r.URL.Path)
 		n.cache.Set(cacheKey, resp.StatusCode, resp.Header, respBody, ttl)
 	}
@@ -826,6 +884,13 @@ func requiredSelectorFromValue(id string) requiredUpstreamSelector {
 	if strings.HasPrefix(id, "client:") {
 		return requiredUpstreamSelector{clientType: strings.TrimPrefix(id, "client:")}
 	}
+	// "glob:" is label()'s spelling of a glob selector in cache-key scopes;
+	// without this strip the whole prefixed string is treated as the pattern
+	// and pre-warm never matches an upstream. (An upstream literally named
+	// "glob:x" would misparse — acceptable.)
+	if strings.HasPrefix(id, "glob:") {
+		return requiredUpstreamSelector{glob: strings.TrimPrefix(id, "glob:")}
+	}
 	if strings.ContainsAny(id, "*?[") {
 		return requiredUpstreamSelector{glob: id}
 	}
@@ -849,24 +914,43 @@ func (n *Network) effectiveFailsafe(method, path string) config.FailsafeConfig {
 
 func mergeFailsafe(base, override config.FailsafeConfig) config.FailsafeConfig {
 	result := base
+	// Clone overridden sections: they alias the shared compiled override and
+	// ApplyFailsafeDefaults mutates in place, so aliasing would race concurrent
+	// requests. base's sections are already defaulted and never written.
 	if override.Timeout != nil {
-		result.Timeout = override.Timeout
+		t := *override.Timeout
+		result.Timeout = &t
 	}
 	if override.Retry != nil {
-		result.Retry = override.Retry
+		r := *override.Retry
+		result.Retry = &r
 	}
 	if override.Hedge != nil {
-		result.Hedge = override.Hedge
+		h := *override.Hedge
+		result.Hedge = &h
 	}
 	if override.CircuitBreaker != nil {
-		result.CircuitBreaker = override.CircuitBreaker
+		cb := *override.CircuitBreaker
+		result.CircuitBreaker = &cb
 	}
+	// A path override replaces whole sections with raw (undefaulted) config;
+	// default the merged result so an override that sets only retry.maxAttempts
+	// still gets a sane delay/backoff instead of a zero-spacing retry storm.
+	config.ApplyFailsafeDefaults(&result)
 	return result
 }
 
 // executeWithFailsafe runs execute with the given failsafe config.
 func (n *Network) executeWithFailsafe(ctx context.Context, r *http.Request, bodyBytes []byte, preferID string, required requiredUpstreamSelector, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, error) {
 	return n.executeFS(ctx, r, bodyBytes, preferID, required, fs, apiPath)
+}
+
+// isClientCancel reports whether err is a context cancellation propagated
+// from the request context (client disconnect) rather than a failsafe
+// timeout — timeouts surface as context.DeadlineExceeded and must still
+// count against the upstream's circuit breaker and error rate.
+func isClientCancel(ctx context.Context, err error) bool {
+	return errors.Is(err, context.Canceled) && errors.Is(ctx.Err(), context.Canceled)
 }
 
 func (n *Network) executeSelectedFS(ctx context.Context, r *http.Request, bodyBytes []byte, required requiredUpstreamSelector, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, error) {
@@ -881,10 +965,12 @@ func (n *Network) executeSelectedFS(ctx context.Context, r *http.Request, bodyBy
 		}
 		resp, err := n.forward(ctx, u, r, body)
 		if err != nil {
-			u.CBFailure()
-			u.RecordScoreErrorForPath(apiPath)
-			n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
-			u.RecordError()
+			if !isClientCancel(ctx, err) {
+				u.CBFailure()
+				u.RecordScoreErrorForPath(apiPath)
+				n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
+				u.RecordError()
+			}
 			return nil, nil, &selectedUpstreamUnavailableError{selector: required.label(), err: err}
 		}
 		if resp.StatusCode < 500 {
@@ -937,6 +1023,12 @@ func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Reque
 			delay := retryDelay(fs.Retry, i-1)
 			select {
 			case <-ctx.Done():
+				// Close any buffered pruning response before bailing;
+				// its tracked body owns a DecrActive that would otherwise
+				// leak activeConns for that upstream.
+				if lastResp != nil {
+					lastResp.Body.Close() //nolint:errcheck
+				}
 				return nil, nil, &selectedUpstreamUnavailableError{selector: required.label(), err: ctx.Err()}
 			case <-time.After(delay):
 			}
@@ -981,6 +1073,12 @@ func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Reque
 			return resp, u, nil
 		}
 
+		if err != nil && isClientCancel(ctx, err) {
+			if lastResp != nil {
+				lastResp.Body.Close() //nolint:errcheck
+			}
+			return nil, nil, err
+		}
 		u.CBFailure()
 		if err != nil || i < len(ups)-1 {
 			u.RecordScoreErrorForPath(apiPath)
@@ -1005,12 +1103,17 @@ func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Reque
 	return nil, nil, &selectedUpstreamUnavailableError{selector: required.label(), err: lastErr}
 }
 
-// dedupKey computes a hash key for request deduplication.
-func dedupKey(networkID, method string, u *url.URL, body []byte, scope string) string {
+// dedupKey computes a hash key for request deduplication. acceptBinary must
+// be part of the key: SSZ and JSON requests for the same path are different
+// representations and must not share one upstream response.
+func dedupKey(networkID, method string, u *url.URL, body []byte, scope string, acceptBinary bool) string {
 	key := networkID + ":" + method + ":" + pathAndQueryForUpstream(u)
 	if len(body) > 0 {
 		h := sha256.Sum256(body)
 		key += ":" + fmt.Sprintf("%x", h[:8])
+	}
+	if acceptBinary {
+		key += ":accept=binary"
 	}
 	if scope != "" {
 		key += ":scope=" + scope
@@ -1033,12 +1136,20 @@ func (n *Network) effectiveCacheTTL(policyTTL time.Duration, path string) time.D
 		if slot, ok := pathNumericSlot(path); ok && slot <= finalizedSlot {
 			return 0 // finalized → cache forever
 		}
-		if epoch, ok := pathNumericEpoch(path); ok && epoch <= finalizedSlot/32 {
-			return 0 // finalized epoch → cache forever
+		// Epoch-keyed data (e.g. attestation rewards for epoch N) can depend
+		// on inclusions through epoch N+1, so require N+2 <= finalized epoch.
+		// Written as epoch <= finalized-2 to avoid uint64 wrap on a huge epoch.
+		if fe := n.pool.FinalizedEpoch(); fe >= 2 {
+			if epoch, ok := pathNumericEpoch(path); ok && epoch <= fe-2 {
+				return 0 // finalized epoch → cache forever
+			}
 		}
 	}
 	if policyTTL > 0 && n.cfg.GenesisTime != 0 && pathHasNamedSlotID(path) {
-		const slotSeconds = int64(12)
+		slotSeconds := n.cfg.SecondsPerSlot
+		if slotSeconds <= 0 {
+			slotSeconds = 12
+		}
 		elapsed := (time.Now().Unix() - n.cfg.GenesisTime) % slotSeconds
 		if elapsed < 0 {
 			elapsed += slotSeconds
@@ -1135,6 +1246,12 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 				for k, v := range u.Headers {
 					req.Header.Set(k, v)
 				}
+				// Strip the client's Accept-Encoding so Go's transport
+				// negotiates gzip itself and transparently decompresses:
+				// consensus compares bodies byte-wise, and per-node gzip
+				// output is not deterministic. It also keeps the winning
+				// (cached) body plain.
+				req.Header.Del("Accept-Encoding")
 				return req, nil
 			})
 			if err != nil {
@@ -1229,12 +1346,12 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 					u.CBSuccess()
 					return wrapResponseBodyCancel(resp, timeoutCancel), u, nil
 				}
-				resp.Body.Close() //nolint:errcheck
-				u.CBSuccess()
-				u.RecordResponseStatus(resp.StatusCode)
 				remaining := max(maxAttempts-(i+1), 1)
 				archiveUps := n.pool.SelectForPathArchive(apiPath, remaining)
 				if len(archiveUps) > 0 {
+					resp.Body.Close() //nolint:errcheck
+					u.CBSuccess()
+					u.RecordResponseStatus(resp.StatusCode)
 					metricArchivePromotion.WithLabelValues(n.id, archivePromotionOnError).Inc()
 					slog.Debug("promoting to archive upstreams after pruning-shaped 404", "network", n.id, "upstream", u.ID, "status", resp.StatusCode, "api_path", apiPath, "remaining_attempts", len(archiveUps))
 					ups = append(ups[:i+1], archiveUps...)
@@ -1243,22 +1360,25 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 					continue
 				}
 				// Archive upstreams exist but none selectable right now (all
-				// unhealthy / circuit-broken / already tried). Return the 404
-				// to the client — no more attempts to promote on this request.
-				// We don't restore `resp` because Body is still open here, so
-				// we fall through to the normal success return.
+				// unhealthy / circuit-broken / already tried). Fall through to
+				// the normal success return with the body still open; the
+				// peeked prefix replays via the MultiReader.
 			}
 			u.CBSuccess()
 			return wrapResponseBodyCancel(resp, timeoutCancel), u, nil
 		}
 
+		if err != nil && isClientCancel(ctx, err) {
+			cancelTimeout()
+			return nil, nil, err
+		}
 		if err != nil {
 			slog.Warn("upstream error", "network", n.id, "upstream", u.ID, "attempt", i+1, "err", err)
 			n.logFailure(r, bodyBytes, apiPath, u.ID, 0, nil, nil, err, time.Since(attemptStarted), "upstream_attempt_failed", "", i+1)
 			lastErr = err
 		} else {
 			slog.Warn("upstream bad status", "network", n.id, "upstream", u.ID, "attempt", i+1, "status", resp.StatusCode)
-			failedBody, readErr := readAndFinalizeResponseBody(resp)
+			failedBody, readErr := readAndFinalizeResponseBody(resp, n.maxResponseBytes)
 			resp.Body.Close() //nolint:errcheck
 			if readErr != nil {
 				n.logFailure(r, bodyBytes, apiPath, u.ID, resp.StatusCode, resp.Header, nil, readErr, time.Since(attemptStarted), "upstream_attempt_failed", "", i+1)
@@ -1284,13 +1404,16 @@ func ensurePreferredUpstreamFirst(pool *upstream.Pool, ups []*upstream.Upstream,
 	}
 	for i, u := range ups {
 		if u.ID == preferID {
+			if pool.BlockCache().IsForked(u.ID) {
+				return ups
+			}
 			if i != 0 {
 				ups[0], ups[i] = ups[i], ups[0]
 			}
 			return trimUpstreamSlice(ups, maxLen)
 		}
 	}
-	if pu := pool.ByID(preferID); pu != nil && pu.IsReady() {
+	if pu := pool.ByID(preferID); pu != nil && pu.IsReady() && !pool.BlockCache().IsForked(pu.ID) {
 		out := append([]*upstream.Upstream{pu}, ups...)
 		return trimUpstreamSlice(out, maxLen)
 	}
@@ -1351,6 +1474,23 @@ func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, 
 			c()
 		}
 	}
+	// drainResults receives the remaining in-flight results and closes their
+	// bodies so TrackResponse accounting (DecrActive) completes for losing
+	// attempts — context cancellation tears down the connection but never
+	// calls the tracked body's Close, which would leak activeConns forever.
+	// No CB/error accounting: losers canceled by us are not upstream faults.
+	drainResults := func(remaining int) {
+		if remaining <= 0 {
+			return
+		}
+		go func() {
+			for range remaining {
+				if res := <-resultCh; res.resp != nil {
+					res.resp.Body.Close() //nolint:errcheck
+				}
+			}
+		}()
+	}
 
 	fire(ups[0])
 	fired, inflight := 1, 1
@@ -1407,6 +1547,7 @@ loop:
 				// Real success (or a non-pruning 4xx) — cancel the rest and
 				// return. If we had a buffered pruning response, close it.
 				cancelAllExcept(res.idx)
+				drainResults(inflight)
 				if pruningResp != nil {
 					pruningResp.resp.Body.Close() //nolint:errcheck
 					pruningResp = nil
@@ -1415,11 +1556,19 @@ loop:
 				res.u.CBSuccess()
 				return res.resp, res.u, nil
 			}
+			if res.err != nil && isClientCancel(ctx, res.err) {
+				triedByID[res.u.ID] = struct{}{}
+				lastErr = res.err
+				if inflight == 0 && fired >= maxFire {
+					break loop
+				}
+				continue
+			}
 			if res.err != nil {
 				n.logFailure(r, bodyBytes, apiPath, res.u.ID, 0, nil, nil, res.err, res.duration, "hedged_attempt_failed", "", res.idx+1)
 				lastErr = res.err
 			} else {
-				failedBody, readErr := readAndFinalizeResponseBody(res.resp)
+				failedBody, readErr := readAndFinalizeResponseBody(res.resp, n.maxResponseBytes)
 				lastErr = fmt.Errorf("HTTP %d", res.resp.StatusCode)
 				res.resp.Body.Close() //nolint:errcheck
 				if readErr != nil {
@@ -1449,6 +1598,7 @@ loop:
 
 		case <-ctx.Done():
 			cancelAll()
+			drainResults(inflight)
 			if pruningResp != nil {
 				pruningResp.resp.Body.Close() //nolint:errcheck
 			}
@@ -1462,6 +1612,11 @@ loop:
 	// also fails (or no archive upstreams are selectable), return the
 	// buffered pruning response to the client unchanged.
 	if pruningResp != nil {
+		// Buffer the pruning body before cancelAll: canceling the request
+		// context that produced it closes its transport body asynchronously,
+		// which would turn the buffered 404 into a read-error 502.
+		pruneBody, pruneReadErr := readAndFinalizeResponseBody(pruningResp.resp, n.maxResponseBytes)
+		pruningResp.resp.Body.Close() //nolint:errcheck
 		cancelAll()
 		maxArchiveAttempts := maxFire
 		if fs.Retry != nil && fs.Retry.MaxAttempts > maxArchiveAttempts {
@@ -1474,7 +1629,6 @@ loop:
 		// keeps the client's overall deadline honored.
 		archiveResp, archiveU, archiveErr := n.promoteToArchive(ctx, apiPath, r, bodyBytes, triedByID, maxArchiveAttempts, target)
 		if archiveErr == nil && archiveResp != nil {
-			pruningResp.resp.Body.Close() //nolint:errcheck
 			metricArchivePromotion.WithLabelValues(n.id, archivePromotionOnError).Inc()
 			slog.Debug("promoting hedge pruning result to archive upstream", "network", n.id, "api_path", apiPath, "archive_upstream", archiveU.ID)
 			return archiveResp, archiveU, nil
@@ -1482,6 +1636,10 @@ loop:
 		if archiveErr != nil {
 			slog.Debug("archive promotion after hedge pruning failed", "network", n.id, "api_path", apiPath, "err", archiveErr)
 		}
+		if pruneReadErr != nil {
+			return nil, nil, fmt.Errorf("read hedge pruning response body: %w", pruneReadErr)
+		}
+		pruningResp.resp.Body = io.NopCloser(bytes.NewReader(pruneBody))
 		return pruningResp.resp, pruningResp.u, nil
 	}
 
@@ -1514,6 +1672,9 @@ func (n *Network) promoteToArchive(ctx context.Context, apiPath string, r *http.
 		resp, err := n.forward(ctx, u, r, body)
 		if err != nil {
 			lastErr = err
+			if isClientCancel(ctx, err) {
+				return nil, nil, err
+			}
 			u.CBFailure()
 			continue
 		}
@@ -1556,14 +1717,18 @@ func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Req
 		req.Header.Set("Accept-Encoding", "gzip")
 	}
 
-	clientAddr := extractClientIP(r)
+	// Append the immediate peer to the XFF chain, per convention. Appending
+	// the extracted client IP instead would duplicate the (spoofable) first
+	// XFF entry and lose the real peer address.
+	peer := remoteAddrHost(r)
 	if existing := r.Header.Get("X-Forwarded-For"); existing != "" {
-		req.Header.Set("X-Forwarded-For", existing+", "+clientAddr)
+		req.Header.Set("X-Forwarded-For", existing+", "+peer)
 	} else {
-		req.Header.Set("X-Forwarded-For", clientAddr)
+		req.Header.Set("X-Forwarded-For", peer)
 	}
 	req.Header.Set("X-Forwarded-Host", r.Host)
 
+	u.ConsumeRateToken()
 	u.IncrActive()
 	resp, err := u.Client.Do(req)
 	if err != nil {
@@ -1621,16 +1786,6 @@ func (g *gzipReadCloser) Close() error {
 	return gzipErr
 }
 
-func (n *Network) needsBodyBuffer() bool {
-	if n.failsafe.Hedge != nil {
-		return true
-	}
-	if n.failsafe.Retry != nil && n.failsafe.Retry.MaxAttempts > 1 {
-		return true
-	}
-	return false
-}
-
 // buildCacheKey produces a stable cache key from the request.
 // Transport encoding (gzip/plain) is normalized by the cache layer, but
 // representation changes like JSON <-> SSZ are not: the proxy does not attempt
@@ -1638,7 +1793,7 @@ func (n *Network) needsBodyBuffer() bool {
 // namespace.
 func buildCacheKey(networkID string, r *http.Request, scope string) string {
 	key := networkID + ":" + r.Method + ":" + pathAndQueryForCache(r.URL)
-	if strings.EqualFold(r.Header.Get("Accept"), "application/octet-stream") {
+	if acceptPrefersSSZ(r.Header.Get("Accept")) {
 		key += ":accept=binary"
 	}
 	if scope != "" {
@@ -1647,8 +1802,67 @@ func buildCacheKey(networkID string, r *http.Request, scope string) string {
 	return key
 }
 
+// acceptPrefersSSZ reports whether the Accept header prefers
+// application/octet-stream (SSZ) over application/json per RFC 9110 q-values.
+// The beacon-API spec recommends SSZ clients send
+// "application/octet-stream;q=1.0,application/json;q=0.9", which an exact
+// string match would misclassify as JSON. Ties and wildcards resolve to JSON,
+// matching beacon-node defaults.
+func acceptPrefersSSZ(accept string) bool {
+	if accept == "" {
+		return false
+	}
+	const (
+		specWildcard = iota + 1
+		specSubWildcard
+		specExact
+	)
+	var qOctet, qJSON float64
+	var specOctet, specJSON int
+	for part := range strings.SplitSeq(accept, ",") {
+		fields := strings.Split(part, ";")
+		mediaType := strings.ToLower(strings.TrimSpace(fields[0]))
+		q := 1.0
+		for _, p := range fields[1:] {
+			if v, ok := strings.CutPrefix(strings.TrimSpace(p), "q="); ok {
+				if f, err := strconv.ParseFloat(v, 64); err == nil {
+					q = f
+				}
+			}
+		}
+		apply := func(curQ *float64, curSpec *int, spec int) {
+			if spec > *curSpec {
+				*curSpec = spec
+				*curQ = q
+			}
+		}
+		switch mediaType {
+		case "application/octet-stream":
+			apply(&qOctet, &specOctet, specExact)
+		case "application/json":
+			apply(&qJSON, &specJSON, specExact)
+		case "application/*":
+			apply(&qOctet, &specOctet, specSubWildcard)
+			apply(&qJSON, &specJSON, specSubWildcard)
+		case "*/*":
+			apply(&qOctet, &specOctet, specWildcard)
+			apply(&qJSON, &specJSON, specWildcard)
+		}
+	}
+	return qOctet > 0 && qOctet > qJSON
+}
+
+// representationMatches reports whether a response's Content-Type is
+// consistent with the cache key's representation, so an SSZ body is never
+// stored under a JSON-keyed entry (or vice versa) — e.g. when an upstream
+// content-negotiates differently than the key predicted.
+func representationMatches(wantBinary bool, respHeader http.Header) bool {
+	isBinary := strings.HasPrefix(strings.ToLower(respHeader.Get("Content-Type")), "application/octet-stream")
+	return wantBinary == isBinary
+}
+
 func pathAndQueryForCache(u *url.URL) string {
-	path := u.Path
+	path := u.EscapedPath()
 	if path == "" {
 		path = "/"
 	}
@@ -1681,7 +1895,10 @@ func upstreamDirective(r *http.Request) string {
 }
 
 func pathAndQueryForUpstream(u *url.URL) string {
-	path := u.Path
+	// EscapedPath keeps percent-encoded segment content (%2F, %3F, %23)
+	// intact; the decoded path would be re-parsed by the outbound request
+	// and change which resource the upstream sees.
+	path := u.EscapedPath()
 	if path == "" {
 		path = "/"
 	}
@@ -1732,20 +1949,6 @@ func copyResponseHeaders(dst, src http.Header) {
 func isHopByHopHeader(h string) bool {
 	_, ok := hopByHopHeaderSet[strings.ToLower(h)]
 	return ok
-}
-
-func extractClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return ip
 }
 
 // ObfuscateUpstreamID returns a stable 8-character hex token for an upstream ID
@@ -1831,12 +2034,31 @@ func finalizeResponseBody(headers http.Header, body []byte) []byte {
 	return body
 }
 
-func readAndFinalizeResponseBody(resp *http.Response) ([]byte, error) {
-	body, err := io.ReadAll(resp.Body)
+func readAndFinalizeResponseBody(resp *http.Response, limit int64) ([]byte, error) {
+	body, err := readBodyCapped(resp.Body, limit)
 	if err != nil {
 		return nil, err
 	}
+	if resp.Request != nil && resp.Request.Method == http.MethodHead {
+		// HEAD bodies are empty by definition; keep the upstream's real
+		// Content-Length instead of overwriting it with 0.
+		return body, nil
+	}
 	return finalizeResponseBody(resp.Header, body), nil
+}
+
+func readBodyCapped(r io.Reader, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		return io.ReadAll(r)
+	}
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("upstream response body exceeds %d bytes", limit)
+	}
+	return body, nil
 }
 
 // peekBodyForPruning reads up to peerDASBodyPeekLimit bytes of resp.Body so

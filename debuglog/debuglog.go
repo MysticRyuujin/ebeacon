@@ -229,7 +229,8 @@ func sanitizeQuery(raw string) string {
 	}
 	values, err := url.ParseQuery(raw)
 	if err != nil {
-		return raw
+		// The raw query may contain a ?secret= credential; never emit it.
+		return "[UNPARSEABLE_QUERY_REDACTED]"
 	}
 	for key := range values {
 		if _, ok := sensitiveQueryKeys[strings.ToLower(key)]; ok {

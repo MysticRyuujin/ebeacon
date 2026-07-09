@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,6 +91,54 @@ func TestCheckNodeHealth_503_Down(t *testing.T) {
 	}
 }
 
+func TestCheckNodeHealth_404DoesNotLatchDown(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/eth/v1/node/health":
+			w.WriteHeader(http.StatusNotFound) // gateway doesn't proxy /health
+		case "/eth/v1/node/syncing":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"head_slot":"100","sync_distance":"0","is_syncing":false}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h, u := testMonitor(t, srv.URL)
+	h.checkNodeHealth(context.Background(), u)
+	// A healthy /syncing poll must be able to bring the node Up — a 404 on
+	// /health is not a health verdict and must not latch it down.
+	h.checkSync(context.Background(), u)
+	if u.Health() != HealthUp {
+		t.Fatalf("404 on /health must not exclude an otherwise-healthy node, got %v", u.Health())
+	}
+}
+
+func TestCheckNodeHealth_429DoesNotLatchDown(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/eth/v1/node/health":
+			w.WriteHeader(http.StatusTooManyRequests)
+		case "/eth/v1/node/syncing":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"head_slot":"100","sync_distance":"0","is_syncing":false}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h, u := testMonitor(t, srv.URL)
+	h.checkNodeHealth(context.Background(), u)
+	h.checkSync(context.Background(), u)
+	if u.Health() != HealthUp {
+		t.Fatalf("429 on /health must not exclude an otherwise-healthy node, got %v", u.Health())
+	}
+}
+
 func TestCheckNodeHealth_ConnError_Down(t *testing.T) {
 	t.Parallel()
 	h, u := testMonitor(t, "http://127.0.0.1:1")
@@ -105,5 +154,76 @@ func TestCheckNodeHealth_ConnError_Down(t *testing.T) {
 	}
 	if after.ErrorRate <= before.ErrorRate {
 		t.Fatalf("expected connection-error health probe to increase error rate, got before=%f after=%f", before.ErrorRate, after.ErrorRate)
+	}
+}
+
+func TestCheckNodeHealth_503LatchesThroughSyncPoll(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/eth/v1/node/health":
+			w.WriteHeader(http.StatusServiceUnavailable)
+		case "/eth/v1/node/syncing":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"head_slot":"100","sync_distance":"0","is_syncing":false}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h, u := testMonitor(t, srv.URL)
+	h.checkNodeHealth(context.Background(), u)
+	if u.Health() != HealthDown {
+		t.Fatalf("503 must mark down, got %v", u.Health())
+	}
+
+	// A healthy /syncing poll must not flap the upstream back Up while the
+	// node-health probe still reports 503.
+	h.checkSync(context.Background(), u)
+	if u.Health() != HealthDown {
+		t.Fatalf("healthy sync poll must not override latched node-health 503, got %v", u.Health())
+	}
+}
+
+func TestCheckNodeHealth_RecoveryClearsLatch(t *testing.T) {
+	t.Parallel()
+	var healthStatus atomic.Int32
+	healthStatus.Store(http.StatusServiceUnavailable)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/eth/v1/node/health":
+			w.WriteHeader(int(healthStatus.Load()))
+		case "/eth/v1/node/syncing":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"head_slot":"100","sync_distance":"0","is_syncing":false}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h, u := testMonitor(t, srv.URL)
+	h.checkNodeHealth(context.Background(), u)
+	healthStatus.Store(http.StatusOK)
+	h.checkNodeHealth(context.Background(), u)
+	h.checkSync(context.Background(), u)
+	if u.Health() != HealthUp {
+		t.Fatalf("recovered node must return to Up, got %v", u.Health())
+	}
+}
+
+func TestCheckSync_ElOfflineDegraded(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"head_slot":"100","sync_distance":"0","is_syncing":false,"el_offline":true}}`))
+	}))
+	defer srv.Close()
+
+	h, u := testMonitor(t, srv.URL)
+	h.checkSync(context.Background(), u)
+	if u.Health() != HealthDegraded {
+		t.Fatalf("el_offline must degrade the upstream, got %v", u.Health())
 	}
 }

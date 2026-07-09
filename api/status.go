@@ -19,7 +19,7 @@ import (
 // StatusAPI serves JSON status endpoints for the web UI.
 type StatusAPI struct {
 	Networks map[string]*networkpkg.Network
-	Auth     *config.AuthConfig // optional: protect dashboard with auth
+	Auth     *config.AuthConfig // required when the UI is enabled; requests are denied when unset
 }
 
 // NewStatusAPI creates a StatusAPI.

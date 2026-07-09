@@ -265,6 +265,12 @@ networks:
 		if fs.Retry == nil || fs.Retry.MaxAttempts != 2 {
 			t.Fatalf("retry for %s: got %#v", path, fs.Retry)
 		}
+		// The override set only maxAttempts; delay/backoff must be defaulted,
+		// not left at zero (which would be a zero-spacing retry storm).
+		if fs.Retry.Delay <= 0 || fs.Retry.Backoff < 1 {
+			t.Fatalf("override retry for %s must be defaulted, got delay=%v backoff=%v",
+				path, fs.Retry.Delay, fs.Retry.Backoff)
+		}
 		if fs.Hedge == nil || fs.Hedge.MaxCount != 0 {
 			t.Fatalf("hedge for %s: got %#v", path, fs.Hedge)
 		}
@@ -537,10 +543,22 @@ func TestEffectiveCacheTTL_FinalizedSlot(t *testing.T) {
 
 	n.pool.UpdateFinalizedEpoch(100)
 
-	// Path references slot 50 — finalized (50 <= 100*32+31).
+	// Path references slot 50 — finalized (50 <= 100*32).
 	ttl := n.effectiveCacheTTL(time.Minute, "/eth/v2/beacon/blocks/50")
 	if ttl != 0 {
 		t.Fatalf("expected forever (0) for finalized slot, got %v", ttl)
+	}
+
+	// The checkpoint boundary slot itself is finalized...
+	ttl = n.effectiveCacheTTL(time.Minute, "/eth/v2/beacon/blocks/3200")
+	if ttl != 0 {
+		t.Fatalf("expected forever (0) for checkpoint boundary slot, got %v", ttl)
+	}
+
+	// ...but the next slot is only justified and can still reorg.
+	ttl = n.effectiveCacheTTL(time.Minute, "/eth/v2/beacon/blocks/3201")
+	if ttl != time.Minute {
+		t.Fatalf("expected policy TTL for slot past the checkpoint, got %v", ttl)
 	}
 
 	ttl2 := n.effectiveCacheTTL(time.Minute, "/eth/v2/beacon/blocks/999999999")
@@ -565,14 +583,137 @@ func TestEffectiveCacheTTL_FinalizedEpoch(t *testing.T) {
 
 	n.pool.UpdateFinalizedEpoch(100)
 
-	ttl := n.effectiveCacheTTL(30*time.Second, "/eth/v1/beacon/rewards/attestations/99")
+	ttl := n.effectiveCacheTTL(30*time.Second, "/eth/v1/beacon/rewards/attestations/98")
 	if ttl != 0 {
 		t.Fatalf("expected forever (0) for finalized epoch rewards, got %v", ttl)
+	}
+
+	// Rewards for epoch 99 depend on inclusions in epoch 100, which is not
+	// yet fully finalized at checkpoint epoch 100.
+	ttl = n.effectiveCacheTTL(30*time.Second, "/eth/v1/beacon/rewards/attestations/99")
+	if ttl != 30*time.Second {
+		t.Fatalf("expected policy TTL for epoch within finality window, got %v", ttl)
 	}
 
 	ttl2 := n.effectiveCacheTTL(30*time.Second, "/eth/v1/validator/duties/proposer/101")
 	if ttl2 != 30*time.Second {
 		t.Fatalf("expected policy TTL for non-finalized epoch, got %v", ttl2)
+	}
+}
+
+func TestEffectiveCacheTTL_SlotsPerEpoch16(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	cfg.Networks[0].SlotsPerEpoch = 16 // Gnosis-style
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n.pool.UpdateFinalizedEpoch(100) // finalized slot = 100*16 = 1600
+
+	if ttl := n.effectiveCacheTTL(time.Minute, "/eth/v2/beacon/blocks/1600"); ttl != 0 {
+		t.Fatalf("expected forever (0) for finalized slot 1600, got %v", ttl)
+	}
+	// Slot 3200 would be "finalized" under a hardcoded 32 slots/epoch, but on a
+	// 16-slot chain it is far past the finalized checkpoint and can still reorg.
+	if ttl := n.effectiveCacheTTL(time.Minute, "/eth/v2/beacon/blocks/3200"); ttl != time.Minute {
+		t.Fatalf("expected policy TTL for non-finalized slot 3200 at 16 slots/epoch, got %v", ttl)
+	}
+	if ttl := n.effectiveCacheTTL(time.Minute, "/eth/v2/beacon/blocks/1601"); ttl != time.Minute {
+		t.Fatalf("expected policy TTL for slot past the checkpoint, got %v", ttl)
+	}
+}
+
+func TestEffectiveCacheTTL_EpochOverflowNotFinalized(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n.pool.UpdateFinalizedEpoch(100)
+
+	// A near-max epoch must not wrap (epoch+2 == 1) and be treated as finalized.
+	path := "/eth/v1/beacon/rewards/attestations/18446744073709551615"
+	if ttl := n.effectiveCacheTTL(30*time.Second, path); ttl != 30*time.Second {
+		t.Fatalf("expected policy TTL for overflowing epoch, got %v", ttl)
+	}
+}
+
+func TestEnsurePreferredUpstreamFirst_SkipsForkedPreferred(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfgText(t, fmt.Sprintf(`
+logLevel: error
+server: { host: "127.0.0.1", port: 5555, maxTimeout: 30s }
+failsafe: { timeout: { duration: 10s } }
+health: { checkInterval: 1h, finalityInterval: 1h, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: %s
+    upstreams:
+      - id: u1
+        url: %q
+      - id: u2
+        url: %q
+    cache: { enabled: false }
+`, id, up.URL, up.URL))
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Make u2 forked: majority reports root-canon at the head slot, u2 differs.
+	bc := n.pool.BlockCache()
+	bc.AddBlock("u1", 100, "root-canon", "p99")
+	bc.AddBlock("pad", 100, "root-canon", "p99")
+	bc.AddBlock("u2", 100, "root-fork", "p99")
+	if !bc.IsForked("u2") {
+		t.Fatal("test setup: u2 should be forked")
+	}
+
+	ups := []*upstream.Upstream{n.pool.ByID("u1"), n.pool.ByID("u2")}
+	got := ensurePreferredUpstreamFirst(n.pool, ups, "u2", 0)
+	if got[0].ID != "u1" {
+		t.Fatalf("forked preferred upstream was moved to front: head=%s", got[0].ID)
+	}
+}
+
+func TestMergeFailsafe_DoesNotMutateOverride(t *testing.T) {
+	t.Parallel()
+	base := config.FailsafeConfig{Retry: &config.RetryConfig{MaxAttempts: 3, Delay: 100 * time.Millisecond, Backoff: 2.0}}
+	override := config.FailsafeConfig{Retry: &config.RetryConfig{MaxAttempts: 1}}
+
+	result := mergeFailsafe(base, override)
+
+	if override.Retry.Delay != 0 || override.Retry.Backoff != 0 {
+		t.Fatalf("mergeFailsafe mutated the shared override: delay=%v backoff=%v", override.Retry.Delay, override.Retry.Backoff)
+	}
+	if result.Retry.Delay != 100*time.Millisecond || result.Retry.Backoff != 2.0 {
+		t.Fatalf("merged result not defaulted: delay=%v backoff=%v", result.Retry.Delay, result.Retry.Backoff)
+	}
+	if result.Retry == override.Retry {
+		t.Fatal("merged result aliases the shared override pointer")
 	}
 }
 
@@ -881,6 +1022,7 @@ func TestNetwork_OctetStreamResponsesStayByteExact(t *testing.T) {
 	}
 
 	req1 := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blobs/123", nil)
+	req1.Header.Set("Accept", "application/octet-stream")
 	rec1 := httptest.NewRecorder()
 	n.ServeHTTP(rec1, req1)
 	if rec1.Code != http.StatusOK {
@@ -894,6 +1036,7 @@ func TestNetwork_OctetStreamResponsesStayByteExact(t *testing.T) {
 	}
 
 	req2 := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blobs/123", nil)
+	req2.Header.Set("Accept", "application/octet-stream")
 	rec2 := httptest.NewRecorder()
 	n.ServeHTTP(rec2, req2)
 	if got := rec2.Header().Get("X-Ebeacon-Cache"); got != "HIT" {
@@ -1525,11 +1668,50 @@ func TestBuildCacheKey_IncludesSelectorScope(t *testing.T) {
 func TestDedupKey_IncludesSelectorScope(t *testing.T) {
 	u := &url.URL{Path: "/eth/v1/node/version"}
 
-	genericKey := dedupKey("mainnet", http.MethodGet, u, nil, "")
-	clientKey := dedupKey("mainnet", http.MethodGet, u, nil, "client:nimbus")
+	genericKey := dedupKey("mainnet", http.MethodGet, u, nil, "", false)
+	clientKey := dedupKey("mainnet", http.MethodGet, u, nil, "client:nimbus", false)
 
 	if genericKey == clientKey {
 		t.Fatalf("expected selector-scoped dedup key to differ, got %q", genericKey)
+	}
+}
+
+func TestDedupKey_IncludesAcceptRepresentation(t *testing.T) {
+	u := &url.URL{Path: "/eth/v2/beacon/blocks/12345"}
+
+	jsonKey := dedupKey("mainnet", http.MethodGet, u, nil, "", false)
+	sszKey := dedupKey("mainnet", http.MethodGet, u, nil, "", true)
+
+	if jsonKey == sszKey {
+		t.Fatalf("SSZ and JSON requests must not share a dedup key, got %q", jsonKey)
+	}
+}
+
+func TestAcceptPrefersSSZ(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		accept string
+		want   bool
+	}{
+		{"", false},
+		{"application/octet-stream", true},
+		{"Application/Octet-Stream", true},
+		{"application/json", false},
+		{"application/octet-stream;q=1.0,application/json;q=0.9", true},
+		{"application/octet-stream; q=1.0, application/json; q=0.9", true},
+		{"application/json;q=1.0,application/octet-stream;q=0.9", false},
+		{"application/octet-stream;q=0", false},
+		{"*/*", false},
+		{"application/*", false},
+		{"application/octet-stream, application/json", false},
+		{"application/octet-stream;q=0.5, */*;q=0.1", true},
+		{"text/html", false},
+		{"application/octet-stream;q=garbage", true},
+	}
+	for _, tt := range tests {
+		if got := acceptPrefersSSZ(tt.accept); got != tt.want {
+			t.Errorf("acceptPrefersSSZ(%q) = %v, want %v", tt.accept, got, tt.want)
+		}
 	}
 }
 
@@ -2319,5 +2501,600 @@ networks:
 	// Numeric entry must still be present.
 	if n.cache.Get(id+":GET:/eth/v1/beacon/headers/12345") == nil {
 		t.Error("numeric slot cache entry was unexpectedly invalidated")
+	}
+}
+
+func TestNetwork_POSTBodyForwardedWithoutRetryConfig(t *testing.T) {
+	var gotBody []byte
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	if cfg.Failsafe.Retry != nil || cfg.Failsafe.Hedge != nil {
+		t.Fatal("test requires a config without retry/hedge")
+	}
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := `["1","2","3"]`
+	req := httptest.NewRequest(http.MethodPost, "/eth/v1/beacon/states/head/validators", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d %q", rec.Code, rec.Body.String())
+	}
+	if string(gotBody) != body {
+		t.Fatalf("upstream body: got %q want %q", gotBody, body)
+	}
+}
+
+func TestNetwork_POSTBodyTooLargeReturns413(t *testing.T) {
+	upstreamCalled := false
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/eth/v1/beacon/states/head/validators",
+		io.LimitReader(neverEnding('x'), 32<<20+1))
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status: got %d want 413", rec.Code)
+	}
+	if upstreamCalled {
+		t.Fatal("oversized body must not reach the upstream")
+	}
+}
+
+type neverEnding byte
+
+func (b neverEnding) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = byte(b)
+	}
+	return len(p), nil
+}
+
+func TestReadBodyCapped_EnforcesLimit(t *testing.T) {
+	t.Parallel()
+	body, err := readBodyCapped(strings.NewReader("12345"), 5)
+	if err != nil || string(body) != "12345" {
+		t.Fatalf("exact-limit read failed: %v %q", err, body)
+	}
+	if _, err := readBodyCapped(strings.NewReader("123456"), 5); err == nil {
+		t.Fatal("expected error for body exceeding limit")
+	}
+	body, err = readBodyCapped(strings.NewReader("123456"), 0)
+	if err != nil || string(body) != "123456" {
+		t.Fatalf("limit 0 must mean unlimited: %v %q", err, body)
+	}
+}
+
+func TestNetwork_OversizedUpstreamResponseReturns502(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(bytes.Repeat([]byte("x"), 1024)) //nolint:errcheck
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	cfg.Server.MaxResponseBodyBytes = 512
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status: got %d want 502", rec.Code)
+	}
+}
+
+func TestNetwork_HEADPreservesUpstreamContentLength(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "12345")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodHead, "/eth/v1/node/version", nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "12345" {
+		t.Fatalf("Content-Length: got %q want 12345", got)
+	}
+}
+
+func TestNetwork_SpecAcceptHeaderKeepsRepresentationsSeparate(t *testing.T) {
+	sszBody := []byte{0x0a, 0x0b, 0x0c, 0x0d}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Emulate a CL node honoring q-values: any Accept mentioning
+		// octet-stream first is served SSZ.
+		if strings.Contains(r.Header.Get("Accept"), "application/octet-stream") {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(sszBody)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":"json"}`))
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	cfg.Networks[0].Cache.Enabled = true
+	cfg.Networks[0].Cache.Policies = []config.CachePolicy{{
+		Pattern: `^/eth/v1/beacon/blobs/\d+$`,
+		TTL:     time.Minute,
+	}}
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The beacon-API spec's recommended SSZ Accept header (q-valued).
+	sszReq := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blobs/456", nil)
+	sszReq.Header.Set("Accept", "application/octet-stream;q=1.0,application/json;q=0.9")
+	sszRec := httptest.NewRecorder()
+	n.ServeHTTP(sszRec, sszReq)
+	if sszRec.Code != http.StatusOK || !bytes.Equal(sszRec.Body.Bytes(), sszBody) {
+		t.Fatalf("ssz response: %d %q", sszRec.Code, sszRec.Body.Bytes())
+	}
+
+	jsonReq := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blobs/456", nil)
+	jsonRec := httptest.NewRecorder()
+	n.ServeHTTP(jsonRec, jsonReq)
+	if got := jsonRec.Body.String(); got != `{"data":"json"}` {
+		t.Fatalf("json client received wrong representation: %q", got)
+	}
+
+	// A second q-valued SSZ request must hit the binary-keyed cache entry.
+	sszReq2 := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blobs/456", nil)
+	sszReq2.Header.Set("Accept", "application/octet-stream;q=1.0,application/json;q=0.9")
+	sszRec2 := httptest.NewRecorder()
+	n.ServeHTTP(sszRec2, sszReq2)
+	if got := sszRec2.Header().Get("X-Ebeacon-Cache"); got != "HIT" {
+		t.Fatalf("second ssz request should be a cache hit, got %q", got)
+	}
+	if !bytes.Equal(sszRec2.Body.Bytes(), sszBody) {
+		t.Fatalf("cached ssz body: %q", sszRec2.Body.Bytes())
+	}
+}
+
+func TestNetwork_MismatchedRepresentationIsNotCached(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Misbehaving upstream: returns SSZ regardless of Accept.
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte{0x01, 0x02})
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	cfg.Networks[0].Cache.Enabled = true
+	cfg.Networks[0].Cache.Policies = []config.CachePolicy{{
+		Pattern: `^/eth/v1/beacon/blobs/\d+$`,
+		TTL:     time.Minute,
+	}}
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jsonReq := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blobs/456", nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, jsonReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d", rec.Code)
+	}
+
+	jsonReq2 := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blobs/456", nil)
+	rec2 := httptest.NewRecorder()
+	n.ServeHTTP(rec2, jsonReq2)
+	if got := rec2.Header().Get("X-Ebeacon-Cache"); got == "HIT" {
+		t.Fatal("SSZ body must not be cached under a JSON-keyed entry")
+	}
+}
+
+func TestNetwork_HedgeLoserConnectionsReturnToZero(t *testing.T) {
+	bothArrived := make(chan struct{})
+	var arrived atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if arrived.Add(1) == 2 {
+			close(bothArrived)
+		}
+		select {
+		case <-bothArrived:
+		case <-time.After(2 * time.Second):
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":"ok"}`))
+	})
+	upA := httptest.NewServer(handler)
+	defer upA.Close()
+	upB := httptest.NewServer(handler)
+	defer upB.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, upA.URL, nil)
+	cfg.Networks[0].Upstreams = []config.UpstreamConfig{
+		{ID: "u1", URL: upA.URL},
+		{ID: "u2", URL: upB.URL},
+	}
+	cfg.Failsafe.Hedge = &config.HedgeConfig{Delay: time.Millisecond, MaxCount: 1}
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d", rec.Code)
+	}
+
+	u1, u2 := n.pool.ByID("u1"), n.pool.ByID("u2")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if u1.ActiveConns() == 0 && u2.ActiveConns() == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("hedge loser leaked active connections: u1=%d u2=%d",
+				u1.ActiveConns(), u2.ActiveConns())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestNetwork_ClientCancelDoesNotTripCircuitBreaker(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	cfg.Failsafe.CircuitBreaker = &config.CircuitBreakerConfig{
+		FailureThreshold: 1,
+		SuccessThreshold: 1,
+		HalfOpenAfter:    time.Hour,
+	}
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/eth/v1/beacon/states/head/validators",
+		strings.NewReader(`["1"]`)).WithContext(cctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		n.ServeHTTP(rec, req)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	if u := n.pool.ByID("u1"); !u.IsReady() {
+		t.Fatal("client disconnect must not trip the circuit breaker")
+	}
+}
+
+func TestNetwork_FailsafeTimeoutStillTripsCircuitBreaker(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	cfg.Failsafe.Timeout = &config.TimeoutConfig{Duration: 50 * time.Millisecond}
+	cfg.Failsafe.CircuitBreaker = &config.CircuitBreakerConfig{
+		FailureThreshold: 1,
+		SuccessThreshold: 1,
+		HalfOpenAfter:    time.Hour,
+	}
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/eth/v1/beacon/states/head/validators",
+		strings.NewReader(`["1"]`))
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status: got %d want 502", rec.Code)
+	}
+	if u := n.pool.ByID("u1"); u.IsReady() {
+		t.Fatal("failsafe timeout must still count as a circuit breaker failure")
+	}
+}
+
+func TestNetwork_MultiplexLeaderDisconnectDoesNotFailFollowers(t *testing.T) {
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		close(arrived)
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":"ok"}`))
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil).WithContext(leaderCtx)
+		n.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	<-arrived
+
+	followerRec := httptest.NewRecorder()
+	followerDone := make(chan struct{})
+	go func() {
+		defer close(followerDone)
+		req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+		n.ServeHTTP(followerRec, req)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	cancelLeader()
+	select {
+	case <-leaderDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("leader handler did not return after client disconnect")
+	}
+
+	close(release)
+	select {
+	case <-followerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("follower did not complete")
+	}
+	if followerRec.Code != http.StatusOK {
+		t.Fatalf("follower status: got %d want 200 (leader disconnect must not fail followers)", followerRec.Code)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("upstream hits: got %d want 1 (execution must stay shared)", hits.Load())
+	}
+}
+
+func TestNetwork_MultiplexFollowerCancelReturnsPromptly(t *testing.T) {
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(arrived)
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":"ok"}`))
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leaderRec := httptest.NewRecorder()
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+		n.ServeHTTP(leaderRec, req)
+	}()
+	<-arrived
+
+	followerCtx, cancelFollower := context.WithCancel(context.Background())
+	followerDone := make(chan struct{})
+	go func() {
+		defer close(followerDone)
+		req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil).WithContext(followerCtx)
+		n.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	cancelFollower()
+	select {
+	case <-followerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("follower must return promptly when its own client cancels")
+	}
+
+	close(release)
+	select {
+	case <-leaderDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("leader did not complete")
+	}
+	if leaderRec.Code != http.StatusOK {
+		t.Fatalf("leader status: got %d want 200", leaderRec.Code)
+	}
+}
+
+func TestForward_AppendsRealPeerToXFF(t *testing.T) {
+	var gotXFF string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotXFF = r.Header.Get("X-Forwarded-For")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+	req.RemoteAddr = "192.0.2.10:5555"
+	req.Header.Set("X-Forwarded-For", "1.2.3.4")
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	if gotXFF != "1.2.3.4, 192.0.2.10" {
+		t.Fatalf("upstream XFF chain must end with the real peer, got %q", gotXFF)
+	}
+}
+
+func TestRequiredSelectorFromValue_GlobPrefixRoundTrip(t *testing.T) {
+	t.Parallel()
+	sel := requiredUpstreamSelector{glob: "*lighthouse*"}
+	parsed := requiredSelectorFromValue(sel.label())
+	if parsed.glob != "*lighthouse*" || parsed.upstreamID != "" || parsed.clientType != "" {
+		t.Fatalf("glob scope label must round-trip, got %+v", parsed)
+	}
+}
+
+func TestForward_PreservesPercentEncodedPath(t *testing.T) {
+	var gotURI string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURI = r.RequestURI
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target := "/eth/v1/x/head%3Ffoo"
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	if gotURI != target {
+		t.Fatalf("upstream URI: got %q want %q (encoded segment content must survive)", gotURI, target)
+	}
+}
+
+func TestNetwork_MultiplexedPanicDoesNotCrashProcess(t *testing.T) {
+	id := netID(t)
+	cfg := mustCfg(t, id, "http://127.0.0.1:1", nil)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := n.pool.ByID("u1")
+	if u == nil {
+		t.Fatal("expected upstream u1")
+	}
+	// A transport that panics stands in for any nil-deref/bug on the request
+	// path. If the panic escaped singleflight it would crash the test binary.
+	u.Client = &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		panic("boom")
+	})}
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status: got %d, want 502 (panic must surface as an error, not a crash)", rec.Code)
+	}
+}
+
+func TestNetwork_SelectedCandidatesCancelDuringBackoffNoLeak(t *testing.T) {
+	// First candidate returns a pruning-shaped 404 (buffered as lastResp);
+	// the failsafe timeout then fires during the retry backoff before the
+	// second candidate. The buffered response's tracked body must be closed
+	// or its DecrActive leaks the upstream's activeConns.
+	pruneHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+	upA := httptest.NewServer(pruneHandler)
+	defer upA.Close()
+	upB := httptest.NewServer(pruneHandler)
+	defer upB.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, upA.URL, nil)
+	cfg.Networks[0].Upstreams = []config.UpstreamConfig{
+		{ID: "prune-a", URL: upA.URL},
+		{ID: "prune-b", URL: upB.URL},
+	}
+	cfg.Failsafe.Timeout = &config.TimeoutConfig{Duration: 80 * time.Millisecond}
+	cfg.Failsafe.Retry = &config.RetryConfig{MaxAttempts: 2, Delay: 400 * time.Millisecond, Backoff: 1}
+	cfg.Failsafe.Hedge = nil
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedHeadSlot(t, n, 20_000_000)
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blob_sidecars/100", nil)
+	req.Header.Set("X-EBEACON-Use-Upstream", "prune-*")
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		a, b := n.pool.ByID("prune-a").ActiveConns(), n.pool.ByID("prune-b").ActiveConns()
+		if a == 0 && b == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("activeConns leaked after cancel-during-backoff: prune-a=%d prune-b=%d", a, b)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

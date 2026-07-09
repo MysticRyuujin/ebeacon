@@ -29,6 +29,8 @@ Use top-level `networks:` and optionally top-level `auth:`. Let HAProxy rewrite 
 - `server.port`: `5555`
 - `server.maxTimeout`: `60s`
 - `server.enableGzip`: defaults to enabled when omitted
+- `server.maxResponseBodyBytes`: `2147483648` (2 GiB)
+- `server.trustedProxies`: unset (forwarding headers trusted from any peer — see [`server`](#server))
 - `pprof.enabled`: `false`
 - `pprof.host`: `127.0.0.1`
 - `pprof.port`: `6060`
@@ -56,6 +58,7 @@ Use top-level `networks:` and optionally top-level `auth:`. Let HAProxy rewrite 
 - `routing.scoreWindowSize`: `100`
 - `cache.maxSize`: `2048`
 - `cache.driver`: `memory`
+- `cache.redis.keyPrefix`: `ebeacon:<networkId>:` when `driver: redis` and no prefix is set
 - `upstream.weight`: `1` when omitted
 - `upstream.archive`: `false` when omitted (default is pruned, matching CL client defaults)
 
@@ -64,10 +67,15 @@ Validation examples:
 - At least one network is required.
 - Each network must have at least one upstream.
 - `server.port` must be `1..65535`.
+- `server.trustedProxies` entries must be valid CIDRs or IPs.
 - `debugLogging.path` is required when `debugLogging.enabled` is `true`.
 - `cors.allowedOrigins` must contain at least one origin when `cors:` is configured.
 - `metrics.path` must start with `/`.
 - `cache.maxSize` must be `> 0`.
+- `cache.driver` must be `memory` or `redis`; `state.driver` must be `local` or `redis` (typos no longer fall back silently).
+- `cache.redis.url` is required when `cache.driver: redis` and the cache is enabled.
+- `auth.keys[]` entries require a non-empty, unique `id` and a non-empty `secret`; a key's `tier` must name a defined tier. Keys without an `id` previously authenticated but silently bypassed per-key and tier rate limits.
+- `ui.basePath` must start with `/` and must not be the root path when the UI is enabled.
 - `blockedPaths`, `routeRules.pathPattern`, and `cache.policies.pattern` must be valid regex.
 
 ## `server`
@@ -78,9 +86,17 @@ server:
   port: 5555
   maxTimeout: 60s
   enableGzip: true
+  maxResponseBodyBytes: 2147483648 # 2 GiB
+  trustedProxies: ["10.0.0.0/8", "127.0.0.1"]
 ```
 
-`maxTimeout` drives request timeout policy ceilings and contributes to HTTP server write timeout.
+`maxTimeout` drives request timeout policy ceilings and contributes to HTTP server write timeout. It also bounds multiplexed request executions, which run detached from any single client's connection.
+
+`maxResponseBodyBytes` caps how much of an upstream response body (after gzip decompression) eBeacon buffers. Large beacon states can approach 1 GiB as JSON; the cap bounds memory against oversized or decompression-bomb responses from a misbehaving upstream. Over-limit responses surface to the client as `502`.
+
+`trustedProxies` lists CIDRs or IPs whose `X-Forwarded-For` / `X-Real-IP` headers are honored when deriving the client IP for per-IP rate limiting and sticky sessions. When set, the `X-Forwarded-For` chain is walked right-to-left past trusted hops, so a client cannot spoof its own address. **When unset, forwarding headers are trusted from any peer** — fine behind a proxy that overwrites them, but spoofable if eBeacon is exposed directly to clients. See [Operations: Deployment topology](operations.md#deployment-topology).
+
+Request bodies are capped at 32 MiB; larger bodies return `413 Request Entity Too Large`.
 
 ## `pprof`
 
@@ -163,7 +179,7 @@ failsafe:
     agreementThreshold: 2
 ```
 
-Network-level and upstream-level failsafe config overrides global values.
+Network-level failsafe config merges with global values field by field: a network block that sets only `retry.delay` inherits the global `timeout`, `maxAttempts`, and everything else it doesn't mention. `consensus` can also be overridden (or disabled) per network. Upstream-level `failsafe.circuitBreaker` overrides the merged result for that upstream.
 
 ## `networks` and upstreams
 
@@ -200,6 +216,10 @@ When `genesisTime` is known, eBeacon aligns the cache TTL for head-relative requ
 | hoodi   | `1742213400`            |
 
 For any other network, set `genesisTime` to the unix timestamp of its genesis block. These values are permanent chain constants and never change.
+
+Set `secondsPerSlot` (default `12`) for chains that don't use 12-second slots — e.g. Gnosis/Chiado use `5`. It drives both slot-boundary TTL alignment and the block cache's future-slot plausibility guard; leaving it at the 12s default on a faster chain would cause eBeacon to reject legitimate blocks and silently disable fork detection.
+
+Set `slotsPerEpoch` (default `32`) for chains with a different epoch length — Gnosis/Chiado use `16` and are auto-detected by network `id`. It drives finality-aware cache promotion: with the wrong value, slots past the true finalized checkpoint are treated as immutable and cached forever, so reorgeable data can be served permanently.
 
 ### Preferred local + backup public provider
 
@@ -381,3 +401,4 @@ Notes:
 - If no `policies` are provided, built-in defaults are used.
 - Methods default to `GET` and `HEAD` when omitted.
 - `driver: redis` requires `cache.redis.url`.
+- With `driver: redis`, `redis.keyPrefix` defaults to `ebeacon:<networkId>:` so networks sharing a Redis database cannot see each other's entries during scan-based operations (finality promotion, reorg purge, size metrics). Set an explicit prefix to override; keep it unique per network.

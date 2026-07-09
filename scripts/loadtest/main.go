@@ -27,6 +27,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"math/rand"
 	"net/http"
@@ -159,6 +160,8 @@ const (
 	endpointRewardsAttestations  = "/eth/v1/beacon/rewards/attestations/{epoch}"
 	endpointBeaconBlobSidecars   = "/eth/v1/beacon/blob_sidecars/{block_id}"
 	endpointNodeHealth           = "/eth/v1/node/health"
+	endpointPostStateValidators  = "POST /eth/v1/beacon/states/{state_id}/validators"
+	endpointPostAttesterDuties   = "POST /eth/v1/validator/duties/attester/{epoch}"
 )
 
 type endpoint struct {
@@ -168,6 +171,13 @@ type endpoint struct {
 	body   interface{} // marshalled to JSON for POST; nil for GET/HEAD
 	weight int
 	accept string // overrides default "application/json" Accept header (e.g. "application/octet-stream" for SSZ)
+	// validate inspects the response. Status-only checks miss bugs like a
+	// proxy forwarding POSTs with empty bodies (which can still return 200);
+	// validators must assert the response reflects the request body.
+	validate func(status int, body []byte) error
+	// expect4xx suppresses 4xx counting for endpoints that request misses on
+	// purpose (cache-miss generator).
+	expect4xx bool
 }
 
 // chainState holds live values fetched from the beacon node at startup.
@@ -253,7 +263,7 @@ func fetchChainState(ctx context.Context, baseURL string, auth string, apiKey st
 	return chainState{
 		headSlot:       headSlot,
 		finalizedEpoch: finalizedEpoch,
-		finalizedSlot:  finalizedEpoch*32 + 31,
+		finalizedSlot:  finalizedEpoch * 32,
 		prevEpoch:      prev,
 	}, nil
 }
@@ -299,6 +309,44 @@ func buildEndpoints(cs chainState) []endpoint {
 		{name: endpointRewardsAttestations, method: methodGET, path: "/eth/v1/beacon/rewards/attestations/" + prevEpoch, weight: 1},
 		{name: endpointBeaconBlobSidecars, method: methodGET, path: "/eth/v1/beacon/blob_sidecars/" + finalizedSlot, weight: 1},
 		{name: endpointNodeHealth, method: methodGET, path: "/eth/v1/node/health", weight: 1},
+
+		{
+			name:     endpointPostStateValidators,
+			method:   methodPOST,
+			path:     "/eth/v1/beacon/states/head/validators",
+			body:     map[string][]string{"ids": {"1", "2", "3"}},
+			weight:   2,
+			validate: validateDataArrayLen(3),
+		},
+		{
+			name:     endpointPostAttesterDuties,
+			method:   methodPOST,
+			path:     "/eth/v1/validator/duties/attester/" + strconv.FormatUint(cs.headSlot/32, 10),
+			body:     []string{"1", "2"},
+			weight:   1,
+			validate: validateDataArrayLen(2),
+		},
+	}
+}
+
+// validateDataArrayLen asserts a 200 response whose data array has exactly n
+// entries — the count requested in the POST body. A proxy that forwards an
+// empty body gets a 400, or a 200 with the wrong entry count; both fail here.
+func validateDataArrayLen(n int) func(status int, body []byte) error {
+	return func(status int, body []byte) error {
+		if status != http.StatusOK {
+			return fmt.Errorf("HTTP %d", status)
+		}
+		var resp struct {
+			Data []json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return fmt.Errorf("parse response: %w", err)
+		}
+		if len(resp.Data) != n {
+			return fmt.Errorf("data has %d entries, requested %d", len(resp.Data), n)
+		}
+		return nil
 	}
 }
 
@@ -367,9 +415,11 @@ func (h *latHist) mean() float64 {
 // ── per-endpoint stats ────────────────────────────────────────────────────────
 
 type stats struct {
-	total  atomic.Int64
-	errors atomic.Int64
-	lat    latHist
+	total     atomic.Int64
+	errors    atomic.Int64
+	status4xx atomic.Int64
+	vfails    atomic.Int64
+	lat       latHist
 }
 
 // ── SSE stats ─────────────────────────────────────────────────────────────────
@@ -493,10 +543,11 @@ func httpWorker(ctx context.Context, stopAt time.Time, cfg config, client *http.
 		// Inject random error paths according to errorPct.
 		if rand.Intn(100) < cfg.errorPct {
 			ep = endpoint{
-				name:   "_error_path",
-				method: methodGET,
-				path:   fmt.Sprintf("/eth/v1/node/version/ebeacon-loadtest-miss-%d-%d", wid, rand.Int()),
-				weight: 1,
+				name:      "_error_path",
+				method:    methodGET,
+				path:      fmt.Sprintf("/eth/v1/node/version/ebeacon-loadtest-miss-%d-%d", wid, rand.Int()),
+				weight:    1,
+				expect4xx: true,
 			}
 		}
 
@@ -527,11 +578,26 @@ func httpWorker(ctx context.Context, stopAt time.Time, cfg config, client *http.
 		if err != nil || resp == nil {
 			st.errors.Add(1)
 		} else {
-			// Drain body so connection can be reused.
-			io.Copy(io.Discard, resp.Body) //nolint:errcheck
-			resp.Body.Close()              //nolint:errcheck
-			if resp.StatusCode >= 500 {
+			var body []byte
+			if ep.validate != nil {
+				body, _ = io.ReadAll(resp.Body)
+			} else {
+				// Drain body so connection can be reused.
+				io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			}
+			resp.Body.Close() //nolint:errcheck
+			switch {
+			case resp.StatusCode >= 500:
 				st.errors.Add(1)
+			case resp.StatusCode >= 400 && !ep.expect4xx:
+				st.status4xx.Add(1)
+			}
+			if ep.validate != nil {
+				if verr := ep.validate(resp.StatusCode, body); verr != nil {
+					st.vfails.Add(1)
+					st.errors.Add(1)
+					slog.Warn("response validation failed", "endpoint", ep.name, "err", verr)
+				}
 			}
 			st.lat.observe(elapsed)
 		}
@@ -619,13 +685,15 @@ func sseWorker(ctx context.Context, cfg config, client *http.Client, topic strin
 // ── reporting ─────────────────────────────────────────────────────────────────
 
 type snapshot struct {
-	name   string
-	total  int64
-	errors int64
-	p50    float64
-	p95    float64
-	p99    float64
-	mean   float64
+	name      string
+	total     int64
+	errors    int64
+	status4xx int64
+	vfails    int64
+	p50       float64
+	p95       float64
+	p99       float64
+	mean      float64
 }
 
 func snapshotStats(statMap map[string]*stats, mu *sync.RWMutex) []snapshot {
@@ -634,13 +702,15 @@ func snapshotStats(statMap map[string]*stats, mu *sync.RWMutex) []snapshot {
 	snaps := make([]snapshot, 0, len(statMap))
 	for name, st := range statMap {
 		snaps = append(snaps, snapshot{
-			name:   name,
-			total:  st.total.Load(),
-			errors: st.errors.Load(),
-			p50:    st.lat.percentile(50),
-			p95:    st.lat.percentile(95),
-			p99:    st.lat.percentile(99),
-			mean:   st.lat.mean(),
+			name:      name,
+			total:     st.total.Load(),
+			errors:    st.errors.Load(),
+			status4xx: st.status4xx.Load(),
+			vfails:    st.vfails.Load(),
+			p50:       st.lat.percentile(50),
+			p95:       st.lat.percentile(95),
+			p99:       st.lat.percentile(99),
+			mean:      st.lat.mean(),
 		})
 	}
 	sort.Slice(snaps, func(i, j int) bool { return snaps[i].name < snaps[j].name })
@@ -698,16 +768,16 @@ func printFinalReport(statMap map[string]*stats, mu *sync.RWMutex, ss *sseStats,
 	fmt.Println()
 
 	// Per-endpoint table.
-	fmt.Printf("  %-50s %8s %8s %8s %8s %8s %8s\n",
-		"endpoint", "reqs", "errors", "mean(ms)", "p50(ms)", "p95(ms)", "p99(ms)")
-	fmt.Println(" ", strings.Repeat("-", 106))
+	fmt.Printf("  %-50s %8s %8s %8s %8s %8s %8s %8s %8s\n",
+		"endpoint", "reqs", "errors", "4xx", "vfails", "mean(ms)", "p50(ms)", "p95(ms)", "p99(ms)")
+	fmt.Println(" ", strings.Repeat("-", 124))
 	for _, s := range snaps {
 		errMark := ""
-		if s.errors > 0 {
+		if s.errors > 0 || s.status4xx > 0 {
 			errMark = " !"
 		}
-		fmt.Printf("  %-50s %8d %8d %8.1f %8.1f %8.1f %8.1f%s\n",
-			s.name, s.total, s.errors, s.mean, s.p50, s.p95, s.p99, errMark)
+		fmt.Printf("  %-50s %8d %8d %8d %8d %8.1f %8.1f %8.1f %8.1f%s\n",
+			s.name, s.total, s.errors, s.status4xx, s.vfails, s.mean, s.p50, s.p95, s.p99, errMark)
 	}
 
 	// SSE summary.

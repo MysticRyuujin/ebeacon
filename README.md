@@ -129,9 +129,9 @@ make ci-local
 The repository includes two long-running validation tools under `scripts/`:
 
 - `go run ./scripts/loadtest/ -base http://127.0.0.1:5555/mainnet -concurrency 50 -duration 60`
-  Generates mixed Beacon API traffic, including SSE and both `gzip` and `identity` request paths.
+  Generates mixed Beacon API traffic — including SSE, both `gzip` and `identity` request paths, and POSTs whose responses are validated against the request body.
 - `go run ./scripts/reliability/ -duration 30m -report 1m`
-  Continuously checks immutable responses, cache accuracy, cache encoding compatibility, SSE health, and captures pprof snapshots.
+  Continuously checks immutable responses, cache accuracy, cache encoding compatibility, SSE health, and metrics invariants (active connections must return to zero at quiesce), and captures pprof snapshots. Exits non-zero on any detected issue, on eBeacon request errors, or when a checker completed zero checks, so it can gate CI or cron runs.
 
 Both tools target a live eBeacon instance. The reliability harness can also compare against direct upstream CL REST APIs via `-upstream`.
 
@@ -161,7 +161,7 @@ Configuration is YAML. See [`ebeacon.example.yaml`](ebeacon.example.yaml) for a 
 
 | Section          | Purpose                                                                                                                                        |
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| **server**       | `host`, `port`, `maxTimeout`, `enableGzip` (default: gzip enabled)                                                                             |
+| **server**       | `host`, `port`, `maxTimeout`, `enableGzip`, `maxResponseBodyBytes`, `trustedProxies`                                                           |
 | **cors**         | `allowedOrigins`, `allowedMethods`, `allowedHeaders`, `exposedHeaders`, `allowCredentials`, `maxAge` for browser access                        |
 | **failsafe**     | `timeout`, `retry`, `hedge`, `circuitBreaker`, `consensus` — global defaults merged per network/upstream                                       |
 | **health**       | `checkInterval`, `finalityInterval`, `maxSyncDistance`, `followDistance`, `maxHeadDistance` — sync/finality polling and degradation thresholds |
@@ -215,6 +215,10 @@ state:
 ui:
   enabled: true
   basePath: /webui
+  auth: # required when ui.enabled is true
+    keys:
+      - id: dashboard
+        secret: "${EBEACON_UI_SECRET}"
 
 networks:
   - id: mainnet

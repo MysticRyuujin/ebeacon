@@ -184,7 +184,7 @@ func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error
 	go func() {
 		r := bufio.NewReader(resp.Body)
 		for {
-			line, err := r.ReadString('\n')
+			line, err := readCappedLine(r, sseMaxEventBytes)
 			select {
 			case lines <- lineResult{line, err}:
 			case <-readerDone:
@@ -239,7 +239,10 @@ func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error
 				case strings.HasPrefix(line, "data:"):
 					if inHeadEvent || inFinalizedEvent || inReorgEvent || !sawEventName {
 						sawData = true
-						dataPayload.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+						payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+						if dataPayload.Len()+len(payload) <= sseMaxEventBytes {
+							dataPayload.WriteString(payload)
+						}
 					}
 				case line == "":
 					if sawData {
@@ -324,7 +327,9 @@ func (w *headWatcher) invalidateHeadCache(ctx context.Context, u *upstream.Upstr
 		return
 	}
 	// Single-pass: purge matching entries and collect their keys for warming.
-	n, keys := w.cache.PurgeCollect(isNamedHeadCacheKey)
+	n, keys := w.cache.PurgeCollect(func(key string) bool {
+		return w.ownsKey(key) && isNamedHeadCacheKey(key)
+	})
 	if n == 0 {
 		return
 	}
@@ -354,6 +359,14 @@ func isNamedHeadCacheKey(key string) bool {
 	return pathHasNamedSlotID(cacheKeyPath(key))
 }
 
+// ownsKey reports whether a cache key belongs to this watcher's network.
+// Scan-based operations can see other networks' entries when a Redis DB is
+// shared, and promotion/purge decisions keyed on another chain's slots would
+// corrupt that network's cache.
+func (w *headWatcher) ownsKey(key string) bool {
+	return strings.HasPrefix(key, w.networkID+":")
+}
+
 // handleFinalizedCheckpoint processes a finalized_checkpoint SSE event.
 // It updates the pool's finalized epoch and promotes existing cache entries
 // for slots/epochs that are now finalized.
@@ -379,8 +392,14 @@ func (w *headWatcher) handleFinalizedCheckpoint(data string) {
 		return
 	}
 
-	finalizedSlot := epoch*32 + 31
+	// A checkpoint at epoch E finalizes the chain only up to slot
+	// E*slotsPerEpoch. Epoch-keyed data (e.g. attestation rewards for epoch N)
+	// can depend on inclusions through epoch N+1, so require N+2 <= E.
+	finalizedSlot := epoch * w.pool.SlotsPerEpoch()
 	n := w.cache.PromoteIf(func(key string) bool {
+		if !w.ownsKey(key) {
+			return false
+		}
 		path := cacheKeyPath(key)
 		if path == "" {
 			return false
@@ -388,7 +407,7 @@ func (w *headWatcher) handleFinalizedCheckpoint(data string) {
 		if slot, ok := pathNumericSlot(path); ok && slot <= finalizedSlot {
 			return true
 		}
-		if ep, ok := pathNumericEpoch(path); ok && ep <= epoch {
+		if ep, ok := pathNumericEpoch(path); ok && epoch >= 2 && ep <= epoch-2 {
 			return true
 		}
 		return false
@@ -423,6 +442,9 @@ func (w *headWatcher) handleChainReorg(data string) {
 	// Purge numeric-slot entries at or above the reorg slot, plus all
 	// named-head entries which may also reference the orphaned fork.
 	n := w.cache.PurgeIf(func(key string) bool {
+		if !w.ownsKey(key) {
+			return false
+		}
 		path := cacheKeyPath(key)
 		if path == "" {
 			return false
