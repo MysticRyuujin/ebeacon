@@ -283,7 +283,7 @@ func New(cfg *config.NetworkConfig, globalCfg *config.Config) (*Network, error) 
 	if err != nil {
 		return nil, fmt.Errorf("network %s: %w", cfg.ID, err)
 	}
-	pool.BlockCache().SetGenesisTime(cfg.GenesisTime)
+	pool.BlockCache().SetSlotTiming(cfg.GenesisTime, cfg.SecondsPerSlot)
 
 	n := &Network{
 		id:               cfg.ID,
@@ -704,7 +704,18 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			body []byte
 		}
 
-		ch := n.inflight.DoChan(dedupKey, func() (interface{}, error) {
+		ch := n.inflight.DoChan(dedupKey, func() (val interface{}, err error) {
+			// A panic here must not escape the closure: singleflight
+			// re-panics on a separate goroutine when callers are waiting
+			// (go panic(e)), which is unrecoverable and crashes the whole
+			// process. Convert it to an error so only this request fails.
+			defer func() {
+				if p := recover(); p != nil {
+					val, err = nil, fmt.Errorf("panic in multiplexed request: %v", p)
+					slog.Error("recovered panic in multiplexed request",
+						"network", n.id, "method", r.Method, "path", r.URL.Path, "panic", p)
+				}
+			}()
 			// Detach from the caller's request context so one client's
 			// disconnect doesn't fail every deduplicated follower. The
 			// failsafe timeout still applies inside executeFS; maxTimeout
@@ -914,6 +925,10 @@ func mergeFailsafe(base, override config.FailsafeConfig) config.FailsafeConfig {
 	if override.CircuitBreaker != nil {
 		result.CircuitBreaker = override.CircuitBreaker
 	}
+	// A path override replaces whole sections with raw (undefaulted) config;
+	// default the merged result so an override that sets only retry.maxAttempts
+	// still gets a sane delay/backoff instead of a zero-spacing retry storm.
+	config.ApplyFailsafeDefaults(&result)
 	return result
 }
 
@@ -1000,6 +1015,12 @@ func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Reque
 			delay := retryDelay(fs.Retry, i-1)
 			select {
 			case <-ctx.Done():
+				// Close any buffered pruning response before bailing;
+				// its tracked body owns a DecrActive that would otherwise
+				// leak activeConns for that upstream.
+				if lastResp != nil {
+					lastResp.Body.Close() //nolint:errcheck
+				}
 				return nil, nil, &selectedUpstreamUnavailableError{selector: required.label(), err: ctx.Err()}
 			case <-time.After(delay):
 			}
@@ -1114,7 +1135,10 @@ func (n *Network) effectiveCacheTTL(policyTTL time.Duration, path string) time.D
 		}
 	}
 	if policyTTL > 0 && n.cfg.GenesisTime != 0 && pathHasNamedSlotID(path) {
-		const slotSeconds = int64(12)
+		slotSeconds := n.cfg.SecondsPerSlot
+		if slotSeconds <= 0 {
+			slotSeconds = 12
+		}
 		elapsed := (time.Now().Unix() - n.cfg.GenesisTime) % slotSeconds
 		if elapsed < 0 {
 			elapsed += slotSeconds
@@ -1375,7 +1399,7 @@ func ensurePreferredUpstreamFirst(pool *upstream.Pool, ups []*upstream.Upstream,
 			return trimUpstreamSlice(ups, maxLen)
 		}
 	}
-	if pu := pool.ByID(preferID); pu != nil && pu.IsReady() && pool.BlockCache().IsOnCanonicalFork(pu.ID) {
+	if pu := pool.ByID(preferID); pu != nil && pu.IsReady() && !pool.BlockCache().IsForked(pu.ID) {
 		out := append([]*upstream.Upstream{pu}, ups...)
 		return trimUpstreamSlice(out, maxLen)
 	}

@@ -265,6 +265,12 @@ networks:
 		if fs.Retry == nil || fs.Retry.MaxAttempts != 2 {
 			t.Fatalf("retry for %s: got %#v", path, fs.Retry)
 		}
+		// The override set only maxAttempts; delay/backoff must be defaulted,
+		// not left at zero (which would be a zero-spacing retry storm).
+		if fs.Retry.Delay <= 0 || fs.Retry.Backoff < 1 {
+			t.Fatalf("override retry for %s must be defaulted, got delay=%v backoff=%v",
+				path, fs.Retry.Delay, fs.Retry.Backoff)
+		}
 		if fs.Hedge == nil || fs.Hedge.MaxCount != 0 {
 			t.Fatalf("hedge for %s: got %#v", path, fs.Hedge)
 		}
@@ -2901,5 +2907,78 @@ func TestForward_PreservesPercentEncodedPath(t *testing.T) {
 
 	if gotURI != target {
 		t.Fatalf("upstream URI: got %q want %q (encoded segment content must survive)", gotURI, target)
+	}
+}
+
+func TestNetwork_MultiplexedPanicDoesNotCrashProcess(t *testing.T) {
+	id := netID(t)
+	cfg := mustCfg(t, id, "http://127.0.0.1:1", nil)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := n.pool.ByID("u1")
+	if u == nil {
+		t.Fatal("expected upstream u1")
+	}
+	// A transport that panics stands in for any nil-deref/bug on the request
+	// path. If the panic escaped singleflight it would crash the test binary.
+	u.Client = &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		panic("boom")
+	})}
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status: got %d, want 502 (panic must surface as an error, not a crash)", rec.Code)
+	}
+}
+
+func TestNetwork_SelectedCandidatesCancelDuringBackoffNoLeak(t *testing.T) {
+	// First candidate returns a pruning-shaped 404 (buffered as lastResp);
+	// the failsafe timeout then fires during the retry backoff before the
+	// second candidate. The buffered response's tracked body must be closed
+	// or its DecrActive leaks the upstream's activeConns.
+	pruneHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+	upA := httptest.NewServer(pruneHandler)
+	defer upA.Close()
+	upB := httptest.NewServer(pruneHandler)
+	defer upB.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, upA.URL, nil)
+	cfg.Networks[0].Upstreams = []config.UpstreamConfig{
+		{ID: "prune-a", URL: upA.URL},
+		{ID: "prune-b", URL: upB.URL},
+	}
+	cfg.Failsafe.Timeout = &config.TimeoutConfig{Duration: 80 * time.Millisecond}
+	cfg.Failsafe.Retry = &config.RetryConfig{MaxAttempts: 2, Delay: 400 * time.Millisecond, Backoff: 1}
+	cfg.Failsafe.Hedge = nil
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedHeadSlot(t, n, 20_000_000)
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blob_sidecars/100", nil)
+	req.Header.Set("X-EBEACON-Use-Upstream", "prune-*")
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		a, b := n.pool.ByID("prune-a").ActiveConns(), n.pool.ByID("prune-b").ActiveConns()
+		if a == 0 && b == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("activeConns leaked after cancel-during-backoff: prune-a=%d prune-b=%d", a, b)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
