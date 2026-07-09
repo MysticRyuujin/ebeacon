@@ -642,20 +642,19 @@ func runEncodingCompatibilityChecks(ctx context.Context, cfg config, c *counters
 		}
 	}
 
+	// Use the finalized header's own slot: head-1 can be a missed (empty) slot
+	// that legitimately 404s, and finalized resolves to a real, immutable block.
 	resolveStableBinaryPath := func() (string, error) {
-		res, err := fetch(ctx, client, cfg.ebeaconBase+"/eth/v1/beacon/headers/head", cfg.auth, cfg.apiKey)
+		res, err := fetch(ctx, client, cfg.ebeaconBase+"/eth/v1/beacon/headers/finalized", cfg.auth, cfg.apiKey)
 		if err != nil {
 			return "", err
 		}
 		if res.status != http.StatusOK {
-			return "", fmt.Errorf("headers/head returned %d", res.status)
+			return "", fmt.Errorf("headers/finalized returned %d", res.status)
 		}
 		slot, ok := extractSlot(res.body)
 		if !ok {
-			return "", fmt.Errorf("could not extract slot from headers/head")
-		}
-		if slot > 0 {
-			slot--
+			return "", fmt.Errorf("could not extract slot from headers/finalized")
 		}
 		return "/eth/v2/beacon/blocks/" + strconv.FormatUint(slot, 10), nil
 	}
