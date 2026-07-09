@@ -13,6 +13,12 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// foreverTTL is the finite TTL used for "cache forever" entries. Keeping it
+// finite (rather than persisting with no expiry) means entries orphaned by a
+// keyPrefix change still expire on their own instead of accumulating in Redis
+// until a manual flush.
+const foreverTTL = 24 * time.Hour * 365
+
 // redisEntry is a serializable form of Entry for Redis storage.
 type redisEntry struct {
 	Key     string
@@ -95,7 +101,7 @@ func (r *RedisStore) Set(key string, entry *Entry, ttl time.Duration) {
 	defer cancel()
 
 	if ttl <= 0 {
-		ttl = 24 * time.Hour * 365
+		ttl = foreverTTL
 	}
 	if err := r.client.Set(ctx, r.prefixed(key), buf.Bytes(), ttl).Err(); err != nil {
 		slog.Warn("redis cache set failed", "key", key, "err", err)
@@ -113,7 +119,10 @@ func (r *RedisStore) Delete(key string) {
 func (r *RedisStore) Promote(key string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := r.client.Persist(ctx, r.prefixed(key)).Err(); err != nil {
+	// Extend to a long finite TTL rather than Persist (no expiry): a
+	// finalized entry stays cached effectively forever, but one orphaned by
+	// a keyPrefix change still expires instead of leaking permanently.
+	if err := r.client.Expire(ctx, r.prefixed(key), foreverTTL).Err(); err != nil {
 		slog.Warn("redis cache promote failed", "key", key, "err", err)
 	}
 }

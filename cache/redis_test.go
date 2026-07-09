@@ -81,6 +81,13 @@ func TestRedisStore_Promote(t *testing.T) {
 	if !ok {
 		t.Fatal("expected promoted entry to survive TTL expiry")
 	}
+
+	// The promoted key must keep a finite TTL, not be persisted forever —
+	// otherwise a key orphaned by a keyPrefix change would leak permanently.
+	ttl := mr.TTL("k1")
+	if ttl <= 0 {
+		t.Fatalf("promoted key must retain a finite TTL, got %v", ttl)
+	}
 }
 
 func TestRedisStore_KeyPrefixIsolation(t *testing.T) {

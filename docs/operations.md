@@ -267,7 +267,7 @@ cache:
 
 `keyPrefix` defaults to `ebeacon:<networkId>:`, which keeps networks sharing a Redis database isolated from each other's scan-based cache operations (finality promotion, reorg purge, size metrics). If you override it, keep the prefix unique per network.
 
-> **Upgrade note:** deployments that previously ran with no explicit `keyPrefix` will see a one-time cold cache after upgrading — entries under the old empty prefix are orphaned and expire via their TTLs.
+> **Upgrade note:** deployments that previously ran with no explicit `keyPrefix` will see a one-time cold cache after upgrading — entries under the old empty prefix are orphaned. They expire on their own: finalized ("cache forever") entries carry a finite 365-day TTL rather than being persisted indefinitely, so orphaned keys clear without a manual flush.
 
 For shared state across replicas:
 
