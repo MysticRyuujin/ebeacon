@@ -5,6 +5,7 @@ package network
 import (
 	"bufio"
 	"context"
+	"errors"
 	"hash/fnv"
 	"io"
 	"log/slog"
@@ -220,7 +221,9 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 	slog.Debug("sse: upstream connected", "network", r.networkID, "upstream", u.ID)
 
 	// Read line-by-line without Scanner's fixed token limit; beacon events may
-	// include large payloads for some topics.
+	// include large payloads for some topics. Lines are capped so a stream
+	// that never sends a newline can't grow memory unbounded before the
+	// per-event size check downstream ever runs.
 	reader := bufio.NewReader(resp.Body)
 	var event strings.Builder
 	type readResult struct {
@@ -232,7 +235,7 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 	defer close(done)
 	go func() {
 		for {
-			line, readErr := reader.ReadString('\n')
+			line, readErr := readCappedLine(reader, sseMaxEventBytes)
 			select {
 			case readCh <- readResult{line: line, err: readErr}:
 			case <-done:
@@ -312,6 +315,29 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 			}
 			return true
 		}
+	}
+}
+
+// errSSELineTooLong signals that a single line exceeded the cap without a
+// newline — an abusive or broken upstream. The reader stops so memory can't
+// grow past the cap plus one bufio buffer.
+var errSSELineTooLong = errors.New("sse: line exceeds size cap")
+
+// readCappedLine reads up to and including the next '\n', or until max bytes
+// have accumulated without one, in which case it returns the partial line and
+// errSSELineTooLong instead of buffering the rest of a newline-free stream.
+func readCappedLine(r *bufio.Reader, max int) (string, error) {
+	var sb strings.Builder
+	for {
+		chunk, err := r.ReadSlice('\n')
+		sb.Write(chunk)
+		if err == bufio.ErrBufferFull {
+			if sb.Len() > max {
+				return sb.String(), errSSELineTooLong
+			}
+			continue
+		}
+		return sb.String(), err
 	}
 }
 

@@ -1,6 +1,7 @@
 package network
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"net/http"
@@ -607,4 +608,37 @@ func TestSSERelay_ReconnectsOnIdleUpstream(t *testing.T) {
 	if connects < 2 {
 		t.Fatalf("silent upstream must trigger reconnects, got %d connects", connects)
 	}
+}
+
+func TestReadCappedLine_NewlineFreeStreamBailsAtCap(t *testing.T) {
+	t.Parallel()
+	// A reader that yields 'x' forever, never a newline, must not accumulate
+	// without bound: readCappedLine bails once it exceeds the cap.
+	const capBytes = 4096
+	inf := bufio.NewReader(neverEndingReader('x'))
+	line, err := readCappedLine(inf, capBytes)
+	if err != errSSELineTooLong {
+		t.Fatalf("expected errSSELineTooLong, got %v", err)
+	}
+	if len(line) > capBytes+64<<10 {
+		t.Fatalf("capped line grew too large: %d bytes", len(line))
+	}
+}
+
+func TestReadCappedLine_NormalLine(t *testing.T) {
+	t.Parallel()
+	r := bufio.NewReader(strings.NewReader("data: hello\n"))
+	line, err := readCappedLine(r, 4096)
+	if err != nil || line != "data: hello\n" {
+		t.Fatalf("got %q, %v", line, err)
+	}
+}
+
+type neverEndingReader byte
+
+func (b neverEndingReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = byte(b)
+	}
+	return len(p), nil
 }
