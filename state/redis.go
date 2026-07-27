@@ -133,18 +133,25 @@ func (rs *RedisState) SubscribeHead() <-chan HeadUpdate {
 
 func (rs *RedisState) PublishFinalized(network string, epoch uint64) {
 	rs.finalizedMu.Lock()
-	if epoch <= rs.finalized[network] {
-		rs.finalizedMu.Unlock()
+	skip := epoch <= rs.finalized[network]
+	rs.finalizedMu.Unlock()
+	if skip {
 		return
 	}
-	rs.finalized[network] = epoch
-	rs.finalizedMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := finalizedEpochScript.Run(ctx, rs.client, []string{finalizedKeyFor(network)}, epoch).Err(); err != nil {
+		// Leave the local map untouched so the next call retries the write.
 		slog.Warn("redis set finalized epoch failed", "network", network, "err", err)
+		return
 	}
+
+	rs.finalizedMu.Lock()
+	if epoch > rs.finalized[network] {
+		rs.finalized[network] = epoch
+	}
+	rs.finalizedMu.Unlock()
 }
 
 func (rs *RedisState) GetFinalized(network string) uint64 {

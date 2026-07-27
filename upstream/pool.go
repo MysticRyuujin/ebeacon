@@ -3,6 +3,7 @@ package upstream
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"path"
 	"sort"
@@ -313,13 +314,14 @@ func (p *Pool) SelectByGlobForPath(pattern, apiPath string, n int) []*Upstream {
 	return p.selectFromCandidatesForPath(all, n, apiPath, false)
 }
 
-// ByGlob returns the first ready upstream whose ID matches the glob pattern.
-// Pattern syntax follows path.Match: * matches any sequence of non-separator characters.
+// ByGlob returns the first ready, non-forked upstream whose ID matches the
+// glob pattern. Pattern syntax follows path.Match: * matches any sequence of
+// non-separator characters.
 func (p *Pool) ByGlob(pattern string) *Upstream {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for _, u := range p.upstreams {
-		if matched, _ := path.Match(pattern, u.ID); matched {
+		if matched, _ := path.Match(pattern, u.ID); matched && u.IsReady() && !p.blockCache.IsForked(u.ID) {
 			return u
 		}
 	}
@@ -576,26 +578,48 @@ func (p *Pool) FinalizedSlot() uint64 {
 	return epoch * p.SlotsPerEpoch()
 }
 
-// UpdateFinalizedEpoch merges a finalized epoch into the pool aggregate and
-// publishes it to shared state so other instances learn about it.
-func (p *Pool) UpdateFinalizedEpoch(epoch uint64) {
-	for {
-		old := p.finalizedEpoch.Load()
-		if epoch <= old {
-			return
-		}
-		if p.finalizedEpoch.CompareAndSwap(old, epoch) {
-			if p.sharedState != nil {
-				p.sharedState.PublishFinalized(p.networkID, epoch)
+// UpdateFinalizedEpoch merges a finalized epoch into the pool aggregate,
+// publishes the merged value to shared state, and returns it. Epochs beyond
+// the wall-clock epoch are rejected so one cross-chain/faulty upstream cannot
+// permanently poison finality-based cache promotion; the merged value is
+// offered to shared state even when unchanged so failed publishes retry on
+// the next finality probe.
+func (p *Pool) UpdateFinalizedEpoch(epoch uint64) uint64 {
+	if p.plausibleFinalizedEpoch(epoch) {
+		for {
+			old := p.finalizedEpoch.Load()
+			if epoch <= old || p.finalizedEpoch.CompareAndSwap(old, epoch) {
+				break
 			}
-			return
 		}
+	} else {
+		slog.Warn("rejecting implausible finalized epoch",
+			"network", p.networkID, "epoch", epoch)
 	}
+	merged := p.finalizedEpoch.Load()
+	if p.sharedState != nil && merged > 0 {
+		p.sharedState.PublishFinalized(p.networkID, merged)
+	}
+	return merged
+}
+
+func (p *Pool) plausibleFinalizedEpoch(epoch uint64) bool {
+	currentSlot, ok := p.blockCache.CurrentWallClockSlot()
+	if !ok {
+		return true
+	}
+	return epoch <= currentSlot/p.SlotsPerEpoch()
 }
 
 // seedFinalizedEpoch updates the pool's finalized epoch without publishing to
-// shared state, used when seeding from shared state on startup.
+// shared state, used when seeding from shared state on startup. The
+// plausibility guard applies so poisoned shared state is not reinstated.
 func (p *Pool) seedFinalizedEpoch(epoch uint64) {
+	if !p.plausibleFinalizedEpoch(epoch) {
+		slog.Warn("rejecting implausible finalized epoch from shared state",
+			"network", p.networkID, "epoch", epoch)
+		return
+	}
 	for {
 		old := p.finalizedEpoch.Load()
 		if epoch <= old {
@@ -791,8 +815,12 @@ func (p *Pool) weightedRandomWithinPriority(ups []*Upstream, rng *orderRNG) []*U
 }
 
 func (p *Pool) weightedScoreWithinPriority(ups []*Upstream, canonicalSlot uint64, weights config.ScoreWeightsConfig, rng *orderRNG, apiPath string) []*Upstream {
+	scores := make(map[*Upstream]float64, len(ups))
+	for _, u := range ups {
+		scores[u] = p.scoreDetailsWithWeights(u, canonicalSlot, weights, apiPath).Score
+	}
 	return weightedOrderWithoutReplacement(ups, rng, func(u *Upstream) float64 {
-		return p.scoreDetailsWithWeights(u, canonicalSlot, weights, apiPath).Score
+		return scores[u]
 	})
 }
 

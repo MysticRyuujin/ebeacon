@@ -23,6 +23,10 @@ func WrapWithCORS(next http.Handler, cors *config.CORSConfig) http.Handler {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Vary on every response — shared caches must not replay a variant
+		// negotiated for one Origin to a different one.
+		addCORSVary(w.Header(), r)
+
 		origin := strings.TrimSpace(r.Header.Get("Origin"))
 		if origin == "" {
 			next.ServeHTTP(w, r)
@@ -41,7 +45,6 @@ func WrapWithCORS(next http.Handler, cors *config.CORSConfig) http.Handler {
 		}
 
 		if r.Method == http.MethodOptions {
-			addCORSVary(w.Header(), r)
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}

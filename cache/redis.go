@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/mysticryuujin/ebeacon/config"
@@ -32,7 +34,16 @@ type redisEntry struct {
 type RedisStore struct {
 	client    *redis.Client
 	keyPrefix string
+
+	countMu sync.Mutex
+	count   int
+	countAt time.Time
 }
+
+// lenCacheTTL bounds how often Len runs a full keyspace SCAN; Get/Set/Delete
+// call Len on every operation and would otherwise hammer Redis. The window
+// also throttles retries while Redis is erroring.
+const lenCacheTTL = 10 * time.Second
 
 // NewRedisStore creates a RedisStore from the given config.
 func NewRedisStore(cfg *config.RedisCacheConfig) (*RedisStore, error) {
@@ -178,7 +189,41 @@ func (r *RedisStore) Entries(limit int, includeBody bool) []*Entry {
 	return entries
 }
 
+func (r *RedisStore) Keys() []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var keys []string
+	var cursor uint64
+	pattern := r.prefixed("*")
+	for {
+		batch, next, err := r.client.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			slog.Warn("redis cache keys scan failed", "err", err)
+			break
+		}
+		for _, k := range batch {
+			// MATCH treats *, ?, [ in the prefix as glob syntax, so a scanned
+			// key is not guaranteed to start with the literal prefix.
+			if trimmed, ok := strings.CutPrefix(k, r.keyPrefix); ok {
+				keys = append(keys, trimmed)
+			}
+		}
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
+	return keys
+}
+
 func (r *RedisStore) Len() int {
+	r.countMu.Lock()
+	defer r.countMu.Unlock()
+	if time.Since(r.countAt) < lenCacheTTL {
+		return r.count
+	}
+	r.countAt = time.Now()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	var count int
@@ -187,7 +232,7 @@ func (r *RedisStore) Len() int {
 	for {
 		keys, next, err := r.client.Scan(ctx, cursor, pattern, 100).Result()
 		if err != nil {
-			return 0
+			return r.count
 		}
 		count += len(keys)
 		if next == 0 {
@@ -195,6 +240,7 @@ func (r *RedisStore) Len() int {
 		}
 		cursor = next
 	}
+	r.count = count
 	return count
 }
 

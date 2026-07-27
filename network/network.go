@@ -156,7 +156,9 @@ var gzipPool = sync.Pool{
 		return gz
 	},
 }
-var noisyCacheQueryPathRe = regexp.MustCompile(`^/eth/v\d+/node/(?:peers|peer_count|syncing)$`)
+var noisyCacheQueryPathRe = regexp.MustCompile(`^/eth/v\d+/node/(?:peer_count|syncing)$`)
+
+var peersCacheQueryPathRe = regexp.MustCompile(`^/eth/v\d+/node/peers$`)
 
 // ethConsensusHeaders are Ethereum Beacon API response headers defined in the
 // consensus spec that clients depend on to interpret response bodies correctly.
@@ -1736,14 +1738,19 @@ func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Req
 		return nil, err
 	}
 
-	// Decompress gzip upstream response so caching and body processing work correctly
+	// Decompress gzip upstream response so caching and body processing work correctly.
+	// NewReader consumes leading bytes before failing, so a failure cannot fall
+	// back to forwarding the (now truncated) body — treat it as an upstream error.
 	if resp.Header.Get("Content-Encoding") == "gzip" {
 		gr, gErr := gzip.NewReader(resp.Body)
-		if gErr == nil {
-			resp.Body = &gzipReadCloser{gzip: gr, orig: resp.Body}
-			resp.Header.Del("Content-Encoding")
-			resp.Header.Del("Content-Length")
+		if gErr != nil {
+			resp.Body.Close() //nolint:errcheck
+			u.DecrActive()
+			return nil, fmt.Errorf("invalid gzip response body: %w", gErr)
 		}
+		resp.Body = &gzipReadCloser{gzip: gr, orig: resp.Body}
+		resp.Header.Del("Content-Encoding")
+		resp.Header.Del("Content-Length")
 	}
 
 	return u.TrackResponse(resp), nil
@@ -1871,8 +1878,22 @@ func pathAndQueryForCache(u *url.URL) string {
 	q.Del("use-upstream")
 	q.Del("token")
 	// Default node cache policies don't use arbitrary query args; drop all query
-	// params to prevent cache-key explosion via random noise.
+	// params to prevent cache-key explosion via random noise. /node/peers is the
+	// exception: its spec-defined state/direction filters change the response,
+	// so keep those (and only those).
 	if noisyCacheQueryPathRe.MatchString(path) {
+		return path
+	}
+	if peersCacheQueryPathRe.MatchString(path) {
+		filtered := url.Values{}
+		for _, k := range []string{"state", "direction"} {
+			if vs, ok := q[k]; ok {
+				filtered[k] = vs
+			}
+		}
+		if enc := filtered.Encode(); enc != "" {
+			return path + "?" + enc
+		}
 		return path
 	}
 	if enc := q.Encode(); enc != "" {

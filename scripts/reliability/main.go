@@ -1211,7 +1211,7 @@ func printFinalReport(cfg config, c *counters, log *mismatchLog, files *pprofFil
 
 	pprofPaths := files.all()
 	if len(pprofPaths) > 0 {
-		fmt.Printf("  pprof files (%d saved to %s):\n", len(pprofPaths), pprofPaths[0][:strings.LastIndex(pprofPaths[0], "/")])
+		fmt.Printf("  pprof files (%d saved to %s):\n", len(pprofPaths), filepath.Dir(pprofPaths[0]))
 		for _, p := range pprofPaths {
 			name := filepath.Base(p)
 			if strings.HasSuffix(name, ".pprof") {

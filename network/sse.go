@@ -151,12 +151,12 @@ func (r *SSERelay) Serve(w http.ResponseWriter, req *http.Request, preferUpstrea
 			metricSSEReconnects.WithLabelValues(r.networkID).Inc()
 			slog.Info("sse: upstream disconnected, reconnecting",
 				"network", r.networkID, "upstream", u.ID)
-			if !required.enabled() {
-				stickyID = "" // don't prefer the failed upstream
-			}
 		} else if required.enabled() && !headersSent {
 			http.Error(w, "selected upstream unavailable", http.StatusServiceUnavailable)
 			return
+		}
+		if !required.enabled() {
+			stickyID = "" // don't prefer the failed upstream
 		}
 
 		select {

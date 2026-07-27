@@ -111,6 +111,27 @@ func (m *MemoryStore) Entries(limit int, includeBody bool) []*Entry {
 	return entries
 }
 
+func (m *MemoryStore) Keys() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	keys := make([]string, 0, m.lru.Len())
+	for el := m.lru.Front(); el != nil; {
+		next := el.Next()
+		entry := el.Value.(*Entry)
+		if !entry.expires.IsZero() && now.After(entry.expires) {
+			m.lru.Remove(el)
+			delete(m.items, entry.key)
+			el = next
+			continue
+		}
+		keys = append(keys, entry.key)
+		el = next
+	}
+	return keys
+}
+
 func (m *MemoryStore) Len() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()

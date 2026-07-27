@@ -53,6 +53,30 @@ func (bc *BlockCache) SetSlotTiming(genesisTime, secondsPerSlot int64) {
 	bc.secondsPerSlot = secondsPerSlot
 }
 
+func (bc *BlockCache) currentWallClockSlotLocked() (uint64, bool) {
+	const clockSkewTolerance = 10 * time.Minute
+	if bc.genesisTime <= 0 {
+		return 0, false
+	}
+	now := time.Now().Unix()
+	if now <= bc.genesisTime {
+		return 0, false
+	}
+	slotSeconds := bc.secondsPerSlot
+	if slotSeconds <= 0 {
+		slotSeconds = 12
+	}
+	elapsed := now - bc.genesisTime + int64(clockSkewTolerance.Seconds())
+	return uint64(elapsed) / uint64(slotSeconds), true
+}
+
+// CurrentWallClockSlot returns ok=false when genesis time is unknown (callers fail open).
+func (bc *BlockCache) CurrentWallClockSlot() (uint64, bool) {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return bc.currentWallClockSlotLocked()
+}
+
 // AddBlock records a block header seen by the given upstream.
 func (bc *BlockCache) AddBlock(upstreamID string, slot uint64, root, parentRoot string) {
 	bc.mu.Lock()
@@ -67,19 +91,8 @@ func (bc *BlockCache) AddBlock(upstreamID string, slot uint64, root, parentRoot 
 	// clock otherwise drops every real head and silently freezes fork
 	// detection. Cross-chain/corrupt slots are off by millions, so a generous
 	// margin still catches them.
-	const clockSkewTolerance = 10 * time.Minute
-	slotSeconds := bc.secondsPerSlot
-	if slotSeconds <= 0 {
-		slotSeconds = 12
-	}
-	if bc.genesisTime > 0 {
-		if now := time.Now().Unix(); now > bc.genesisTime {
-			elapsed := now - bc.genesisTime + int64(clockSkewTolerance.Seconds())
-			currentSlot := uint64(elapsed) / uint64(slotSeconds)
-			if slot > currentSlot {
-				return
-			}
-		}
+	if currentSlot, ok := bc.currentWallClockSlotLocked(); ok && slot > currentSlot {
+		return
 	}
 
 	if slot > bc.maxSlot {

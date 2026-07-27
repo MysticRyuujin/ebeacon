@@ -128,6 +128,27 @@ func TestWrapWithCORS_DisallowedOriginContinuesWithoutHeaders(t *testing.T) {
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
 		t.Fatalf("unexpected allow origin header %q", got)
 	}
+	if !hasVaryValue(rec.Header(), "Origin") {
+		t.Fatal("disallowed-origin response must carry Vary: Origin so shared caches don't mix variants")
+	}
+}
+
+func TestWrapWithCORS_AbsentOriginStillVaries(t *testing.T) {
+	t.Parallel()
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := WrapWithCORS(next, &config.CORSConfig{
+		AllowedOrigins: []string{"https://app.example.com"},
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil))
+
+	if !hasVaryValue(rec.Header(), "Origin") {
+		t.Fatal("no-Origin response must carry Vary: Origin so shared caches don't mix variants")
+	}
 }
 
 func TestWrapWithCORS_WildcardOriginWithCredentialsEchoesOrigin(t *testing.T) {

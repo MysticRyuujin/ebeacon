@@ -11,5 +11,6 @@ type Store interface {
 	Delete(key string)
 	Promote(key string) // set TTL to forever
 	Entries(limit int, includeBody bool) []*Entry
+	Keys() []string
 	Len() int
 }

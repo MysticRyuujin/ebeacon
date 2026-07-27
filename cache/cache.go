@@ -279,11 +279,10 @@ func (c *Cache) Delete(key string) {
 // PurgeIf removes all non-expired entries whose key satisfies fn and returns
 // the number of entries deleted. It is safe to call concurrently.
 func (c *Cache) PurgeIf(fn func(key string) bool) int {
-	entries := c.Entries(0, false)
 	n := 0
-	for _, e := range entries {
-		if fn(e.Key) {
-			c.Delete(e.Key)
+	for _, key := range c.store.Keys() {
+		if fn(key) {
+			c.Delete(key)
 			n++
 		}
 	}
@@ -295,12 +294,11 @@ func (c *Cache) PurgeIf(fn func(key string) bool) int {
 // single scan instead of the two scans required by separate matchingCacheKeys +
 // PurgeIf calls.
 func (c *Cache) PurgeCollect(fn func(key string) bool) (int, []string) {
-	entries := c.Entries(0, false)
 	var keys []string
-	for _, e := range entries {
-		if fn(e.Key) {
-			c.Delete(e.Key)
-			keys = append(keys, e.Key)
+	for _, key := range c.store.Keys() {
+		if fn(key) {
+			c.Delete(key)
+			keys = append(keys, key)
 		}
 	}
 	return len(keys), keys

@@ -909,6 +909,9 @@ func TestValidateAuth(t *testing.T) {
 		{"tier without name", AuthConfig{Tiers: []TierConfig{{}}}, "name is required"},
 		{"duplicate tier", AuthConfig{Tiers: []TierConfig{{Name: "t"}, {Name: "t"}}}, "duplicate tier name"},
 		{"bad tier limit", AuthConfig{Tiers: []TierConfig{{Name: "t", RateLimiting: &RateLimitConfig{Limit: -1}}}}, "limit must be > 0"},
+		{"no credentials at all", AuthConfig{}, "no secret or keys"},
+		{"tiers only", AuthConfig{Tiers: []TierConfig{{Name: "t"}}}, "no secret or keys"},
+		{"default key with legacy secret", AuthConfig{Secret: "legacy", Keys: []APIKeyConfig{{ID: "default", Secret: "s"}}}, "conflicts with the legacy secret"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -997,5 +1000,56 @@ networks:
 	_, err := Load(path)
 	if err == nil || !strings.Contains(err.Error(), "ui.basePath") {
 		t.Fatalf("ui.basePath \"/\" must be rejected (would panic ServeMux), got: %v", err)
+	}
+}
+
+func TestLoad_MetricsPathCollisions(t *testing.T) {
+	t.Parallel()
+	mkCfg := func(metricsPath, uiBlock string) string {
+		return strings.TrimSpace(`
+server: { host: "0.0.0.0", port: 5555, maxTimeout: 60s }
+health: { checkInterval: 15s, finalityInterval: 60s, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: true, path: "` + metricsPath + `" }
+` + uiBlock + `
+networks:
+  - id: mainnet
+    upstreams: [{ id: a, url: "http://a" }]
+    routing: { loadBalancing: round-robin }
+`)
+	}
+	uiBlock := strings.TrimSpace(`
+ui:
+  enabled: true
+  basePath: /webui
+  auth: { keys: [{ id: dash, secret: s }] }
+`)
+	tests := []struct {
+		name    string
+		content string
+		wantSub string
+	}{
+		{"root path", mkCfg("/", ""), "metrics.path"},
+		{"ui collision", mkCfg("/webui/", uiBlock), "conflicts with ui.basePath"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "ebeacon.yaml")
+			if err := os.WriteFile(path, []byte(tt.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), tt.wantSub) {
+				t.Fatalf("expected error containing %q, got: %v", tt.wantSub, err)
+			}
+		})
+	}
+	valid := filepath.Join(t.TempDir(), "ebeacon.yaml")
+	if err := os.WriteFile(valid, []byte(mkCfg("/metrics", "")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(valid); err != nil {
+		t.Fatalf("valid metrics.path rejected: %v", err)
 	}
 }

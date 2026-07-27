@@ -1615,6 +1615,53 @@ func TestBuildCacheKey_DropsNoisyNodeQueryParams(t *testing.T) {
 	}
 }
 
+func TestBuildCacheKey_PeersKeepsStateAndDirectionFilters(t *testing.T) {
+	u := &url.URL{Path: "/eth/v1/node/peers", RawQuery: "state=connected"}
+	req := &http.Request{Method: http.MethodGet, URL: u}
+
+	connected := buildCacheKey("mainnet", req, "")
+	u.RawQuery = "state=disconnected"
+	disconnected := buildCacheKey("mainnet", req, "")
+	if connected == disconnected {
+		t.Fatalf("peers state filter must produce distinct cache keys, both %q", connected)
+	}
+
+	u.RawQuery = "state=connected&state=connecting&direction=inbound&fuzz=1"
+	multi1 := buildCacheKey("mainnet", req, "")
+	u.RawQuery = "direction=inbound&state=connected&state=connecting&fuzz=2"
+	multi2 := buildCacheKey("mainnet", req, "")
+	if multi1 != multi2 {
+		t.Fatalf("noise must still be dropped and multi-valued filters kept: %q vs %q", multi1, multi2)
+	}
+	if multi1 == connected {
+		t.Fatal("multi-valued filters must be part of the cache key")
+	}
+}
+
+func TestNetwork_InvalidGzipUpstreamBodyFails(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write([]byte("this is not gzip"))
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("mislabeled gzip body must fail as an upstream error, not be forwarded corrupt: got %d body %q",
+			rec.Code, rec.Body.String())
+	}
+}
+
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {

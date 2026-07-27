@@ -723,6 +723,12 @@ func (c *Config) validate() error {
 		if !strings.HasPrefix(c.Metrics.Path, "/") {
 			return fmt.Errorf("metrics.path must start with \"/\"")
 		}
+		if c.Metrics.Path == "/" {
+			return fmt.Errorf("metrics.path must not be \"/\" (it would shadow the proxy root)")
+		}
+		if c.UI.Enabled && strings.TrimRight(c.Metrics.Path, "/") == strings.TrimRight(c.UI.BasePath, "/") {
+			return fmt.Errorf("metrics.path %q conflicts with ui.basePath %q", c.Metrics.Path, c.UI.BasePath)
+		}
 	}
 	switch c.State.Driver {
 	case "local", "redis", "":
@@ -1080,6 +1086,16 @@ func validateAuth(auth *AuthConfig, ctx string) error {
 		if err := validateAuthRateLimit(key.RateLimiting, fmt.Sprintf("%s.keys[%d] rateLimiting", ctx, i)); err != nil {
 			return err
 		}
+	}
+	if auth.Secret != "" {
+		if _, dup := keyIDs["default"]; dup {
+			return fmt.Errorf("%s: key id \"default\" conflicts with the legacy secret, which authenticates as \"default\"", ctx)
+		}
+	}
+	// Checked after expansion: a secret like "${UNSET_VAR}" expands to empty,
+	// and empty-secret-with-no-keys would otherwise silently disable auth.
+	if auth.Secret == "" && len(auth.Keys) == 0 {
+		return fmt.Errorf("%s: no secret or keys configured (did an env var in \"secret\" expand to empty?)", ctx)
 	}
 	return nil
 }

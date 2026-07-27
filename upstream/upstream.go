@@ -151,7 +151,8 @@ type Upstream struct {
 	// Health state
 	mu             sync.RWMutex
 	health         HealthStatus
-	nodeProbeDown  bool
+	nodeVerdict    HealthStatus
+	syncVerdict    HealthStatus
 	headSlot       uint64
 	headRoot       string
 	syncDistance   uint64
@@ -206,6 +207,8 @@ func New(networkID string, cfg config.UpstreamConfig, defaultCB *config.CircuitB
 		Weight:       cfg.Weight,
 		Archive:      cfg.Archive,
 		health:       HealthUp,
+		nodeVerdict:  HealthUp,
+		syncVerdict:  HealthUp,
 		clientType:   ClientUnknown,
 		scorer:       NewScoreTracker(scoreWindowSize),
 		routeScorers: make(map[string]*ScoreTracker),
@@ -289,28 +292,50 @@ func (u *Upstream) Health() HealthStatus {
 	return u.health
 }
 
-// SetHealth updates the upstream health status.
-func (u *Upstream) SetHealth(h HealthStatus) {
-	u.mu.Lock()
-	old := u.health
-	u.health = h
-	u.mu.Unlock()
+// recomputeHealthLocked derives health = min(nodeVerdict, syncVerdict). The
+// two pollers run independently; deriving from per-source verdicts under one
+// lock is what stops a 206 node-health verdict and a healthy /syncing
+// response from flapping the shared state.
+func (u *Upstream) recomputeHealthLocked() (old, h HealthStatus) {
+	old = u.health
+	u.health = min(u.nodeVerdict, u.syncVerdict)
+	metricHealth.WithLabelValues(u.NetworkID, u.ID).Set(float64(u.health))
+	return old, u.health
+}
+
+func (u *Upstream) logHealthTransition(old, h HealthStatus) {
 	if old != h {
 		slog.Info("upstream health changed",
 			"network", u.NetworkID, "upstream", u.ID,
 			"from", healthName(old), "to", healthName(h))
 	}
-	metricHealth.WithLabelValues(u.NetworkID, u.ID).Set(float64(h))
 }
 
-// SetNodeProbeDown latches the latest /eth/v1/node/health verdict. While
-// latched, UpdateSyncStatus will not raise health above HealthDown — the two
-// pollers run independently and a healthy /syncing response used to flap the
-// upstream back Up between failing node-health probes.
-func (u *Upstream) SetNodeProbeDown(down bool) {
+// SetHealth overrides health directly: both probe verdicts reset to h, so
+// Health() returns exactly h until the next probe adjusts a verdict.
+func (u *Upstream) SetHealth(h HealthStatus) {
 	u.mu.Lock()
-	u.nodeProbeDown = down
+	u.nodeVerdict = h
+	u.syncVerdict = h
+	old, h := u.recomputeHealthLocked()
 	u.mu.Unlock()
+	u.logHealthTransition(old, h)
+}
+
+func (u *Upstream) setNodeVerdict(v HealthStatus) {
+	u.mu.Lock()
+	u.nodeVerdict = v
+	old, h := u.recomputeHealthLocked()
+	u.mu.Unlock()
+	u.logHealthTransition(old, h)
+}
+
+func (u *Upstream) setSyncVerdict(v HealthStatus) {
+	u.mu.Lock()
+	u.syncVerdict = v
+	old, h := u.recomputeHealthLocked()
+	u.mu.Unlock()
+	u.logHealthTransition(old, h)
 }
 
 // UpdateSyncStatus records the latest sync status.
@@ -319,23 +344,14 @@ func (u *Upstream) UpdateSyncStatus(isSyncing bool, headSlot, syncDistance uint6
 	u.isSyncing = isSyncing
 	u.headSlot = headSlot
 	u.syncDistance = syncDistance
-	old := u.health
-	switch {
-	case u.nodeProbeDown:
-		u.health = HealthDown
-	case isSyncing:
-		u.health = HealthDegraded
-	default:
-		u.health = HealthUp
+	if isSyncing {
+		u.syncVerdict = HealthDegraded
+	} else {
+		u.syncVerdict = HealthUp
 	}
-	h := u.health
+	old, h := u.recomputeHealthLocked()
 	u.mu.Unlock()
-	if old != h {
-		slog.Info("upstream health changed",
-			"network", u.NetworkID, "upstream", u.ID,
-			"from", healthName(old), "to", healthName(h))
-	}
-	metricHealth.WithLabelValues(u.NetworkID, u.ID).Set(float64(h))
+	u.logHealthTransition(old, h)
 	metricHeadSlot.WithLabelValues(u.NetworkID, u.ID).Set(float64(headSlot))
 	metricSyncDistance.WithLabelValues(u.NetworkID, u.ID).Set(float64(syncDistance))
 }

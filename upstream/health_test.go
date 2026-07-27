@@ -227,3 +227,113 @@ func TestCheckSync_ElOfflineDegraded(t *testing.T) {
 		t.Fatalf("el_offline must degrade the upstream, got %v", u.Health())
 	}
 }
+
+func syncedOrHealthHandler(healthStatus, syncStatus *atomic.Int64) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/eth/v1/node/health":
+			w.WriteHeader(int(healthStatus.Load()))
+		case "/eth/v1/node/syncing":
+			if s := int(syncStatus.Load()); s != http.StatusOK {
+				w.WriteHeader(s)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"head_slot":"100","sync_distance":"0","is_syncing":false,"el_offline":false}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+}
+
+func TestHealth_NoFlapBetween206AndHealthySync(t *testing.T) {
+	t.Parallel()
+	var healthStatus, syncStatus atomic.Int64
+	healthStatus.Store(http.StatusPartialContent)
+	syncStatus.Store(http.StatusOK)
+	srv := httptest.NewServer(syncedOrHealthHandler(&healthStatus, &syncStatus))
+	defer srv.Close()
+
+	h, u := testMonitor(t, srv.URL)
+	for i := 0; i < 3; i++ {
+		h.checkNodeHealth(context.Background(), u)
+		if u.Health() != HealthDegraded {
+			t.Fatalf("cycle %d after node-health probe: got %v want HealthDegraded", i, u.Health())
+		}
+		h.checkSync(context.Background(), u)
+		if u.Health() != HealthDegraded {
+			t.Fatalf("cycle %d after sync probe: got %v want HealthDegraded (flap)", i, u.Health())
+		}
+	}
+}
+
+func TestHealth_NoFlapBetween206AndSyncError(t *testing.T) {
+	t.Parallel()
+	var healthStatus, syncStatus atomic.Int64
+	healthStatus.Store(http.StatusPartialContent)
+	syncStatus.Store(http.StatusInternalServerError)
+	srv := httptest.NewServer(syncedOrHealthHandler(&healthStatus, &syncStatus))
+	defer srv.Close()
+
+	for name, first := range map[string]func(*HealthMonitor, *Upstream){
+		"sync-first": func(h *HealthMonitor, u *Upstream) { h.checkSync(context.Background(), u) },
+		"node-first": func(h *HealthMonitor, u *Upstream) { h.checkNodeHealth(context.Background(), u) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, u := testMonitor(t, srv.URL)
+			first(h, u)
+			h.checkSync(context.Background(), u)
+			for i := 0; i < 3; i++ {
+				h.checkNodeHealth(context.Background(), u)
+				if got := u.Health(); got != HealthDown {
+					t.Fatalf("cycle %d after node-health probe: got %v want HealthDown", i, got)
+				}
+				h.checkSync(context.Background(), u)
+				if got := u.Health(); got != HealthDown {
+					t.Fatalf("cycle %d after sync probe: got %v want HealthDown", i, got)
+				}
+			}
+		})
+	}
+}
+
+func TestHealth_NodeVerdictClearLiftsImmediately(t *testing.T) {
+	t.Parallel()
+	var healthStatus, syncStatus atomic.Int64
+	healthStatus.Store(http.StatusPartialContent)
+	syncStatus.Store(http.StatusOK)
+	srv := httptest.NewServer(syncedOrHealthHandler(&healthStatus, &syncStatus))
+	defer srv.Close()
+
+	h, u := testMonitor(t, srv.URL)
+	h.checkNodeHealth(context.Background(), u)
+	h.checkSync(context.Background(), u)
+	if u.Health() != HealthDegraded {
+		t.Fatalf("setup: got %v want HealthDegraded", u.Health())
+	}
+
+	healthStatus.Store(http.StatusOK)
+	h.checkNodeHealth(context.Background(), u)
+	if u.Health() != HealthUp {
+		t.Fatalf("cleared node verdict must lift health without waiting for a sync poll, got %v", u.Health())
+	}
+}
+
+func TestSetHealth_OverridesNodeVerdict(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	h, u := testMonitor(t, srv.URL)
+	h.checkNodeHealth(context.Background(), u)
+	if u.Health() != HealthDown {
+		t.Fatalf("setup: got %v want HealthDown", u.Health())
+	}
+
+	u.SetHealth(HealthUp)
+	if u.Health() != HealthUp {
+		t.Fatalf("SetHealth must override the latched node verdict, got %v", u.Health())
+	}
+}

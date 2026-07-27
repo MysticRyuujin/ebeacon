@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestClientIP_TrustedProxies(t *testing.T) {
@@ -56,4 +57,27 @@ func TestSetTrustedProxies_RejectsGarbage(t *testing.T) {
 		t.Fatal("expected error for invalid trusted proxy entry")
 	}
 	SetTrustedProxies(nil) //nolint:errcheck
+}
+
+func TestSessionManager_GetRefreshesLastSeen(t *testing.T) {
+	t.Parallel()
+	sm := newSessionManager(0, 0, 10*time.Minute)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "10.1.2.3:5000"
+
+	s := sm.Get(req)
+	stale := time.Now().Add(-time.Hour)
+	s.mu.Lock()
+	s.lastSeen = stale
+	s.mu.Unlock()
+
+	// Sticky-only configs never call Allow, so Get itself must keep active
+	// sessions alive or cleanup evicts them mid-traffic.
+	sm.Get(req)
+	s.mu.Lock()
+	got := s.lastSeen
+	s.mu.Unlock()
+	if !got.After(stale) {
+		t.Fatal("Get must refresh lastSeen for existing sessions")
+	}
 }

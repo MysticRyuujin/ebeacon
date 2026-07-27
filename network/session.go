@@ -87,7 +87,11 @@ func (sm *SessionManager) Get(r *http.Request) *Session {
 		}
 		s = &Session{ip: ip, limiter: lim, lastSeen: time.Now()}
 		sm.byIP[ip] = s
+		return s
 	}
+	s.mu.Lock()
+	s.lastSeen = time.Now()
+	s.mu.Unlock()
 	return s
 }
 

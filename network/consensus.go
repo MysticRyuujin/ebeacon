@@ -97,7 +97,12 @@ func (cp *ConsensusPolicy) Execute(
 				results[idx] = consensusResult{err: readErr, upstream: u}
 				return
 			}
-			u.CBSuccess()
+			if resp.StatusCode < 500 {
+				u.CBSuccess()
+			} else {
+				u.CBFailure()
+				u.RecordError()
+			}
 			results[idx] = consensusResult{
 				body:     body,
 				status:   resp.StatusCode,
@@ -123,27 +128,33 @@ func (cp *ConsensusPolicy) Execute(
 		return h.Sum64()
 	}
 	counts := make(map[bodyKey]int)
-	byKey := make(map[bodyKey]consensusResult)
 	for _, r := range results {
 		if r.err != nil {
 			continue
 		}
-		k := bodyKey{status: r.status, body: hashBody(r.body)}
-		counts[k]++
-		byKey[k] = r
+		counts[bodyKey{status: r.status, body: hashBody(r.body)}]++
 	}
 
-	// Find majority
-	for k, count := range counts {
-		if count >= cp.AgreementThreshold {
-			r := byKey[k]
-			resp := &http.Response{
-				StatusCode: r.status,
-				Header:     r.headers,
-				Body:       io.NopCloser(bytes.NewReader(r.body)),
-			}
-			return resp, r.upstream, nil
+	// Pick the largest agreeing group, walking results in participant order so
+	// ties break deterministically instead of by map iteration.
+	var best consensusResult
+	bestCount := 0
+	for _, r := range results {
+		if r.err != nil {
+			continue
 		}
+		if n := counts[bodyKey{status: r.status, body: hashBody(r.body)}]; n > bestCount {
+			best = r
+			bestCount = n
+		}
+	}
+	if bestCount >= cp.AgreementThreshold {
+		resp := &http.Response{
+			StatusCode: best.status,
+			Header:     best.headers,
+			Body:       io.NopCloser(bytes.NewReader(best.body)),
+		}
+		return resp, best.upstream, nil
 	}
 
 	return nil, nil, fmt.Errorf("consensus not reached: %d participants, need %d agreement", n, cp.AgreementThreshold)

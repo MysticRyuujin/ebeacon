@@ -384,8 +384,13 @@ func (w *headWatcher) handleFinalizedCheckpoint(data string) {
 		return
 	}
 
-	// Pool epoch tracking is independent of caching and must always run.
-	w.pool.UpdateFinalizedEpoch(epoch)
+	// Pool epoch tracking is independent of caching and must always run. Cache
+	// promotion below uses the pool-accepted epoch, not the raw event value, so
+	// an implausible epoch rejected by the pool cannot promote anything.
+	epoch = w.pool.UpdateFinalizedEpoch(epoch)
+	if epoch == 0 {
+		return
+	}
 
 	// Cache promotion only applies when caching is enabled.
 	if w.cache == nil {

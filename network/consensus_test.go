@@ -225,3 +225,60 @@ func TestConsensusPolicy_ClientCancelDoesNotTripBreaker(t *testing.T) {
 		}
 	}
 }
+
+func TestConsensusPolicy_LargestGroupWins(t *testing.T) {
+	t.Parallel()
+	majority := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":"majority"}`))
+	}))
+	defer majority.Close()
+	minority := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":"minority"}`))
+	}))
+	defer minority.Close()
+
+	// Threshold 1 qualifies both groups; the larger group must win every
+	// time, not whichever a map walk happens to visit first.
+	cp := &ConsensusPolicy{MaxParticipants: 3, AgreementThreshold: 1}
+	ups := []*upstream.Upstream{
+		mkConsensusUpstream("a", majority.URL),
+		mkConsensusUpstream("b", minority.URL),
+		mkConsensusUpstream("c", majority.URL),
+	}
+
+	for i := 0; i < 20; i++ {
+		resp, _, err := cp.Execute(context.Background(), ups, func(u *upstream.Upstream) (*http.Request, error) {
+			return http.NewRequest(http.MethodGet, u.URL, nil)
+		})
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(body), "majority") {
+			t.Fatalf("iteration %d: minority group won: %s", i, body)
+		}
+	}
+}
+
+func TestConsensusPolicy_ServerErrorOpensBreaker(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	u := upstream.New("testnet", config.UpstreamConfig{ID: "a", URL: srv.URL},
+		&config.CircuitBreakerConfig{FailureThreshold: 1, SuccessThreshold: 1, HalfOpenAfter: time.Hour}, 100)
+	cp := &ConsensusPolicy{MaxParticipants: 1, AgreementThreshold: 1}
+
+	_, _, _ = cp.Execute(context.Background(), []*upstream.Upstream{u}, func(u *upstream.Upstream) (*http.Request, error) {
+		return http.NewRequest(http.MethodGet, u.URL, nil)
+	})
+
+	if u.IsReady() {
+		t.Fatal("a 5xx consensus response must count as a circuit-breaker failure")
+	}
+}

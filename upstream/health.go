@@ -3,7 +3,6 @@ package upstream
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -82,6 +81,17 @@ func (h *HealthMonitor) recordProbeError(u *Upstream) {
 	h.pool.RefreshUpstreamScoreMetrics(u)
 }
 
+func probeRequest(ctx context.Context, u *Upstream, path string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.URL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range u.Headers {
+		req.Header.Set(k, v)
+	}
+	return req, nil
+}
+
 func (h *HealthMonitor) start(ctx context.Context) {
 	for _, u := range h.upstreams {
 		go h.monitorSync(ctx, u)
@@ -128,17 +138,16 @@ func (h *HealthMonitor) checkSync(ctx context.Context, u *Upstream) {
 	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet,
-		fmt.Sprintf("%s/eth/v1/node/syncing", u.URL), nil)
+	req, err := probeRequest(checkCtx, u, "/eth/v1/node/syncing")
 	if err != nil {
-		u.SetHealth(HealthDown)
+		u.setSyncVerdict(HealthDown)
 		return
 	}
 
 	resp, err := u.Client.Do(req)
 	if err != nil {
 		slog.Warn("health check failed", "network", u.NetworkID, "upstream", u.ID, "err", err)
-		u.SetHealth(HealthDown)
+		u.setSyncVerdict(HealthDown)
 		h.recordProbeError(u)
 		return
 	}
@@ -146,7 +155,7 @@ func (h *HealthMonitor) checkSync(ctx context.Context, u *Upstream) {
 
 	if resp.StatusCode != http.StatusOK {
 		slog.Warn("health check bad status", "network", u.NetworkID, "upstream", u.ID, "status", resp.StatusCode)
-		u.SetHealth(HealthDown)
+		u.setSyncVerdict(HealthDown)
 		h.recordProbeError(u)
 		return
 	}
@@ -154,13 +163,20 @@ func (h *HealthMonitor) checkSync(ctx context.Context, u *Upstream) {
 	var s syncStatusResponse
 	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
 		slog.Error("health check decode error", "network", u.NetworkID, "upstream", u.ID, "err", err)
-		u.SetHealth(HealthDown)
+		u.setSyncVerdict(HealthDown)
 		h.recordProbeError(u)
 		return
 	}
 
-	headSlot, _ := strconv.ParseUint(s.Data.HeadSlot, 10, 64)
-	syncDistance, _ := strconv.ParseUint(s.Data.SyncDistance, 10, 64)
+	headSlot, headErr := strconv.ParseUint(s.Data.HeadSlot, 10, 64)
+	syncDistance, distErr := strconv.ParseUint(s.Data.SyncDistance, 10, 64)
+	if headErr != nil || distErr != nil {
+		slog.Error("health check decode error", "network", u.NetworkID, "upstream", u.ID,
+			"head_slot", s.Data.HeadSlot, "sync_distance", s.Data.SyncDistance)
+		u.setSyncVerdict(HealthDown)
+		h.recordProbeError(u)
+		return
+	}
 	// Nodes can report is_syncing=false while still many slots behind (e.g. they
 	// consider themselves synced to a minority fork). Apply our own threshold so
 	// we don't route validator traffic to a node that is effectively lagging.
@@ -186,8 +202,7 @@ func (h *HealthMonitor) checkFinality(ctx context.Context, u *Upstream) {
 	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet,
-		fmt.Sprintf("%s/eth/v1/beacon/states/head/finality_checkpoints", u.URL), nil)
+	req, err := probeRequest(checkCtx, u, "/eth/v1/beacon/states/head/finality_checkpoints")
 	if err != nil {
 		return
 	}
@@ -243,8 +258,7 @@ func (h *HealthMonitor) checkVersion(ctx context.Context, u *Upstream) {
 	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet,
-		fmt.Sprintf("%s/eth/v1/node/version", u.URL), nil)
+	req, err := probeRequest(checkCtx, u, "/eth/v1/node/version")
 	if err != nil {
 		return
 	}
@@ -303,8 +317,7 @@ func (h *HealthMonitor) checkHead(ctx context.Context, u *Upstream) {
 	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet,
-		fmt.Sprintf("%s/eth/v1/beacon/headers/head", u.URL), nil)
+	req, err := probeRequest(checkCtx, u, "/eth/v1/beacon/headers/head")
 	if err != nil {
 		return
 	}
@@ -368,8 +381,7 @@ func (h *HealthMonitor) checkNodeHealth(ctx context.Context, u *Upstream) {
 	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet,
-		fmt.Sprintf("%s/eth/v1/node/health", u.URL), nil)
+	req, err := probeRequest(checkCtx, u, "/eth/v1/node/health")
 	if err != nil {
 		return
 	}
@@ -377,8 +389,7 @@ func (h *HealthMonitor) checkNodeHealth(ctx context.Context, u *Upstream) {
 	resp, err := u.Client.Do(req)
 	if err != nil {
 		slog.Warn("node health check failed", "network", u.NetworkID, "upstream", u.ID, "err", err)
-		u.SetNodeProbeDown(true)
-		u.SetHealth(HealthDown)
+		u.setNodeVerdict(HealthDown)
 		h.recordProbeError(u)
 		return
 	}
@@ -386,21 +397,19 @@ func (h *HealthMonitor) checkNodeHealth(ctx context.Context, u *Upstream) {
 
 	switch resp.StatusCode {
 	case http.StatusOK: // 200: ready — defer to monitorSync for exact status
-		u.SetNodeProbeDown(false)
+		u.setNodeVerdict(HealthUp)
 		h.recordProbeSuccess(u, started)
 	case http.StatusPartialContent: // 206: syncing
-		u.SetNodeProbeDown(false)
-		u.SetHealth(HealthDegraded)
+		u.setNodeVerdict(HealthDegraded)
 		h.recordProbeSuccess(u, started)
 	case http.StatusServiceUnavailable: // 503: not ready
 		slog.Warn("node health check unhealthy", "network", u.NetworkID, "upstream", u.ID, "status", resp.StatusCode)
-		u.SetNodeProbeDown(true)
-		u.SetHealth(HealthDown)
+		u.setNodeVerdict(HealthDown)
 		h.recordProbeError(u)
 	default: // endpoint not answering the health question — defer to sync poller
 		slog.Debug("node health check returned unexpected status, deferring to sync poll",
 			"network", u.NetworkID, "upstream", u.ID, "status", resp.StatusCode)
-		u.SetNodeProbeDown(false)
+		u.setNodeVerdict(HealthUp)
 	}
 }
 
