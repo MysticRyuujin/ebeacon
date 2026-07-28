@@ -2,8 +2,6 @@
 
 eBeacon is a fault-tolerant, high-performance reverse proxy for Ethereum Beacon API nodes. It provides intelligent load balancing, response caching, canonical fork detection, request multiplexing, and multi-upstream reliability for consensus layer infrastructure.
 
-> ⚠️ **Pre-1.0.** Breaking changes to the YAML config schema and CLI flags can land at any time. APIs and metric names may move between releases. Run at your own risk.
-
 > ⚠️ **Not for validators.** eBeacon is a load balancer and cache for read-heavy Beacon API workloads (RPC clients, indexers, dashboards). It is **not** intended to sit between a validator client and its beacon node — caching and load balancing can violate the freshness and correctness guarantees a validator needs. If you want a fault-tolerant, validator-safe Beacon API load balancer, look at [Vero](https://github.com/serenita-org/vero).
 
 ## Features
@@ -26,7 +24,7 @@ eBeacon is a fault-tolerant, high-performance reverse proxy for Ethereum Beacon 
 - gzip compression (client-proxy and proxy-upstream)
 - Configurable CORS for browser clients and frontend apps
 - Dugtrio-style client routing (path prefix to specific upstreams)
-- Project routing with API key authentication
+- Network routing with API key authentication
 - SSE (Server-Sent Events) relay with reconnect and deduplication
 - Synthetic health endpoints for load balancers: `/healthz` and `/eth/v1/node/health`
 - Ethereum consensus header preservation
@@ -102,6 +100,17 @@ docker run -p 5555:5555 -v $(pwd)/ebeacon.yaml:/app/ebeacon.yaml ghcr.io/mysticr
 
 The image exposes port `5555` and expects a config file at `/app/ebeacon.yaml` (override by mounting your own file as shown).
 
+For the bundled local monitoring stack:
+
+```bash
+cp ebeacon.example.yaml ebeacon.local.yaml
+cp .env.example .env
+# Edit ebeacon.local.yaml with upstream URLs reachable from the container.
+docker compose up --build
+```
+
+Compose publishes eBeacon at `127.0.0.1:5555`, Prometheus at `127.0.0.1:19090`, and Grafana at `127.0.0.1:13000`. It also reserves `127.0.0.1:6060` for pprof, which remains disabled unless enabled in `ebeacon.local.yaml`; use `host: "0.0.0.0"` inside the container when enabling it. The host-side loopback bindings keep the developer stack local by default. Set non-default UI and Grafana secrets in `.env` before starting it.
+
 ## Developer Checks (Hooks + CI)
 
 Local git hooks are provided in `.githooks/`:
@@ -138,14 +147,12 @@ Both tools target a live eBeacon instance. The reliability harness can also comp
 CI (`.github/workflows/ci.yml`) enforces:
 
 - `gofmt` verification
-- `go mod verify`
+- module tidiness
 - `go vet`
 - `golangci-lint`
-- `go test -v -race -cover ./...`
-- `govulncheck`
-- Trivy filesystem + image vulnerability scanning
-- Docker image build smoke check
-- Optional SBOM generation/upload (`CI_GENERATE_SBOM=true` repository variable)
+- `go test -race ./...`
+
+Release tags (`v*`) trigger the separate release workflow, which builds and publishes multi-architecture Docker images and creates the GitHub Release. `make vuln` remains available as an explicit local dependency scan.
 
 Dependabot config is included at `.github/dependabot.yml` for weekly updates of:
 
@@ -156,6 +163,8 @@ Dependabot config is included at `.github/dependabot.yml` for weekly updates of:
 ## Configuration
 
 Configuration is YAML. See [`ebeacon.example.yaml`](ebeacon.example.yaml) for a full, commented reference covering top-level `networks`, Redis cache/state, and advanced routing.
+
+Unknown YAML fields are rejected to catch misspellings. Network and upstream IDs must match `[A-Za-z0-9][A-Za-z0-9._-]*` because they are used in URL routing, metrics labels, and dashboard identifiers.
 
 **Key sections:**
 
@@ -345,9 +354,9 @@ The default is `archive: false`, matching the CL default. Only mark upstreams yo
 
 Two mechanisms decide when archive upstreams get used:
 
-1. **Proactive classification.** Request paths that carry a numeric slot, epoch, or block root are classified up front. If the target is older than the per-endpoint retention window (blob sidecars ~18 days, blocks ~5 months, states ~27 hours, duties 1 epoch), eBeacon skips pruned upstreams on the first attempt and routes to archive-capable ones directly. Named identifiers (`head`, `finalized`, `justified`, `genesis`) and root-based lookups cannot be classified this way and flow through normal routing.
+1. **Proactive classification.** Request paths that carry a numeric slot or epoch are classified up front. If the target is older than the per-endpoint retention window (blob sidecars 4096 epochs, blocks 33024 epochs, states 8192 slots, duties 1 epoch), eBeacon skips pruned upstreams on the first attempt and routes to archive-capable ones directly. The epoch-based thresholds use the network's configured `slotsPerEpoch`. Named identifiers (`head`, `finalized`, `justified`, `genesis`) and root-based lookups cannot be classified this way because their slot is unknown, so they flow through normal routing.
 
-2. **Error-driven fallthrough.** If a pruned upstream returns a 404 for any historical-id path — by-root lookups, or requests that sat just inside our conservative retention threshold but outside the client's actual retention — eBeacon promotes the remaining retry budget to archive upstreams and continues the request without the client seeing the 404.
+2. **Error-driven fallthrough.** If a pruned upstream returns a 404 for a historical-id path — or a blob endpoint returns a recognized PeerDAS custody-related 400 — eBeacon promotes the remaining retry budget to archive upstreams and continues the request without exposing that response when an archive upstream succeeds. This covers by-root lookups and requests that sat just inside the conservative retention threshold but outside the client's actual retention.
 
 Priority still applies within the archive subset. A `priority: 0` local archive beats a `priority: 10` cloud archive. If no upstream is marked `archive: true`, behavior matches pre-archive releases: pruning-shaped 404s propagate to the client unchanged, and `ebeacon_pruning_error_no_archive_total` ticks so operators can see the signal that adding an archive upstream would help.
 
@@ -355,7 +364,7 @@ Relevant Prometheus metrics:
 
 - `ebeacon_upstream_archive{network,upstream}` — 1 if archive, 0 if pruned
 - `ebeacon_archive_promotion_total{network,reason}` — counter, `reason` is `proactive` or `pruning_error`
-- `ebeacon_pruning_error_no_archive_total{network}` — counter of pruning-shaped 404s returned because no archive upstream exists
+- `ebeacon_pruning_error_no_archive_total{network}` — counter of pruning-shaped responses returned because no archive upstream exists
 
 The bundled Grafana overview dashboard has an **Archive Routing** row covering all three.
 
@@ -391,23 +400,6 @@ For each request, roughly:
 4. **Cache lookup** — on cacheable methods/paths, return if hit.
 5. **Execute** — multiplex identical in-flight requests; apply retry, hedge, circuit breaker, optional consensus policy; forward to chosen upstream(s).
 6. **Response** — preserve Ethereum consensus headers, optional gzip, SSE handling where applicable.
-
-## Comparison with Dugtrio
-
-| Feature                | eBeacon              | Dugtrio |
-| ---------------------- | -------------------- | ------- |
-| Retry/Hedge            | Yes                  | No      |
-| Response caching       | Yes (memory + Redis) | No      |
-| Score-based routing    | Yes                  | No      |
-| Request multiplexing   | Yes                  | No      |
-| Circuit breaker        | Yes                  | No      |
-| Consensus verification | Yes                  | No      |
-| Rate limit auto-tuner  | Yes                  | No      |
-| Fork detection         | Yes                  | Yes     |
-| Client auto-detection  | Yes                  | Yes     |
-| Web UI                 | Yes                  | Yes     |
-| gzip compression       | Yes                  | No      |
-| Horizontal scaling     | Yes (Redis)          | No      |
 
 ## Acknowledgements
 

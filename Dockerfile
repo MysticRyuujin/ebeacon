@@ -31,6 +31,8 @@ WORKDIR /app
 
 COPY --from=build /out/ebeacon /app/ebeacon
 COPY --from=build /src/ebeacon.example.yaml /app/ebeacon.yaml
+COPY --from=build /src/LICENSE /licenses/ebeacon/LICENSE
+COPY --from=build /src/NOTICE /licenses/ebeacon/NOTICE
 
 EXPOSE 5555
 

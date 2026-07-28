@@ -12,7 +12,7 @@ Thanks for considering a contribution. eBeacon is an open-source reverse proxy f
 
 - Go version: see [`go.mod`](go.mod) (`go` directive).
 - Install local hooks: `./scripts/install-hooks.sh` — runs `gofmt` on staged Go files and tests on commit, plus `go vet` and the race detector on push.
-- Optional but recommended: `golangci-lint` and `govulncheck` on `PATH`. CI runs both.
+- Install `golangci-lint` to run the same lint checks as CI. `make vuln` is also available as an optional dependency scan.
 
 ## Required checks
 
@@ -22,7 +22,7 @@ Before pushing, run:
 make ci-local
 ```
 
-That runs `gofmt -l` (must be empty), `go vet`, `golangci-lint`, `go test -race ./...`, and `govulncheck ./...`. CI runs the same set on every PR.
+That verifies formatting and module tidiness, then runs `go vet`, `golangci-lint`, and `go test -race ./...`. CI runs the same set on every PR.
 
 For changes that touch upstream routing, caching, or the SSE relay, also run the validation harnesses against a local instance:
 

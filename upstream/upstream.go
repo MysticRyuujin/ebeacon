@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -23,6 +24,10 @@ const (
 	CBOpen                    // rejecting requests
 	CBHalfOpen                // probing recovery
 )
+
+// ErrCircuitUnavailable indicates that another request owns the single
+// half-open recovery probe, or that the open interval has not elapsed.
+var ErrCircuitUnavailable = errors.New("upstream circuit breaker unavailable")
 
 // HealthStatus represents the observed health of an upstream.
 type HealthStatus int
@@ -161,12 +166,13 @@ type Upstream struct {
 	clientType     string
 
 	// Circuit breaker
-	cbMu      sync.Mutex
-	cbState   CBState
-	cbFails   int
-	cbSuccess int
-	cbLastErr time.Time
-	cbCfg     config.CircuitBreakerConfig
+	cbMu            sync.Mutex
+	cbState         CBState
+	cbFails         int
+	cbSuccess       int
+	cbLastErr       time.Time
+	cbCfg           config.CircuitBreakerConfig
+	cbProbeInFlight bool
 
 	// Concurrency tracking
 	activeConns atomic.Int64
@@ -267,7 +273,7 @@ func New(networkID string, cfg config.UpstreamConfig, defaultCB *config.CircuitB
 
 // IsReady returns true if the upstream is healthy and the circuit breaker allows requests.
 func (u *Upstream) IsReady() bool {
-	return u.IsHealthy() && u.cbAllow()
+	return u.IsHealthy() && u.cbCanRoute()
 }
 
 // IsArchive returns true if the upstream is explicitly marked as archive-capable.
@@ -575,6 +581,7 @@ func (u *Upstream) CBSuccess() {
 	defer u.cbMu.Unlock()
 	switch u.cbState {
 	case CBHalfOpen:
+		u.cbProbeInFlight = false
 		u.cbSuccess++
 		if u.cbSuccess >= u.cbCfg.SuccessThreshold {
 			u.cbState = CBClosed
@@ -591,6 +598,7 @@ func (u *Upstream) CBSuccess() {
 func (u *Upstream) CBFailure() {
 	u.cbMu.Lock()
 	defer u.cbMu.Unlock()
+	u.cbProbeInFlight = false
 	u.cbFails++
 	u.cbLastErr = time.Now()
 	if u.cbState == CBHalfOpen || u.cbFails >= u.cbCfg.FailureThreshold {
@@ -604,7 +612,9 @@ func (u *Upstream) CBFailure() {
 	metricCBState.WithLabelValues(u.NetworkID, u.ID).Set(float64(u.cbState))
 }
 
-func (u *Upstream) cbAllow() bool {
+// CBTryAcquire reserves permission to dispatch a request. Closed circuits allow
+// all callers; half-open circuits permit exactly one recovery probe at a time.
+func (u *Upstream) CBTryAcquire() bool {
 	u.cbMu.Lock()
 	defer u.cbMu.Unlock()
 	switch u.cbState {
@@ -614,15 +624,45 @@ func (u *Upstream) cbAllow() bool {
 		if time.Since(u.cbLastErr) >= u.cbCfg.HalfOpenAfter {
 			u.cbState = CBHalfOpen
 			u.cbSuccess = 0
+			u.cbProbeInFlight = true
 			slog.Info("circuit breaker half-open", "network", u.NetworkID, "upstream", u.ID)
 			metricCBState.WithLabelValues(u.NetworkID, u.ID).Set(float64(CBHalfOpen))
 			return true
 		}
 		return false
 	case CBHalfOpen:
+		if u.cbProbeInFlight {
+			return false
+		}
+		u.cbProbeInFlight = true
 		return true
 	}
-	return true
+	return false
+}
+
+// CBRelease abandons an acquired half-open probe without treating it as an
+// upstream success or failure, as is appropriate for client cancellation.
+func (u *Upstream) CBRelease() {
+	u.cbMu.Lock()
+	defer u.cbMu.Unlock()
+	if u.cbState == CBHalfOpen {
+		u.cbProbeInFlight = false
+	}
+}
+
+func (u *Upstream) cbCanRoute() bool {
+	u.cbMu.Lock()
+	defer u.cbMu.Unlock()
+	switch u.cbState {
+	case CBClosed:
+		return true
+	case CBOpen:
+		return time.Since(u.cbLastErr) >= u.cbCfg.HalfOpenAfter
+	case CBHalfOpen:
+		return !u.cbProbeInFlight
+	default:
+		return false
+	}
 }
 
 func healthName(h HealthStatus) string {

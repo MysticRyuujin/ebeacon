@@ -60,6 +60,72 @@ networks:
 	}
 }
 
+func TestLoadRejectsUnknownFields(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "ebeacon.yaml")
+	content := strings.TrimSpace(`
+server:
+  host: "127.0.0.1"
+  port: 5555
+  maxTimeout: 30s
+  maxTimout: 10s
+health: { checkInterval: 30s, finalityInterval: 2m, maxSyncDistance: 5 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: testnet
+    upstreams: [{ id: node-a, url: "http://127.0.0.1:5052" }]
+    routing: { loadBalancing: round-robin }
+`)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "maxTimout") {
+		t.Fatalf("expected unknown-field error, got %v", err)
+	}
+}
+
+func TestLoadRejectsUnsafeIdentifiersAndPaths(t *testing.T) {
+	t.Parallel()
+	base := func(networkID, upstreamID, metricsPath string) string {
+		return strings.TrimSpace(`
+server: { host: "127.0.0.1", port: 5555, maxTimeout: 30s }
+health: { checkInterval: 30s, finalityInterval: 2m, maxSyncDistance: 5 }
+rateLimiting: {}
+metrics: { enabled: true, path: "` + metricsPath + `" }
+networks:
+  - id: ` + networkID + `
+    upstreams: [{ id: ` + upstreamID + `, url: "http://127.0.0.1:5052" }]
+    routing: { loadBalancing: round-robin }
+`)
+	}
+	tests := []struct {
+		name       string
+		networkID  string
+		upstreamID string
+		path       string
+		want       string
+	}{
+		{"network slash", "main/net", "node-a", "/metrics", "must match"},
+		{"upstream markup", "mainnet", "<node>", "/metrics", "must match"},
+		{"ServeMux wildcard", "mainnet", "node-a", "/metrics/{rest}", "literal HTTP path"},
+		{"unclean path", "mainnet", "node-a", "/internal/../metrics", "clean HTTP path"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "ebeacon.yaml")
+			if err := os.WriteFile(path, []byte(base(tc.networkID, tc.upstreamID, tc.path)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected error containing %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
 func TestLoad_CORSDefaults(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

@@ -10,8 +10,6 @@
 # Documentation
 docs
 *.md
-LICENSE
-NOTICE
 
 # Monitoring stack config (not part of the binary)
 monitoring

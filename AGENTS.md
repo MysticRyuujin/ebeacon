@@ -14,7 +14,7 @@ make fmt-check     # Verify formatting (used in CI)
 make lint          # Run golangci-lint
 make test          # Run Go tests
 make vet           # Run go vet
-make ci-local      # Run full CI suite (fmt-check + vet + lint + test + vuln)
+make ci-local      # Run the CI suite (fmt-check + mod-check + vet + lint + test)
 make docker-build  # Build Docker image
 
 go build -o ebeacon .
@@ -62,7 +62,7 @@ Client → proxy/ (HTTP router, auth, rate limiting)
 
 **Failsafe strategies** (configured per-network): retry with backoff/jitter, hedged requests (fire multiple, take first response), and per-upstream circuit breakers.
 
-**Load balancing strategies**: score-based (default), round-robin, random, least-connections.
+**Load balancing strategies**: round-robin (default), score-based, random, least-connections.
 
 ## Release Notes
 

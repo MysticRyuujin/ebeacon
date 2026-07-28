@@ -1,13 +1,17 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"net/netip"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -303,7 +307,16 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := yaml.Unmarshal(data, cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("parse config: multiple YAML documents are not supported")
+		}
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.applyDefaults()
@@ -720,8 +733,8 @@ func (c *Config) validate() error {
 		return err
 	}
 	if c.Metrics.Enabled {
-		if !strings.HasPrefix(c.Metrics.Path, "/") {
-			return fmt.Errorf("metrics.path must start with \"/\"")
+		if err := validateLiteralServeMuxPath("metrics.path", c.Metrics.Path); err != nil {
+			return err
 		}
 		if c.Metrics.Path == "/" {
 			return fmt.Errorf("metrics.path must not be \"/\" (it would shadow the proxy root)")
@@ -742,8 +755,11 @@ func (c *Config) validate() error {
 		return fmt.Errorf("ui.auth with at least one key is required when ui.enabled is true")
 	}
 	if c.UI.Enabled {
-		if !strings.HasPrefix(c.UI.BasePath, "/") || strings.TrimRight(c.UI.BasePath, "/") == "" {
-			return fmt.Errorf("ui.basePath must start with \"/\" and not be the root path, got %q", c.UI.BasePath)
+		if err := validateLiteralServeMuxPath("ui.basePath", c.UI.BasePath); err != nil {
+			return err
+		}
+		if strings.TrimRight(c.UI.BasePath, "/") == "" {
+			return fmt.Errorf("ui.basePath must not be the root path")
 		}
 	}
 	if c.LegacyProjects.Kind != 0 {
@@ -757,6 +773,9 @@ func (c *Config) validate() error {
 		if n.ID == "" {
 			return fmt.Errorf("networks[%d]: id is required", i)
 		}
+		if !validIdentifier.MatchString(n.ID) {
+			return fmt.Errorf("networks[%d]: id %q must match %s", i, n.ID, validIdentifierPattern)
+		}
 		if seen[n.ID] {
 			return fmt.Errorf("networks[%d]: duplicate network id %q", i, n.ID)
 		}
@@ -768,6 +787,28 @@ func (c *Config) validate() error {
 		if err := validateHealth(&effHealth, fmt.Sprintf("networks[%d] (%s) effective health", i, n.ID)); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+const validIdentifierPattern = `[A-Za-z0-9][A-Za-z0-9._-]*`
+
+var validIdentifier = regexp.MustCompile(`^` + validIdentifierPattern + `$`)
+
+func validateLiteralServeMuxPath(name, value string) error {
+	if !strings.HasPrefix(value, "/") {
+		return fmt.Errorf("%s must start with \"/\"", name)
+	}
+	if strings.ContainsAny(value, "{}?#") ||
+		strings.IndexFunc(value, func(r rune) bool { return unicode.IsControl(r) || unicode.IsSpace(r) }) >= 0 {
+		return fmt.Errorf("%s must be a literal HTTP path without whitespace, control characters, wildcards, query, or fragment syntax, got %q", name, value)
+	}
+	canonical := strings.TrimSuffix(value, "/")
+	if canonical == "" {
+		canonical = "/"
+	}
+	if path.Clean(value) != canonical {
+		return fmt.Errorf("%s must be a clean HTTP path, got %q", name, value)
 	}
 	return nil
 }
@@ -922,6 +963,9 @@ func validateNetwork(n *NetworkConfig, ctx string) error {
 	for i, u := range n.Upstreams {
 		if u.ID == "" {
 			return fmt.Errorf("%s upstreams[%d]: id is required", ctx, i)
+		}
+		if !validIdentifier.MatchString(u.ID) {
+			return fmt.Errorf("%s upstreams[%d]: id %q must match %s", ctx, i, u.ID, validIdentifierPattern)
 		}
 		if _, exists := seenUpstream[u.ID]; exists {
 			return fmt.Errorf("%s: duplicate upstream id %q", ctx, u.ID)

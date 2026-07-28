@@ -3,6 +3,7 @@ package network
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -75,14 +76,20 @@ func (cp *ConsensusPolicy) Execute(
 				return
 			}
 			req = req.WithContext(ctx)
+			if !u.CBTryAcquire() {
+				results[idx] = consensusResult{err: upstream.ErrCircuitUnavailable, upstream: u}
+				return
+			}
+			defer u.CBRelease()
 			u.ConsumeRateToken()
 			u.IncrActive()
 			resp, err := u.Client.Do(req)
 			if err != nil {
+				err = upstream.SanitizeError(err)
 				u.DecrActive()
 				// A client disconnect cancels every participant's request;
 				// that is not an upstream fault, so don't open breakers.
-				if !isClientCancel(ctx, err) {
+				if !isClientCancel(ctx, err) && !errors.Is(err, upstream.ErrCircuitUnavailable) {
 					u.CBFailure()
 				}
 				results[idx] = consensusResult{err: err, upstream: u}

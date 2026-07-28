@@ -182,10 +182,15 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 		upReq.Header.Set(k, v)
 	}
 
+	if !u.CBTryAcquire() {
+		return false
+	}
+	defer u.CBRelease()
 	u.ConsumeRateToken()
 	u.IncrActive()
 	resp, err := u.Client.Do(upReq)
 	if err != nil {
+		err = upstream.SanitizeError(err)
 		u.DecrActive()
 		if ctx.Err() == nil {
 			slog.Warn("sse: upstream connection failed", "network", r.networkID, "upstream", u.ID, "err", err)
@@ -201,6 +206,7 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 		u.CBFailure()
 		return false
 	}
+	u.CBSuccess()
 
 	if !*headersSent {
 		copyResponseHeaders(w.Header(), resp.Header)
@@ -302,7 +308,6 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 				if !flushSSEEvent(w, flusher, seen, &event, true) {
 					return true
 				}
-				u.CBSuccess()
 				slog.Info("sse: upstream closed connection",
 					"network", r.networkID, "upstream", u.ID,
 					"duration", time.Since(connectedAt).Round(time.Second))

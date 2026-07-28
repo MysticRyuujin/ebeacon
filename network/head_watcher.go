@@ -160,7 +160,7 @@ func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error
 
 	resp, err := u.Client.Do(req)
 	if err != nil {
-		return err
+		return upstream.SanitizeError(err)
 	}
 	// readerDone is closed first (LIFO defer order) so the reader goroutine can
 	// exit via its select before resp.Body.Close() interrupts the read.

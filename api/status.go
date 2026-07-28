@@ -1025,6 +1025,28 @@ function applyCacheEntryFilters(){
 	renderCacheEntries(latestCacheEntries);
 }
 
+function renderSummaryCards(containerID,items,describe){
+	const container = document.getElementById(containerID);
+	container.replaceChildren();
+	(items || []).forEach(function(item){
+		const description = describe(item);
+		const card = document.createElement('div');
+		card.className = 'card';
+		const heading = document.createElement('h3');
+		heading.textContent = description.title;
+		const stat = document.createElement('div');
+		stat.className = 'stat';
+		stat.textContent = description.stat;
+		card.append(heading,stat);
+		(description.details || []).forEach(function(detail){
+			const line = document.createElement('p');
+			line.textContent = detail;
+			card.appendChild(line);
+		});
+		container.appendChild(card);
+	});
+}
+
 async function loadAll(){
 	try{
 		syncCacheEntryFiltersFromDOM();
@@ -1036,15 +1058,25 @@ async function loadAll(){
 			fetch(base+'/api/sessions').then(r=>r.json()),
 			fetch(base+'/api/forks').then(r=>r.json()),
 		]);
-		document.getElementById('health').innerHTML=(health||[]).map(function(h){ return '<div class="card"><h3>'+h.id+'</h3><div class="stat">'+h.healthyCount+'/'+h.upstreamCount+'</div><p>Finalized: '+h.finalizedSlot+'</p><p>Canonical: '+h.canonicalSlot+'</p></div>'; }).join('');
+		renderSummaryCards('health',health,function(h){
+			return {
+				title:String(h.id || ''),
+				stat:String(h.healthyCount)+'/'+String(h.upstreamCount),
+				details:['Finalized: '+String(h.finalizedSlot),'Canonical: '+String(h.canonicalSlot)]
+			};
+		});
 		latestUpstreams = ups || [];
 		latestForks = forks || [];
 		renderUpstreams(latestUpstreams);
 		latestCacheStats = caches || [];
 		latestCacheEntries = (entriesResult && entriesResult.entries) ? entriesResult.entries : [];
-		document.getElementById('cache-stats').innerHTML=(latestCacheStats||[]).map(function(c){ return '<div class="card"><h3>'+c.network+'</h3><div class="stat">'+(c.enabled?c.size+' entries':'disabled')+'</div></div>'; }).join('');
+		renderSummaryCards('cache-stats',latestCacheStats,function(c){
+			return {title:String(c.network || ''),stat:c.enabled ? String(c.size)+' entries' : 'disabled'};
+		});
 		renderCacheEntries(latestCacheEntries);
-		document.getElementById('sessions').innerHTML=(sessions||[]).map(function(s){ return '<div class="card"><h3>'+s.network+'</h3><div class="stat">'+s.activeSessions+' sessions</div></div>'; }).join('');
+		renderSummaryCards('sessions',sessions,function(s){
+			return {title:String(s.network || ''),stat:String(s.activeSessions)+' sessions'};
+		});
 	}catch(e){
 		console.error(e);
 	}

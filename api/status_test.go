@@ -380,6 +380,28 @@ func TestSanitizeUpstreamURL(t *testing.T) {
 	}
 }
 
+func TestDashboardSummaryRenderingUsesTextContent(t *testing.T) {
+	t.Parallel()
+	for _, want := range []string{
+		"heading.textContent = description.title",
+		"stat.textContent = description.stat",
+		"line.textContent = detail",
+	} {
+		if !strings.Contains(dashboardHTML, want) {
+			t.Fatalf("dashboard is missing safe DOM rendering %q", want)
+		}
+	}
+	for _, unsafe := range []string{
+		"'<div class=\"card\"><h3>'+h.id",
+		"'<div class=\"card\"><h3>'+c.network",
+		"'<div class=\"card\"><h3>'+s.network",
+	} {
+		if strings.Contains(dashboardHTML, unsafe) {
+			t.Fatalf("dashboard contains raw summary HTML interpolation %q", unsafe)
+		}
+	}
+}
+
 func TestSanitizeCacheHeaders(t *testing.T) {
 	t.Parallel()
 	in := http.Header{

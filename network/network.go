@@ -41,7 +41,7 @@ const statusClientClosedRequest = 499
 // must never reach the backend beacon nodes.
 var hopByHopHeaders = []string{
 	"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
-	"Te", "Trailers", "Transfer-Encoding", "Upgrade",
+	"Proxy-Connection", "Te", "Trailer", "Trailers", "Transfer-Encoding", "Upgrade",
 	"X-EBEACON-Use-Upstream",
 	"X-EBEACON-Secret-Token",
 	"X-API-Key",
@@ -822,6 +822,8 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
 			u.RecordError()
 			u.CBFailure()
+		} else {
+			u.CBRelease()
 		}
 		n.logFailure(r, bodyBytes, apiPath, u.ID, http.StatusBadGateway, resp.Header, nil, err, time.Since(start), "upstream_response_read_error", "", 0)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
@@ -967,7 +969,7 @@ func (n *Network) executeSelectedFS(ctx context.Context, r *http.Request, bodyBy
 		}
 		resp, err := n.forward(ctx, u, r, body)
 		if err != nil {
-			if !isClientCancel(ctx, err) {
+			if !isClientCancel(ctx, err) && !errors.Is(err, upstream.ErrCircuitUnavailable) {
 				u.CBFailure()
 				u.RecordScoreErrorForPath(apiPath)
 				n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
@@ -1080,6 +1082,10 @@ func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Reque
 				lastResp.Body.Close() //nolint:errcheck
 			}
 			return nil, nil, err
+		}
+		if errors.Is(err, upstream.ErrCircuitUnavailable) {
+			lastErr = err
+			continue
 		}
 		u.CBFailure()
 		if err != nil || i < len(ups)-1 {
@@ -1205,7 +1211,10 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 	// lookups, or retention windows more aggressive than our conservative
 	// thresholds).
 	target := classifyHistoricalTarget(r.URL.Path)
-	proactiveArchive := n.pool.HasArchive() && target.RequiresArchive(n.pool.BlockCache().MaxSlot())
+	proactiveArchive := n.pool.HasArchive() && target.RequiresArchive(
+		n.pool.BlockCache().MaxSlot(),
+		n.pool.SlotsPerEpoch(),
+	)
 
 	// When proactive archive routing is on, neutralize a sticky-session or
 	// route-rule preferID that points to a non-archive upstream. Otherwise
@@ -1374,6 +1383,10 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 			cancelTimeout()
 			return nil, nil, err
 		}
+		if errors.Is(err, upstream.ErrCircuitUnavailable) {
+			lastErr = err
+			continue
+		}
 		if err != nil {
 			slog.Warn("upstream error", "network", n.id, "upstream", u.ID, "attempt", i+1, "err", err)
 			n.logFailure(r, bodyBytes, apiPath, u.ID, 0, nil, nil, err, time.Since(attemptStarted), "upstream_attempt_failed", "", i+1)
@@ -1487,8 +1500,10 @@ func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, 
 		}
 		go func() {
 			for range remaining {
-				if res := <-resultCh; res.resp != nil {
+				res := <-resultCh
+				if res.resp != nil {
 					res.resp.Body.Close() //nolint:errcheck
+					res.u.CBRelease()
 				}
 			}
 		}()
@@ -1559,6 +1574,14 @@ loop:
 				return res.resp, res.u, nil
 			}
 			if res.err != nil && isClientCancel(ctx, res.err) {
+				triedByID[res.u.ID] = struct{}{}
+				lastErr = res.err
+				if inflight == 0 && fired >= maxFire {
+					break loop
+				}
+				continue
+			}
+			if errors.Is(res.err, upstream.ErrCircuitUnavailable) {
 				triedByID[res.u.ID] = struct{}{}
 				lastErr = res.err
 				if inflight == 0 && fired >= maxFire {
@@ -1677,6 +1700,9 @@ func (n *Network) promoteToArchive(ctx context.Context, apiPath string, r *http.
 			if isClientCancel(ctx, err) {
 				return nil, nil, err
 			}
+			if errors.Is(err, upstream.ErrCircuitUnavailable) {
+				continue
+			}
 			u.CBFailure()
 			continue
 		}
@@ -1706,7 +1732,7 @@ func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Req
 	dest := u.URL + pathAndQueryForUpstream(r.URL)
 	req, err := http.NewRequestWithContext(ctx, r.Method, dest, body)
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, fmt.Errorf("build request: %w", upstream.SanitizeError(err))
 	}
 
 	copyRequestHeaders(req.Header, r.Header)
@@ -1730,11 +1756,18 @@ func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Req
 	}
 	req.Header.Set("X-Forwarded-Host", r.Host)
 
+	if !u.CBTryAcquire() {
+		return nil, upstream.ErrCircuitUnavailable
+	}
 	u.ConsumeRateToken()
 	u.IncrActive()
 	resp, err := u.Client.Do(req)
 	if err != nil {
 		u.DecrActive()
+		err = upstream.SanitizeError(err)
+		if isClientCancel(ctx, err) {
+			u.CBRelease()
+		}
 		return nil, err
 	}
 
@@ -1940,8 +1973,9 @@ func isEventStream(r *http.Request) bool {
 }
 
 func copyRequestHeaders(dst, src http.Header) {
+	skip := hopByHopHeadersFor(src)
 	for k, vv := range src {
-		if isHopByHopHeader(k) {
+		if _, blocked := skip[strings.ToLower(k)]; blocked {
 			continue
 		}
 		for _, v := range vv {
@@ -1951,8 +1985,9 @@ func copyRequestHeaders(dst, src http.Header) {
 }
 
 func copyResponseHeaders(dst, src http.Header) {
+	skip := hopByHopHeadersFor(src)
 	for k, vv := range src {
-		if isHopByHopHeader(k) {
+		if _, blocked := skip[strings.ToLower(k)]; blocked {
 			continue
 		}
 		for _, v := range vv {
@@ -1961,15 +1996,28 @@ func copyResponseHeaders(dst, src http.Header) {
 	}
 	// Explicitly preserve Ethereum consensus headers even if they were skipped
 	for _, h := range ethConsensusHeaders {
+		if _, blocked := skip[strings.ToLower(h)]; blocked {
+			continue
+		}
 		if v := src.Get(h); v != "" {
 			dst.Set(h, v)
 		}
 	}
 }
 
-func isHopByHopHeader(h string) bool {
-	_, ok := hopByHopHeaderSet[strings.ToLower(h)]
-	return ok
+func hopByHopHeadersFor(headers http.Header) map[string]struct{} {
+	out := make(map[string]struct{}, len(hopByHopHeaderSet)+4)
+	for name := range hopByHopHeaderSet {
+		out[name] = struct{}{}
+	}
+	for _, value := range headers.Values("Connection") {
+		for token := range strings.SplitSeq(value, ",") {
+			if name := strings.ToLower(strings.TrimSpace(token)); name != "" {
+				out[name] = struct{}{}
+			}
+		}
+	}
+	return out
 }
 
 // ObfuscateUpstreamID returns a stable 8-character hex token for an upstream ID

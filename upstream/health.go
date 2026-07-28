@@ -146,6 +146,7 @@ func (h *HealthMonitor) checkSync(ctx context.Context, u *Upstream) {
 
 	resp, err := u.Client.Do(req)
 	if err != nil {
+		err = SanitizeError(err)
 		slog.Warn("health check failed", "network", u.NetworkID, "upstream", u.ID, "err", err)
 		u.setSyncVerdict(HealthDown)
 		h.recordProbeError(u)
@@ -388,6 +389,7 @@ func (h *HealthMonitor) checkNodeHealth(ctx context.Context, u *Upstream) {
 
 	resp, err := u.Client.Do(req)
 	if err != nil {
+		err = SanitizeError(err)
 		slog.Warn("node health check failed", "network", u.NetworkID, "upstream", u.ID, "err", err)
 		u.setNodeVerdict(HealthDown)
 		h.recordProbeError(u)

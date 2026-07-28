@@ -64,18 +64,20 @@ Use top-level `networks:` and optionally top-level `auth:`. Let HAProxy rewrite 
 
 Validation examples:
 
+- Unknown YAML fields are rejected so misspelled configuration keys fail at startup.
 - At least one network is required.
 - Each network must have at least one upstream.
+- Network and upstream IDs must match `[A-Za-z0-9][A-Za-z0-9._-]*`.
 - `server.port` must be `1..65535`.
 - `server.trustedProxies` entries must be valid CIDRs or IPs.
 - `debugLogging.path` is required when `debugLogging.enabled` is `true`.
 - `cors.allowedOrigins` must contain at least one origin when `cors:` is configured.
-- `metrics.path` must start with `/`.
+- `metrics.path` and `ui.basePath` must be clean, literal HTTP paths without `http.ServeMux` wildcard syntax.
 - `cache.maxSize` must be `> 0`.
 - `cache.driver` must be `memory` or `redis`; `state.driver` must be `local` or `redis` (typos no longer fall back silently).
 - `cache.redis.url` is required when `cache.driver: redis` and the cache is enabled.
 - `auth.keys[]` entries require a non-empty, unique `id` and a non-empty `secret`; a key's `tier` must name a defined tier. Keys without an `id` previously authenticated but silently bypassed per-key and tier rate limits.
-- `ui.basePath` must start with `/` and must not be the root path when the UI is enabled.
+- `ui.basePath` must not be the root path when the UI is enabled.
 - `blockedPaths`, `routeRules.pathPattern`, and `cache.policies.pattern` must be valid regex.
 
 ## `server`
@@ -278,25 +280,25 @@ The default is `archive: false`, which matches the CL client default — only se
 
 Two routing behaviors are driven by the flag:
 
-1. **Proactive routing on first attempt.** When the request path carries a numeric slot, epoch, or block root, eBeacon extracts the target identifier and compares it to a per-endpoint retention window:
+1. **Proactive routing on first attempt.** When the request path carries a numeric slot or epoch, eBeacon extracts the target identifier and compares it to a per-endpoint retention window:
 
    | Endpoint family | Retention threshold | Source |
    | --- | --- | --- |
-   | `/eth/v1/beacon/blob_sidecars/{block_id}` | 4096 epochs (~18 days) | `MIN_EPOCHS_FOR_BLOB_SIDECARS_REQUESTS` (EIP-4844) |
-   | `/eth/v1/beacon/states/{state_id}/...` | 8192 slots (~27 hours) | conservative; real Lighthouse/Prysm retention varies |
-   | `/eth/v{1,2}/beacon/blocks/{block_id}` and related | 33024 epochs (~5 months) | `MIN_EPOCHS_FOR_BLOCK_REQUESTS` (spec) |
+   | `/eth/v1/beacon/blob_sidecars/{block_id}` | 4096 epochs (~18 days on mainnet) | `MIN_EPOCHS_FOR_BLOB_SIDECARS_REQUESTS` (EIP-4844) |
+   | `/eth/v1/beacon/states/{state_id}/...` | 8192 slots (~27 hours on mainnet) | conservative; real Lighthouse/Prysm retention varies |
+   | `/eth/v{1,2}/beacon/blocks/{block_id}` and related | 33024 epochs (~5 months on mainnet) | `MIN_EPOCHS_FOR_BLOCK_REQUESTS` (spec) |
    | `/eth/v1/validator/duties/{attester,proposer,sync}/{epoch}` | current epoch + 1 | Beacon API spec |
    | `/eth/v1/beacon/rewards/attestations/{epoch}` | current epoch + 1 | Beacon API spec |
 
-   When the target is demonstrably older than the threshold, eBeacon routes directly to `archive: true` upstreams on the first attempt and skips the pruned tier entirely. Named identifiers (`head`, `finalized`, `justified`, `genesis`) are always served by pruned nodes and are not classified this way.
+   Epoch thresholds use the network's configured `slotsPerEpoch`. When the target is demonstrably older than the threshold, eBeacon routes directly to `archive: true` upstreams on the first attempt and skips the pruned tier entirely. Named identifiers (`head`, `finalized`, `justified`, `genesis`) and root-based lookups are not classified proactively because their slot is unknown; they use normal routing.
 
-2. **Error-driven fallthrough on 404.** For cases proactive classification cannot cover (by-root lookups where the slot is unknown, or requests that sat just inside the conservative threshold but outside the client's actual retention), eBeacon watches for pruning-shaped responses. A 404 on any historical-id path triggers promotion: the remaining retry budget is filled with archive-capable candidates and the request continues. The client does not see the 404 unless the archive tier also fails.
+2. **Error-driven fallthrough.** For cases proactive classification cannot cover (by-root lookups where the slot is unknown, or requests that sat just inside the conservative threshold but outside the client's actual retention), eBeacon watches for pruning-shaped responses. A 404 on a historical-id path triggers promotion. Recognized PeerDAS custody-related 400 responses on blob endpoints do the same. The remaining retry budget is filled with archive-capable candidates and the request continues; the client sees the original response only if the archive tier also fails.
 
 Priority continues to apply inside the archive subset. A `priority: 0` local archive node beats a `priority: 10` cloud archive provider. The same `weight` and load-balancing rules apply between equal-priority archive upstreams.
 
 If no upstream in the pool is marked `archive: true`, behavior is unchanged from pre-archive releases: pruning-shaped 404s propagate to clients, and `ebeacon_pruning_error_no_archive_total` (see [Operations Guide](operations.md#metrics)) ticks so you can see the signal that configuring an archive upstream would convert those errors into successful responses.
 
-**Pruning detection is heuristic-based.** eBeacon treats an HTTP 404 on a historical-id path as pruning-shaped. Body substrings are intentionally not matched (Lighthouse, Prysm, Teku, and Nimbus use different error wording that changes between versions). The cost of a false positive is one extra upstream roundtrip; the archive retry will fail identically and return the 404 the client would have seen anyway.
+**Pruning detection is heuristic-based.** eBeacon treats an HTTP 404 on a historical-id path as pruning-shaped. For HTTP 400 responses on blob endpoints, it checks a bounded body prefix for known PeerDAS custody-error phrases. The cost of a false positive is one extra upstream roundtrip; if the archive retry also fails, eBeacon returns the original response.
 
 **Hedge and archive quota.** When `failsafe.hedge` is enabled alongside proactive archive routing, multiple parallel requests fire to archive upstreams for a single historical request. For metered providers (QuickNode, Alchemy tiered plans), either disable hedge for that network or rely on per-upstream `rateLimiting.autoTune` to stay inside your allotment.
 

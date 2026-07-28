@@ -751,17 +751,21 @@ func TestNetwork_StartStop(t *testing.T) {
 
 func TestCopyHeaders_DoNotMutateSource(t *testing.T) {
 	srcReq := http.Header{
-		"Connection":             []string{"keep-alive"},
+		"Connection":             []string{"keep-alive, X-Remove-Me"},
 		"Authorization":          []string{"Bearer local-token"},
 		"X-Api-Key":              []string{"premium-local-test-key"},
 		"X-Ebeacon-Secret-Token": []string{"local-secret"},
 		"X-Ebeacon-Test":         []string{"ok"},
 		"X-Ebeacon-Use-Upstream": []string{"u1"},
+		"X-Remove-Me":            []string{"connection-scoped"},
 	}
 	dstReq := http.Header{}
 	copyRequestHeaders(dstReq, srcReq)
 	if got := dstReq.Get("Connection"); got != "" {
 		t.Fatalf("request hop-by-hop header copied: %q", got)
+	}
+	if got := dstReq.Get("X-Remove-Me"); got != "" {
+		t.Fatalf("request header nominated by Connection was copied: %q", got)
 	}
 	if got := dstReq.Get("X-Ebeacon-Test"); got != "ok" {
 		t.Fatalf("request header missing: %q", got)
@@ -775,7 +779,7 @@ func TestCopyHeaders_DoNotMutateSource(t *testing.T) {
 	if got := dstReq.Get("X-EBEACON-Secret-Token"); got != "" {
 		t.Fatalf("request secret header copied upstream: %q", got)
 	}
-	if got := srcReq.Get("Connection"); got != "keep-alive" {
+	if got := srcReq.Get("Connection"); got != "keep-alive, X-Remove-Me" {
 		t.Fatalf("source request headers mutated: %q", got)
 	}
 	if got := srcReq.Get("Authorization"); got != "Bearer local-token" {
@@ -792,13 +796,18 @@ func TestCopyHeaders_DoNotMutateSource(t *testing.T) {
 	}
 
 	srcResp := http.Header{
-		"Transfer-Encoding": []string{"chunked"},
-		"Content-Type":      []string{"application/json"},
+		"Transfer-Encoding":   []string{"chunked"},
+		"Content-Type":        []string{"application/json"},
+		"Connection":          []string{"X-Response-Internal"},
+		"X-Response-Internal": []string{"remove"},
 	}
 	dstResp := http.Header{}
 	copyResponseHeaders(dstResp, srcResp)
 	if got := dstResp.Get("Transfer-Encoding"); got != "" {
 		t.Fatalf("response hop-by-hop header copied: %q", got)
+	}
+	if got := dstResp.Get("X-Response-Internal"); got != "" {
+		t.Fatalf("response header nominated by Connection was copied: %q", got)
 	}
 	if got := dstResp.Get("Content-Type"); got != "application/json" {
 		t.Fatalf("response header missing: %q", got)

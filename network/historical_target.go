@@ -22,27 +22,33 @@ const (
 	HistoricalKindLiveness                      // /validator/liveness/{epoch}
 )
 
-// SlotsPerEpoch is the Ethereum consensus-layer constant (SLOTS_PER_EPOCH = 32).
+// SlotsPerEpoch is the default Ethereum consensus-layer value. Individual
+// networks may override it (for example, Gnosis and Chiado use 16).
 const SlotsPerEpoch uint64 = 32
 
-// Per-endpoint retention thresholds expressed in slots. Requests for targets
-// older than (headSlot - threshold) are presumed to require an archive upstream.
+// Per-endpoint retention thresholds. Epoch-based protocol minimums are
+// converted to slots using the configured network value at classification
+// time. Requests older than the resulting threshold are presumed to require
+// an archive upstream.
 //
 // These are intentionally spec-minimum or below — they describe what a pruned
 // node is GUARANTEED to retain, not what any specific client implementation
 // retains. A conservative value means fewer false-positive archive promotions.
 const (
-	// Blob sidecars: MIN_EPOCHS_FOR_BLOB_SIDECARS_REQUESTS = 4096 epochs (~18 days).
+	// Blob sidecars: MIN_EPOCHS_FOR_BLOB_SIDECARS_REQUESTS = 4096 epochs
+	// (~18 days on mainnet).
 	// See EIP-4844. Blobs are aggressively pruned; this is the cleanest archive win.
-	blobSidecarsRetentionSlots = 4096 * SlotsPerEpoch
+	blobSidecarsRetentionEpochs uint64 = 4096
 
 	// States: clients (Lighthouse, Prysm, Teku) retain ~1 week of historical states
-	// by default. We use a conservative ~27h threshold — older than this, promote
-	// to archive on first attempt. The retry path catches edge cases within 27h.
+	// by default. We use a conservative 8192-slot threshold (~27h on mainnet) —
+	// older than this, promote to archive on first attempt. The retry path catches
+	// edge cases inside the threshold.
 	statesRetentionSlots uint64 = 8192
 
-	// Blocks: MIN_EPOCHS_FOR_BLOCK_REQUESTS = 33024 epochs (~5 months) per spec.
-	blocksRetentionSlots = 33024 * SlotsPerEpoch
+	// Blocks: MIN_EPOCHS_FOR_BLOCK_REQUESTS = 33024 epochs
+	// (~5 months on mainnet) per spec.
+	blocksRetentionEpochs uint64 = 33024
 )
 
 // HistoricalTarget describes the historical identifier carried by a Beacon API
@@ -71,24 +77,27 @@ func (t HistoricalTarget) IsHistorical() bool {
 // This is best-effort proactive classification — when it returns false, the
 // request is routed normally and the error-driven retry path catches any
 // pruning-shaped errors.
-func (t HistoricalTarget) RequiresArchive(headSlot uint64) bool {
+func (t HistoricalTarget) RequiresArchive(headSlot, slotsPerEpoch uint64) bool {
 	if headSlot == 0 || t.Named != "" || t.Root != "" {
 		return false
 	}
-	headEpoch := headSlot / SlotsPerEpoch
+	if slotsPerEpoch == 0 {
+		slotsPerEpoch = SlotsPerEpoch
+	}
+	headEpoch := headSlot / slotsPerEpoch
 
 	switch t.Kind {
 	case HistoricalKindBlockByID:
 		if t.Slot == nil {
 			return false
 		}
-		return olderThan(*t.Slot, headSlot, blocksRetentionSlots)
+		return olderThan(*t.Slot, headSlot, blocksRetentionEpochs*slotsPerEpoch)
 
 	case HistoricalKindBlobSidecars:
 		if t.Slot == nil {
 			return false
 		}
-		return olderThan(*t.Slot, headSlot, blobSidecarsRetentionSlots)
+		return olderThan(*t.Slot, headSlot, blobSidecarsRetentionEpochs*slotsPerEpoch)
 
 	case HistoricalKindStateByID:
 		if t.Slot == nil {
@@ -157,9 +166,9 @@ func classifyBeaconPath(segments []string) HistoricalTarget {
 
 	case "blobs", "blob_sidecars":
 		// Both endpoints return blob data, which is pruned per EIP-4844's
-		// MIN_EPOCHS_FOR_BLOB_SIDECARS_REQUESTS (~18 days). Using the block
-		// retention threshold (~5 months) would miss archive promotion for
-		// blob requests 18d–5mo old, where pruned nodes 404 but we still
+		// MIN_EPOCHS_FOR_BLOB_SIDECARS_REQUESTS. Using the block retention
+		// threshold would miss archive promotion for blob requests between
+		// the two windows, where pruned nodes 404 but we still
 		// have an archive upstream that can serve.
 		if len(segments) < 5 {
 			return HistoricalTarget{}

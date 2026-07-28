@@ -220,6 +220,8 @@ func TestClassifyHistoricalTarget(t *testing.T) {
 func TestHistoricalTargetRequiresArchive(t *testing.T) {
 	const headSlot uint64 = 10_000_000 // arbitrary "now"
 	headEpoch := headSlot / SlotsPerEpoch
+	blocksRetentionSlots := blocksRetentionEpochs * SlotsPerEpoch
+	blobSidecarsRetentionSlots := blobSidecarsRetentionEpochs * SlotsPerEpoch
 
 	tests := []struct {
 		name   string
@@ -355,10 +357,40 @@ func TestHistoricalTargetRequiresArchive(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.target.RequiresArchive(tt.head); got != tt.want {
+			if got := tt.target.RequiresArchive(tt.head, SlotsPerEpoch); got != tt.want {
 				t.Errorf("RequiresArchive(%d): got %v want %v", tt.head, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestHistoricalTargetRequiresArchiveUsesConfiguredSlotsPerEpoch(t *testing.T) {
+	const slotsPerEpoch uint64 = 16
+	head := blocksRetentionEpochs*slotsPerEpoch + 100
+
+	oldAt16 := HistoricalTarget{
+		Kind: HistoricalKindBlockByID,
+		Slot: uint64Ptr(head - blocksRetentionEpochs*slotsPerEpoch - 1),
+	}
+	if !oldAt16.RequiresArchive(head, slotsPerEpoch) {
+		t.Fatal("block older than the configured 16-slot epoch retention should require archive")
+	}
+
+	stillRecentAt32 := HistoricalTarget{
+		Kind: HistoricalKindBlockByID,
+		Slot: uint64Ptr(1),
+	}
+	if stillRecentAt32.RequiresArchive(head, SlotsPerEpoch) {
+		t.Fatal("same head should remain within the default 32-slot epoch retention")
+	}
+
+	headEpoch := head / slotsPerEpoch
+	duties := HistoricalTarget{
+		Kind:  HistoricalKindAttesterDuties,
+		Epoch: uint64Ptr(headEpoch - 2),
+	}
+	if !duties.RequiresArchive(head, slotsPerEpoch) {
+		t.Fatal("duty classification should use the configured slots per epoch")
 	}
 }
 
