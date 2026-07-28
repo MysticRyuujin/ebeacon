@@ -60,6 +60,72 @@ networks:
 	}
 }
 
+func TestLoad_EmptyConfigReportsMissingNetworks(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{"empty", ""},
+		{"comment only", "# nothing here\n"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "ebeacon.yaml")
+			if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), "network") {
+				t.Fatalf("an empty config must name what is missing rather than surfacing a bare EOF, got %v", err)
+			}
+		})
+	}
+}
+
+func TestLoad_DocumentSeparators(t *testing.T) {
+	t.Parallel()
+	valid := strings.TrimSpace(`
+server: { host: "127.0.0.1", port: 5555, maxTimeout: 30s }
+health: { checkInterval: 30s, finalityInterval: 2m, maxSyncDistance: 5 }
+rateLimiting: {}
+networks:
+  - id: mainnet
+    upstreams: [{ id: node-a, url: "http://127.0.0.1:5052" }]
+    routing: { loadBalancing: round-robin }
+`)
+	tests := []struct {
+		name    string
+		content string
+		wantErr bool
+	}{
+		{"trailing separator", valid + "\n---\n", false},
+		{"leading separator", "---\n" + valid, false},
+		{"second document", valid + "\n---\n" + valid, true},
+		{"second document behind a null one", valid + "\n---\n---\n" + valid, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "ebeacon.yaml")
+			if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "multiple YAML documents") {
+					t.Fatalf("expected a multi-document rejection, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsUnknownFields(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "ebeacon.yaml")
@@ -111,6 +177,8 @@ networks:
 		{"upstream markup", "mainnet", "<node>", "/metrics", "must match"},
 		{"ServeMux wildcard", "mainnet", "node-a", "/metrics/{rest}", "literal HTTP path"},
 		{"unclean path", "mainnet", "node-a", "/internal/../metrics", "clean HTTP path"},
+		{"doubled root slash", "mainnet", "node-a", "//", "clean HTTP path"},
+		{"doubled inner slash", "mainnet", "node-a", "/metrics//", "clean HTTP path"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

@@ -26,7 +26,7 @@ const (
 )
 
 // ErrCircuitUnavailable indicates that another request owns the single
-// half-open recovery probe, or that the open interval has not elapsed.
+// half-open recovery probe.
 var ErrCircuitUnavailable = errors.New("upstream circuit breaker unavailable")
 
 // HealthStatus represents the observed health of an upstream.
@@ -173,6 +173,8 @@ type Upstream struct {
 	cbLastErr       time.Time
 	cbCfg           config.CircuitBreakerConfig
 	cbProbeInFlight bool
+	cbProbeGen      uint64
+	cbEpoch         uint64
 
 	// Concurrency tracking
 	activeConns atomic.Int64
@@ -575,93 +577,182 @@ func (u *Upstream) routeScorer(apiPath string, create bool) *ScoreTracker {
 	return scorer
 }
 
-// CBSuccess records a successful request; may close an open/half-open circuit.
-func (u *Upstream) CBSuccess() {
-	u.cbMu.Lock()
-	defer u.cbMu.Unlock()
-	switch u.cbState {
-	case CBHalfOpen:
-		u.cbProbeInFlight = false
-		u.cbSuccess++
-		if u.cbSuccess >= u.cbCfg.SuccessThreshold {
-			u.cbState = CBClosed
-			u.cbFails = 0
-			slog.Info("circuit breaker closed", "network", u.NetworkID, "upstream", u.ID)
-		}
-	case CBClosed:
-		u.cbFails = 0
-	}
-	metricCBState.WithLabelValues(u.NetworkID, u.ID).Set(float64(u.cbState))
+// CBToken is one admitted request's claim on the circuit breaker, returned by
+// CBTryAcquire and settled by the caller via Success, Failure, or Release.
+// Tokens minted while the circuit was half-open own the single recovery probe:
+// their settlement is owner-checked, so a duplicate or stale settlement (from
+// a request that outlived a breaker state change) is a no-op. Other tokens
+// carry closed-state accounting scoped to the state they were minted in. The
+// zero CBToken settles as a no-op.
+type CBToken struct {
+	u     *Upstream
+	probe bool
+	gen   uint64
+	epoch uint64
 }
 
-// CBFailure records a failed request; may open the circuit.
+type cbOutcome int
+
+const (
+	cbSettleSuccess cbOutcome = iota
+	cbSettleFailure
+	cbSettleRelease
+)
+
+// Success settles the token as an upstream success.
+func (t CBToken) Success() { t.settle(cbSettleSuccess) }
+
+// Failure settles the token as an upstream failure.
+func (t CBToken) Failure() { t.settle(cbSettleFailure) }
+
+// Release abandons the token without success/failure accounting, as is
+// appropriate for client cancellation and canceled hedge losers.
+func (t CBToken) Release() { t.settle(cbSettleRelease) }
+
+func (t CBToken) settle(outcome cbOutcome) {
+	if t.u == nil {
+		return
+	}
+	u := t.u
+	u.cbMu.Lock()
+	defer u.cbMu.Unlock()
+	if t.probe {
+		// Only the live unsettled probe may touch recovery state: settling
+		// clears cbProbeInFlight, and every grant bumps cbProbeGen, so a
+		// stale or duplicate settle can never disturb a newer probe.
+		if !u.cbProbeInFlight || u.cbProbeGen != t.gen {
+			return
+		}
+		u.cbProbeInFlight = false
+		switch outcome {
+		case cbSettleSuccess:
+			u.cbSuccess++
+			if u.cbSuccess >= u.cbCfg.SuccessThreshold {
+				u.cbTransitionLocked(CBClosed)
+				u.cbFails = 0
+				slog.Info("circuit breaker closed", "network", u.NetworkID, "upstream", u.ID)
+			}
+		case cbSettleFailure:
+			u.cbFailAndOpenLocked()
+		}
+		return
+	}
+	// Non-probe tokens carry closed-state accounting only, and only within
+	// the epoch they were minted in: traffic admitted before an open/recover
+	// cycle must not reset cbFails on, or reopen, the circuit that has since
+	// moved on. They never extend cbLastErr while open, so the recovery
+	// clock runs on schedule.
+	if u.cbEpoch != t.epoch || u.cbState != CBClosed {
+		return
+	}
+	switch outcome {
+	case cbSettleSuccess:
+		u.cbFails = 0
+	case cbSettleFailure:
+		u.cbRecordFailureLocked()
+	}
+}
+
+// CBFailure records failure evidence from a request that no longer holds an
+// admission token (an SSE stream that already credited a delivered event).
 func (u *Upstream) CBFailure() {
 	u.cbMu.Lock()
 	defer u.cbMu.Unlock()
-	u.cbProbeInFlight = false
-	u.cbFails++
-	u.cbLastErr = time.Now()
-	if u.cbState == CBHalfOpen || u.cbFails >= u.cbCfg.FailureThreshold {
-		if u.cbState != CBOpen {
-			slog.Warn("circuit breaker opened",
-				"network", u.NetworkID, "upstream", u.ID, "failures", u.cbFails)
+	switch u.cbState {
+	case CBClosed:
+		u.cbRecordFailureLocked()
+	case CBHalfOpen:
+		// Recovering, and this evidence is current: discarding it would let a
+		// later single success close the circuit as if nothing had gone wrong.
+		// A live probe is left to its own settlement rather than pre-empted.
+		if !u.cbProbeInFlight {
+			u.cbFailAndOpenLocked()
 		}
-		u.cbState = CBOpen
-		u.cbSuccess = 0
 	}
-	metricCBState.WithLabelValues(u.NetworkID, u.ID).Set(float64(u.cbState))
 }
 
-// CBTryAcquire reserves permission to dispatch a request. Closed circuits allow
-// all callers; half-open circuits permit exactly one recovery probe at a time.
-func (u *Upstream) CBTryAcquire() bool {
+func (u *Upstream) cbRecordFailureLocked() {
+	u.cbFails++
+	u.cbLastErr = time.Now()
+	if u.cbFails >= u.cbCfg.FailureThreshold {
+		u.cbOpenLocked()
+	}
+}
+
+func (u *Upstream) cbFailAndOpenLocked() {
+	u.cbFails++
+	u.cbLastErr = time.Now()
+	u.cbOpenLocked()
+}
+
+// cbTransitionLocked is the only writer of cbState, so the epoch bump and the
+// state gauge cannot drift from it.
+func (u *Upstream) cbTransitionLocked(s CBState) {
+	if u.cbState != s {
+		u.cbState = s
+		u.cbEpoch++
+		metricCBState.WithLabelValues(u.NetworkID, u.ID).Set(float64(s))
+	}
+}
+
+func (u *Upstream) cbOpenLocked() {
+	if u.cbState != CBOpen {
+		slog.Warn("circuit breaker opened",
+			"network", u.NetworkID, "upstream", u.ID, "failures", u.cbFails)
+	}
+	u.cbTransitionLocked(CBOpen)
+	u.cbSuccess = 0
+}
+
+// CBTryAcquire admits a request for dispatch. Half-open circuits grant the
+// single recovery probe to one caller at a time and refuse the rest; every
+// other state admits. Open circuits inside the recovery window admit
+// advisorily rather than refusing: a caller that reached dispatch already
+// picked this upstream despite IsReady reporting false — either as the pool's
+// last-resort tier or by explicit operator pinning — and in both cases
+// refusing turns the worst available option into a hard 502. Advisory tokens
+// carry no probe ownership and their settlement never touches recovery state.
+func (u *Upstream) CBTryAcquire() (CBToken, bool) {
 	u.cbMu.Lock()
 	defer u.cbMu.Unlock()
 	switch u.cbState {
-	case CBClosed:
-		return true
 	case CBOpen:
 		if time.Since(u.cbLastErr) >= u.cbCfg.HalfOpenAfter {
-			u.cbState = CBHalfOpen
+			u.cbTransitionLocked(CBHalfOpen)
 			u.cbSuccess = 0
-			u.cbProbeInFlight = true
 			slog.Info("circuit breaker half-open", "network", u.NetworkID, "upstream", u.ID)
-			metricCBState.WithLabelValues(u.NetworkID, u.ID).Set(float64(CBHalfOpen))
-			return true
+			return u.cbGrantProbeLocked(), true
 		}
-		return false
+		return CBToken{u: u, epoch: u.cbEpoch}, true
 	case CBHalfOpen:
 		if u.cbProbeInFlight {
-			return false
+			return CBToken{}, false
 		}
-		u.cbProbeInFlight = true
-		return true
-	}
-	return false
-}
-
-// CBRelease abandons an acquired half-open probe without treating it as an
-// upstream success or failure, as is appropriate for client cancellation.
-func (u *Upstream) CBRelease() {
-	u.cbMu.Lock()
-	defer u.cbMu.Unlock()
-	if u.cbState == CBHalfOpen {
-		u.cbProbeInFlight = false
+		return u.cbGrantProbeLocked(), true
+	default:
+		return CBToken{u: u, epoch: u.cbEpoch}, true
 	}
 }
 
+func (u *Upstream) cbGrantProbeLocked() CBToken {
+	u.cbProbeInFlight = true
+	u.cbProbeGen++
+	return CBToken{u: u, probe: true, gen: u.cbProbeGen, epoch: u.cbEpoch}
+}
+
+// cbCanRoute is deliberately stricter than CBTryAcquire: it is a routing
+// preference (open circuits are unattractive), while CBTryAcquire is the
+// dispatch gate (open circuits still serve as a last resort).
 func (u *Upstream) cbCanRoute() bool {
 	u.cbMu.Lock()
 	defer u.cbMu.Unlock()
 	switch u.cbState {
-	case CBClosed:
-		return true
 	case CBOpen:
 		return time.Since(u.cbLastErr) >= u.cbCfg.HalfOpenAfter
 	case CBHalfOpen:
 		return !u.cbProbeInFlight
 	default:
-		return false
+		return true
 	}
 }
 

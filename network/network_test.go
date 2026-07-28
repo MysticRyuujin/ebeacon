@@ -842,7 +842,7 @@ func TestForward_TracksActiveConnectionsUntilBodyClose(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
-	resp, err := n.forward(context.Background(), u, req, nil)
+	resp, _, err := n.forward(context.Background(), u, req, nil)
 	if err != nil {
 		t.Fatalf("forward: %v", err)
 	}
@@ -2834,6 +2834,200 @@ func TestNetwork_HedgeLoserConnectionsReturnToZero(t *testing.T) {
 	}
 }
 
+func TestNetwork_DrainedHedgeAttemptFreesRecoveryProbe(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	// Both attempts hang until the failsafe deadline fires, so they are
+	// drained with context.DeadlineExceeded rather than a client cancel —
+	// the outcome that used to strand the half-open recovery probe.
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	})
+	upA := httptest.NewServer(handler)
+	defer upA.Close()
+	upB := httptest.NewServer(handler)
+	defer upB.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, upA.URL, nil)
+	cfg.Networks[0].Upstreams = []config.UpstreamConfig{
+		{ID: "u1", URL: upA.URL},
+		{ID: "u2", URL: upB.URL},
+	}
+	cfg.Failsafe.Hedge = &config.HedgeConfig{Delay: time.Millisecond, MaxCount: 1}
+	cfg.Failsafe.Timeout = &config.TimeoutConfig{Duration: 50 * time.Millisecond}
+	cfg.Failsafe.CircuitBreaker = &config.CircuitBreakerConfig{
+		FailureThreshold: 1,
+		SuccessThreshold: 1,
+		HalfOpenAfter:    10 * time.Millisecond,
+	}
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u2 := n.pool.ByID("u2")
+	u2.CBFailure()
+	time.Sleep(20 * time.Millisecond)
+	if !u2.IsReady() {
+		t.Fatal("circuit should offer a recovery probe after the open interval")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if u2.IsReady() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("drained hedge attempt stranded the half-open recovery probe, leaving the upstream permanently unroutable")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestNetwork_OpenCircuitStillServesLastResortUpstream(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":"ok"}`))
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	cfg.Failsafe.CircuitBreaker = &config.CircuitBreakerConfig{
+		FailureThreshold: 1,
+		SuccessThreshold: 1,
+		HalfOpenAfter:    time.Hour,
+	}
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("first request status: got %d want 502", rec.Code)
+	}
+	u := n.pool.ByID("u1")
+	if u.IsReady() {
+		t.Fatal("a 500 should have opened the circuit")
+	}
+
+	// The pool's last-resort tier still hands out this upstream; dispatching
+	// through an open circuit is what keeps a single-upstream network serving
+	// instead of hard-failing for the whole recovery window.
+	req = httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+	rec = httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("open-circuit last-resort request: got %d want 200", rec.Code)
+	}
+	if u.IsReady() {
+		t.Fatal("an advisory success must not close the circuit early")
+	}
+}
+
+func TestNetwork_HalfOpenProbeBodyReadFailureCountsAsFailure(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "64")
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte(`{"data":`)); err != nil {
+			return
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		conn.Close() //nolint:errcheck
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	cfg.Failsafe.CircuitBreaker = &config.CircuitBreakerConfig{
+		FailureThreshold: 1,
+		SuccessThreshold: 1,
+		HalfOpenAfter:    10 * time.Millisecond,
+	}
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u := n.pool.ByID("u1")
+	u.CBFailure()
+	time.Sleep(20 * time.Millisecond)
+	if !u.IsReady() {
+		t.Fatal("circuit should offer a recovery probe after the open interval")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("truncated body status: got %d want 502", rec.Code)
+	}
+
+	// Headers arrived, but the body did not: the probe must not be credited
+	// with a success that would close the circuit on an unusable response.
+	if u.IsReady() {
+		t.Fatal("a probe whose body failed mid-read must count as a failure")
+	}
+}
+
+func TestNetwork_MultiplexedSelectedServerErrorTripsCircuitBreaker(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"code":500}`))
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	cfg.Failsafe.CircuitBreaker = &config.CircuitBreakerConfig{
+		FailureThreshold: 1,
+		SuccessThreshold: 1,
+		HalfOpenAfter:    time.Hour,
+	}
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A pinned upstream returns its 5xx to the caller, and GET responses are
+	// settled on the multiplexed path — which must apply the same
+	// status-to-outcome rule as the direct path.
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+	req.Header.Set("X-EBEACON-Use-Upstream", "u1")
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status: got %d want 500", rec.Code)
+	}
+
+	if u := n.pool.ByID("u1"); u.IsReady() {
+		t.Fatal("a pinned 5xx must count as a circuit-breaker failure, not a success")
+	}
+}
+
 func TestNetwork_ClientCancelDoesNotTripCircuitBreaker(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -3045,6 +3239,33 @@ func TestForward_AppendsRealPeerToXFF(t *testing.T) {
 
 	if gotXFF != "1.2.3.4, 192.0.2.10" {
 		t.Fatalf("upstream XFF chain must end with the real peer, got %q", gotXFF)
+	}
+}
+
+func TestForward_ConnectionNominatedXFFIsNotSmuggled(t *testing.T) {
+	var gotXFF string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotXFF = r.Header.Get("X-Forwarded-For")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, nil)
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/eth/v1/node/version", nil)
+	req.RemoteAddr = "192.0.2.10:5555"
+	req.Header.Set("Connection", "X-Forwarded-For")
+	req.Header.Set("X-Forwarded-For", "1.2.3.4")
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+
+	if gotXFF != "192.0.2.10" {
+		t.Fatalf("a Connection-nominated XFF must be stripped, leaving only the peer, got %q", gotXFF)
 	}
 }
 

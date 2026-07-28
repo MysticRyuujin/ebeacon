@@ -182,10 +182,11 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 		upReq.Header.Set(k, v)
 	}
 
-	if !u.CBTryAcquire() {
+	tok, ok := u.CBTryAcquire()
+	if !ok {
 		return false
 	}
-	defer u.CBRelease()
+	defer tok.Release()
 	u.ConsumeRateToken()
 	u.IncrActive()
 	resp, err := u.Client.Do(upReq)
@@ -194,7 +195,7 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 		u.DecrActive()
 		if ctx.Err() == nil {
 			slog.Warn("sse: upstream connection failed", "network", r.networkID, "upstream", u.ID, "err", err)
-			u.CBFailure()
+			tok.Failure()
 		}
 		return false
 	}
@@ -203,10 +204,9 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 
 	if resp.StatusCode != http.StatusOK {
 		slog.Warn("sse: upstream bad status", "network", r.networkID, "upstream", u.ID, "status", resp.StatusCode)
-		u.CBFailure()
+		tok.Failure()
 		return false
 	}
-	u.CBSuccess()
 
 	if !*headersSent {
 		copyResponseHeaders(w.Header(), resp.Header)
@@ -225,6 +225,14 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 
 	connectedAt := time.Now()
 	slog.Debug("sse: upstream connected", "network", r.networkID, "upstream", u.ID)
+
+	// Success is credited only once a real event reaches the client: a frame
+	// carrying a non-comment field, newly delivered rather than deduplicated.
+	// Crediting anything cheaper (the connect, a keep-alive, a replay of an
+	// event already seen) would zero the failure count on every reconnect, so
+	// an upstream that serves nothing new could never trip the breaker.
+	credited := false
+	eventHasField := false
 
 	// Read line-by-line without Scanner's fixed token limit; beacon events may
 	// include large payloads for some topics. Lines are capped so a stream
@@ -293,11 +301,21 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 						"network", r.networkID, "upstream", u.ID, "size", event.Len())
 					return true
 				}
+				terminator := rr.line == "\n" || rr.line == "\r\n"
+				if !terminator && !strings.HasPrefix(rr.line, ":") {
+					eventHasField = true
+				}
 				event.WriteString(rr.line)
-				if rr.line == "\n" || rr.line == "\r\n" {
-					if !flushSSEEvent(w, flusher, seen, &event, false) {
+				if terminator {
+					wrote, ok := flushSSEEvent(w, flusher, seen, &event, false)
+					if !ok {
 						return true
 					}
+					if wrote && eventHasField && !credited {
+						tok.Success()
+						credited = true
+					}
+					eventHasField = false
 				}
 			}
 
@@ -305,8 +323,17 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 				continue
 			}
 			if rr.err == io.EOF {
-				if !flushSSEEvent(w, flusher, seen, &event, true) {
+				wrote, ok := flushSSEEvent(w, flusher, seen, &event, true)
+				if !ok {
 					return true
+				}
+				if wrote && eventHasField && !credited {
+					tok.Success()
+					credited = true
+				}
+				// Closing cleanly having served nothing is still a fault.
+				if !credited {
+					tok.Failure()
 				}
 				slog.Info("sse: upstream closed connection",
 					"network", r.networkID, "upstream", u.ID,
@@ -316,7 +343,14 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 			if ctx.Err() == nil {
 				slog.Warn("sse: read error", "network", r.networkID, "upstream", u.ID,
 					"err", rr.err, "duration", time.Since(connectedAt).Round(time.Second))
-				u.CBFailure()
+				// A stream that already credited its success no longer owns a
+				// recovery probe, so the drop counts against closed-state
+				// accounting only.
+				if credited {
+					u.CBFailure()
+				} else {
+					tok.Failure()
+				}
 			}
 			return true
 		}
@@ -346,9 +380,12 @@ func readCappedLine(r *bufio.Reader, max int) (string, error) {
 	}
 }
 
-func flushSSEEvent(w http.ResponseWriter, flusher http.Flusher, seen *seenRing, event *strings.Builder, forceTerminator bool) bool {
+// flushSSEEvent reports whether it wrote the event to the client, and whether
+// the client is still usable. An empty or already-seen event yields
+// (false, true): nothing reached the client, but that is not an error.
+func flushSSEEvent(w http.ResponseWriter, flusher http.Flusher, seen *seenRing, event *strings.Builder, forceTerminator bool) (wrote, ok bool) {
 	if event.Len() == 0 {
-		return true
+		return false, true
 	}
 
 	evStr := event.String()
@@ -359,14 +396,14 @@ func flushSSEEvent(w http.ResponseWriter, flusher http.Flusher, seen *seenRing, 
 	h := hashEvent(evStr)
 	if seen.has(h) {
 		event.Reset()
-		return true
+		return false, true
 	}
 	seen.add(h)
 
 	if _, err := w.Write([]byte(evStr)); err != nil {
-		return false
+		return false, false
 	}
 	flusher.Flush()
 	event.Reset()
-	return true
+	return true, true
 }

@@ -9,7 +9,7 @@ help:
 	@echo "  make lint          - run golangci-lint"
 	@echo "  make test          - run Go tests"
 	@echo "  make vet           - run go vet"
-	@echo "  make vuln          - run the optional govulncheck scan"
+	@echo "  make vuln          - run govulncheck"
 	@echo "  make mod-check     - verify go.mod/go.sum are tidy"
 	@echo "  make loadtest      - build scripts/loadtest/loadtest"
 	@echo "  make reliability   - build scripts/reliability/reliability"
@@ -69,7 +69,7 @@ reliability:
 docker-build:
 	@docker build -t ebeacon:local .
 
-ci-local: fmt-check mod-check vet lint test
+ci-local: fmt-check mod-check vet lint test vuln
 
 hooks-install:
 	@./scripts/install-hooks.sh

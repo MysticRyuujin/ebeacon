@@ -10,6 +10,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log/slog"
+	"maps"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -697,6 +698,11 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var resp *http.Response
 	var u *upstream.Upstream
 	var execErr error
+	// Settled after the response body is read: a response whose body turns
+	// out to be unreadable must not credit a half-open recovery probe. The
+	// multiplexed path settles inside the leader closure instead, so cbTok
+	// stays zero (a no-op) for those callers.
+	var cbTok upstream.CBToken
 
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
 		dedupKey := dedupKey(n.id, r.Method, r.URL, bodyBytes, cacheScope, acceptBinary)
@@ -725,15 +731,17 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// backstops the case where no failsafe timeout is configured.
 			execCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), n.maxTimeout)
 			defer cancel()
-			resp, u, err := n.executeWithFailsafe(execCtx, r, bodyBytes, preferID, requiredSelector, fs, apiPath)
+			resp, u, tok, err := n.executeFS(execCtx, r, bodyBytes, preferID, requiredSelector, fs, apiPath)
 			if err != nil {
 				return nil, err
 			}
 			body, err := readAndFinalizeResponseBody(resp, n.maxResponseBytes)
 			resp.Body.Close() //nolint:errcheck
 			if err != nil {
+				tok.Failure()
 				return nil, fmt.Errorf("read upstream response body: %w", err)
 			}
+			settleTokenForStatus(tok, resp.StatusCode)
 			return &muxResult{resp: resp, u: u, body: body}, nil
 		})
 
@@ -768,7 +776,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			execErr = fmt.Errorf("multiplexed request failed")
 		}
 	} else {
-		resp, u, execErr = n.executeWithFailsafe(r.Context(), r, bodyBytes, preferID, requiredSelector, fs, apiPath)
+		resp, u, cbTok, execErr = n.executeFS(r.Context(), r, bodyBytes, preferID, requiredSelector, fs, apiPath)
 	}
 
 	if execErr != nil {
@@ -821,14 +829,16 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			u.RecordScoreErrorForPath(apiPath)
 			n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
 			u.RecordError()
-			u.CBFailure()
+			cbTok.Failure()
 		} else {
-			u.CBRelease()
+			cbTok.Release()
 		}
 		n.logFailure(r, bodyBytes, apiPath, u.ID, http.StatusBadGateway, resp.Header, nil, err, time.Since(start), "upstream_response_read_error", "", 0)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
+
+	settleTokenForStatus(cbTok, resp.StatusCode)
 
 	// Cache successful responses after the body has been read in full.
 	if cachePolicy != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 &&
@@ -944,9 +954,16 @@ func mergeFailsafe(base, override config.FailsafeConfig) config.FailsafeConfig {
 	return result
 }
 
-// executeWithFailsafe runs execute with the given failsafe config.
-func (n *Network) executeWithFailsafe(ctx context.Context, r *http.Request, bodyBytes []byte, preferID string, required requiredUpstreamSelector, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, error) {
-	return n.executeFS(ctx, r, bodyBytes, preferID, required, fs, apiPath)
+// settleTokenForStatus applies the shared status-to-outcome rule so it cannot
+// drift between the callers that settle a response they have consumed.
+// Responses discarded unread settle as Release instead: a body never verified
+// must not credit a circuit-breaker recovery probe.
+func settleTokenForStatus(tok upstream.CBToken, status int) {
+	if status >= 500 {
+		tok.Failure()
+		return
+	}
+	tok.Success()
 }
 
 // isClientCancel reports whether err is a context cancellation propagated
@@ -957,33 +974,32 @@ func isClientCancel(ctx context.Context, err error) bool {
 	return errors.Is(err, context.Canceled) && errors.Is(ctx.Err(), context.Canceled)
 }
 
-func (n *Network) executeSelectedFS(ctx context.Context, r *http.Request, bodyBytes []byte, required requiredUpstreamSelector, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, error) {
+func (n *Network) executeSelectedFS(ctx context.Context, r *http.Request, bodyBytes []byte, required requiredUpstreamSelector, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, upstream.CBToken, error) {
 	if required.upstreamID != "" {
 		u := n.pool.ByID(required.upstreamID)
 		if u == nil {
-			return nil, nil, &selectedUpstreamUnavailableError{selector: required.label()}
+			return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.label()}
 		}
 		var body io.Reader
 		if bodyBytes != nil {
 			body = bytes.NewReader(bodyBytes)
 		}
-		resp, err := n.forward(ctx, u, r, body)
+		resp, tok, err := n.forward(ctx, u, r, body)
 		if err != nil {
-			if !isClientCancel(ctx, err) && !errors.Is(err, upstream.ErrCircuitUnavailable) {
-				u.CBFailure()
+			if isClientCancel(ctx, err) {
+				tok.Release()
+			} else if !errors.Is(err, upstream.ErrCircuitUnavailable) {
+				tok.Failure()
 				u.RecordScoreErrorForPath(apiPath)
 				n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
 				u.RecordError()
 			}
-			return nil, nil, &selectedUpstreamUnavailableError{selector: required.label(), err: err}
+			return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.label(), err: err}
 		}
-		if resp.StatusCode < 500 {
-			u.CBSuccess()
-		} else {
-			u.CBFailure()
+		if resp.StatusCode >= 500 {
 			u.RecordError()
 		}
-		return resp, u, nil
+		return resp, u, tok, nil
 	}
 
 	if required.glob != "" {
@@ -993,7 +1009,7 @@ func (n *Network) executeSelectedFS(ctx context.Context, r *http.Request, bodyBy
 		}
 		ups := n.pool.SelectByGlobForPath(required.glob, apiPath, maxAttempts)
 		if len(ups) == 0 {
-			return nil, nil, &selectedUpstreamUnavailableError{selector: required.label()}
+			return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.label()}
 		}
 		return n.executeSelectedCandidatesFS(ctx, r, bodyBytes, required, fs, ups, apiPath)
 	}
@@ -1004,15 +1020,27 @@ func (n *Network) executeSelectedFS(ctx context.Context, r *http.Request, bodyBy
 	}
 	ups := n.pool.SelectByClientTypeForPath(required.clientType, apiPath, maxAttempts)
 	if len(ups) == 0 {
-		return nil, nil, &selectedUpstreamUnavailableError{selector: required.label()}
+		return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.label()}
 	}
 	return n.executeSelectedCandidatesFS(ctx, r, bodyBytes, required, fs, ups, apiPath)
 }
 
-func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Request, bodyBytes []byte, required requiredUpstreamSelector, fs config.FailsafeConfig, ups []*upstream.Upstream, apiPath string) (*http.Response, *upstream.Upstream, error) {
+func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Request, bodyBytes []byte, required requiredUpstreamSelector, fs config.FailsafeConfig, ups []*upstream.Upstream, apiPath string) (*http.Response, *upstream.Upstream, upstream.CBToken, error) {
 	var lastResp *http.Response
 	var lastUpstream *upstream.Upstream
+	var lastTok upstream.CBToken
 	var lastErr error
+
+	// The buffered response's tracked body owns a DecrActive and its token may
+	// own a recovery probe; dropping one without the other leaks activeConns
+	// or strands the probe.
+	dropBuffered := func() {
+		if lastResp != nil {
+			lastResp.Body.Close() //nolint:errcheck
+			lastTok.Release()
+			lastResp = nil
+		}
+	}
 
 	// Client-type and glob selectors can include multiple upstreams of
 	// mixed retention (e.g. a pruned local lighthouse and an archive-capable
@@ -1027,13 +1055,8 @@ func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Reque
 			delay := retryDelay(fs.Retry, i-1)
 			select {
 			case <-ctx.Done():
-				// Close any buffered pruning response before bailing;
-				// its tracked body owns a DecrActive that would otherwise
-				// leak activeConns for that upstream.
-				if lastResp != nil {
-					lastResp.Body.Close() //nolint:errcheck
-				}
-				return nil, nil, &selectedUpstreamUnavailableError{selector: required.label(), err: ctx.Err()}
+				dropBuffered()
+				return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.label(), err: ctx.Err()}
 			case <-time.After(delay):
 			}
 		}
@@ -1043,7 +1066,7 @@ func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Reque
 			body = bytes.NewReader(bodyBytes)
 		}
 
-		resp, err := n.forward(ctx, u, r, body)
+		resp, tok, err := n.forward(ctx, u, r, body)
 		if err == nil && resp.StatusCode < 500 {
 			peeked, peekErr := peekBodyForPruning(resp, target)
 			if peekErr != nil {
@@ -1051,43 +1074,34 @@ func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Reque
 			}
 			if i < len(ups)-1 && isPruningError(resp.StatusCode, peeked, target) {
 				// Pruning-shaped response with more candidates remaining:
-				// record it as lastResp (so we'll return it if no later
-				// candidate produces a real success) and continue.
-				//
-				// CBSuccess is intentional: a pruning/custody response means
-				// the upstream responded cleanly but lacks the data — not
-				// an upstream fault. Treating it as a failure would trip
-				// the CB on any non-supernode client that receives a steady
-				// stream of blob queries it literally cannot serve, locking
-				// out that upstream from unrelated requests it could serve.
-				u.CBSuccess()
+				// buffer it (returned only if no later candidate produces a
+				// real success) and continue. Its token rides along unsettled
+				// so the outcome reflects whether the body is readable, and it
+				// is never a failure — a non-supernode client fielding a
+				// steady stream of blob queries it cannot serve would
+				// otherwise trip its own breaker.
 				u.RecordResponseStatus(resp.StatusCode)
-				if lastResp != nil {
-					lastResp.Body.Close() //nolint:errcheck
-				}
+				dropBuffered()
 				lastResp = resp
 				lastUpstream = u
+				lastTok = tok
 				lastErr = fmt.Errorf("HTTP %d (pruned)", resp.StatusCode)
 				continue
 			}
-			u.CBSuccess()
-			if lastResp != nil {
-				lastResp.Body.Close() //nolint:errcheck
-			}
-			return resp, u, nil
+			dropBuffered()
+			return resp, u, tok, nil
 		}
 
 		if err != nil && isClientCancel(ctx, err) {
-			if lastResp != nil {
-				lastResp.Body.Close() //nolint:errcheck
-			}
-			return nil, nil, err
+			tok.Release()
+			dropBuffered()
+			return nil, nil, upstream.CBToken{}, err
 		}
 		if errors.Is(err, upstream.ErrCircuitUnavailable) {
 			lastErr = err
 			continue
 		}
-		u.CBFailure()
+		tok.Failure()
 		if err != nil || i < len(ups)-1 {
 			u.RecordScoreErrorForPath(apiPath)
 			n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
@@ -1097,18 +1111,17 @@ func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Reque
 			lastErr = err
 			continue
 		}
-		if lastResp != nil {
-			lastResp.Body.Close() //nolint:errcheck
-		}
+		dropBuffered()
 		lastResp = resp
 		lastUpstream = u
+		lastTok = upstream.CBToken{}
 		lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
 	if lastResp != nil {
-		return lastResp, lastUpstream, nil
+		return lastResp, lastUpstream, lastTok, nil
 	}
-	return nil, nil, &selectedUpstreamUnavailableError{selector: required.label(), err: lastErr}
+	return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.label(), err: lastErr}
 }
 
 // dedupKey computes a hash key for request deduplication. acceptBinary must
@@ -1173,7 +1186,12 @@ func (n *Network) effectiveCacheTTL(policyTTL time.Duration, path string) time.D
 	return policyTTL
 }
 
-func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []byte, preferID string, required requiredUpstreamSelector, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, error) {
+// executeFS dispatches the request under the given failsafe config. The
+// returned CBToken belongs to the returned response and must be settled by the
+// consumer after the body is read: a response whose body turns out to be
+// unreadable must not count as a circuit-breaker recovery success. A zero
+// token means settlement already happened internally.
+func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []byte, preferID string, required requiredUpstreamSelector, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, upstream.CBToken, error) {
 	var timeoutCancel context.CancelFunc
 	if fs.Timeout != nil {
 		ctx, timeoutCancel = context.WithTimeout(ctx, fs.Timeout.Duration)
@@ -1185,12 +1203,12 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 	}
 
 	if required.enabled() {
-		resp, u, err := n.executeSelectedFS(ctx, r, bodyBytes, required, fs, apiPath)
+		resp, u, tok, err := n.executeSelectedFS(ctx, r, bodyBytes, required, fs, apiPath)
 		if err != nil {
 			cancelTimeout()
-			return nil, nil, err
+			return nil, nil, upstream.CBToken{}, err
 		}
-		return wrapResponseBodyCancel(resp, timeoutCancel), u, nil
+		return wrapResponseBodyCancel(resp, timeoutCancel), u, tok, nil
 	}
 
 	// For requests targeting a named head ID (/head, /finalized, /justified)
@@ -1265,11 +1283,15 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 				req.Header.Del("Accept-Encoding")
 				return req, nil
 			})
-			if err != nil {
-				cancelTimeout()
-				return nil, nil, err
+			if err == nil {
+				return wrapResponseBodyCancel(resp, timeoutCancel), u, upstream.CBToken{}, nil
 			}
-			return wrapResponseBodyCancel(resp, timeoutCancel), u, nil
+			// Recovery probes gated enough participants to make the agreement
+			// threshold unreachable; the sequential path below can still serve.
+			if !errors.Is(err, upstream.ErrCircuitUnavailable) {
+				cancelTimeout()
+				return nil, nil, upstream.CBToken{}, err
+			}
 		}
 	}
 
@@ -1283,12 +1305,12 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 		count := fs.Hedge.MaxCount + 1
 		ups := selectForPath(apiPath, count)
 		if len(ups) > 1 {
-			resp, u, err := n.executeHedgeFS(ctx, ups, r, bodyBytes, preferID, fs, apiPath, target, proactiveArchive)
+			resp, u, tok, err := n.executeHedgeFS(ctx, ups, r, bodyBytes, preferID, fs, apiPath, target, proactiveArchive)
 			if err != nil {
 				cancelTimeout()
-				return nil, nil, err
+				return nil, nil, upstream.CBToken{}, err
 			}
-			return wrapResponseBodyCancel(resp, timeoutCancel), u, nil
+			return wrapResponseBodyCancel(resp, timeoutCancel), u, tok, nil
 		}
 	}
 
@@ -1296,7 +1318,7 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 	ups := selectForPath(apiPath, maxAttempts)
 	if len(ups) == 0 {
 		cancelTimeout()
-		return nil, nil, fmt.Errorf("no upstreams available")
+		return nil, nil, upstream.CBToken{}, fmt.Errorf("no upstreams available")
 	}
 
 	ups = ensurePreferredUpstreamFirst(n.pool, ups, preferID, maxAttempts)
@@ -1323,7 +1345,7 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 			select {
 			case <-ctx.Done():
 				cancelTimeout()
-				return nil, nil, ctx.Err()
+				return nil, nil, upstream.CBToken{}, ctx.Err()
 			case <-time.After(delay):
 			}
 		}
@@ -1334,7 +1356,7 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 		}
 
 		attemptStarted := time.Now()
-		resp, err := n.forward(ctx, u, r, body)
+		resp, tok, err := n.forward(ctx, u, r, body)
 		if err == nil && resp.StatusCode < 500 {
 			// Pruning-shaped response on a historical target: if we have
 			// archive upstreams we haven't yet tried, promote and re-enter
@@ -1354,14 +1376,13 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 					// signal that adding an archive upstream would help,
 					// then return the 404 unchanged (no behavior change).
 					metricPruningErrorNoArchive.WithLabelValues(n.id).Inc()
-					u.CBSuccess()
-					return wrapResponseBodyCancel(resp, timeoutCancel), u, nil
+					return wrapResponseBodyCancel(resp, timeoutCancel), u, tok, nil
 				}
 				remaining := max(maxAttempts-(i+1), 1)
 				archiveUps := n.pool.SelectForPathArchive(apiPath, remaining)
 				if len(archiveUps) > 0 {
 					resp.Body.Close() //nolint:errcheck
-					u.CBSuccess()
+					tok.Release()
 					u.RecordResponseStatus(resp.StatusCode)
 					metricArchivePromotion.WithLabelValues(n.id, archivePromotionOnError).Inc()
 					slog.Debug("promoting to archive upstreams after pruning-shaped 404", "network", n.id, "upstream", u.ID, "status", resp.StatusCode, "api_path", apiPath, "remaining_attempts", len(archiveUps))
@@ -1375,13 +1396,13 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 				// the normal success return with the body still open; the
 				// peeked prefix replays via the MultiReader.
 			}
-			u.CBSuccess()
-			return wrapResponseBodyCancel(resp, timeoutCancel), u, nil
+			return wrapResponseBodyCancel(resp, timeoutCancel), u, tok, nil
 		}
 
 		if err != nil && isClientCancel(ctx, err) {
+			tok.Release()
 			cancelTimeout()
-			return nil, nil, err
+			return nil, nil, upstream.CBToken{}, err
 		}
 		if errors.Is(err, upstream.ErrCircuitUnavailable) {
 			lastErr = err
@@ -1402,14 +1423,14 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 			}
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 		}
-		u.CBFailure()
+		tok.Failure()
 		u.RecordScoreErrorForPath(apiPath)
 		n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
 		u.RecordError()
 	}
 
 	cancelTimeout()
-	return nil, nil, fmt.Errorf("all %d upstream(s) failed: %w", len(ups), lastErr)
+	return nil, nil, upstream.CBToken{}, fmt.Errorf("all %d upstream(s) failed: %w", len(ups), lastErr)
 }
 
 // ensurePreferredUpstreamFirst moves preferID to the front, or prepends it from the pool if missing from ups.
@@ -1442,7 +1463,7 @@ func trimUpstreamSlice(ups []*upstream.Upstream, maxLen int) []*upstream.Upstrea
 	return ups
 }
 
-func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, r *http.Request, bodyBytes []byte, preferID string, fs config.FailsafeConfig, apiPath string, target HistoricalTarget, archiveBiased bool) (*http.Response, *upstream.Upstream, error) {
+func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, r *http.Request, bodyBytes []byte, preferID string, fs config.FailsafeConfig, apiPath string, target HistoricalTarget, archiveBiased bool) (*http.Response, *upstream.Upstream, upstream.CBToken, error) {
 	hedge := fs.Hedge
 	maxFire := hedge.MaxCount + 1
 	if maxFire > len(ups) {
@@ -1453,6 +1474,7 @@ func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, 
 	type result struct {
 		resp     *http.Response
 		u        *upstream.Upstream
+		tok      upstream.CBToken
 		err      error
 		idx      int
 		duration time.Duration
@@ -1471,8 +1493,8 @@ func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, 
 				body = bytes.NewReader(bodyBytes)
 			}
 			started := time.Now()
-			resp, err := n.forward(reqCtx, u, r, body)
-			resultCh <- result{resp: resp, u: u, err: err, idx: idx, duration: time.Since(started)}
+			resp, tok, err := n.forward(reqCtx, u, r, body)
+			resultCh <- result{resp: resp, u: u, tok: tok, err: err, idx: idx, duration: time.Since(started)}
 		}(idx)
 	}
 
@@ -1493,7 +1515,10 @@ func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, 
 	// bodies so TrackResponse accounting (DecrActive) completes for losing
 	// attempts — context cancellation tears down the connection but never
 	// calls the tracked body's Close, which would leak activeConns forever.
-	// No CB/error accounting: losers canceled by us are not upstream faults.
+	// Release (not Failure) because losers canceled by us are not upstream
+	// faults, but it must be unconditional: a loser that errored without a
+	// response still holds an admission token, and stranding it would leave
+	// a half-open recovery probe in flight forever.
 	drainResults := func(remaining int) {
 		if remaining <= 0 {
 			return
@@ -1503,8 +1528,8 @@ func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, 
 				res := <-resultCh
 				if res.resp != nil {
 					res.resp.Body.Close() //nolint:errcheck
-					res.u.CBRelease()
 				}
+				res.tok.Release()
 			}
 		}()
 	}
@@ -1553,8 +1578,8 @@ loop:
 					} else {
 						res.resp.Body.Close() //nolint:errcheck
 						triedByID[res.u.ID] = struct{}{}
+						res.tok.Release()
 					}
-					res.u.CBSuccess()
 					res.u.RecordResponseStatus(res.resp.StatusCode)
 					if inflight == 0 && fired >= maxFire {
 						break loop
@@ -1567,13 +1592,14 @@ loop:
 				drainResults(inflight)
 				if pruningResp != nil {
 					pruningResp.resp.Body.Close() //nolint:errcheck
+					pruningResp.tok.Release()
 					pruningResp = nil
 				}
 				res.resp = wrapResponseBodyCancel(res.resp, cancels[res.idx])
-				res.u.CBSuccess()
-				return res.resp, res.u, nil
+				return res.resp, res.u, res.tok, nil
 			}
 			if res.err != nil && isClientCancel(ctx, res.err) {
+				res.tok.Release()
 				triedByID[res.u.ID] = struct{}{}
 				lastErr = res.err
 				if inflight == 0 && fired >= maxFire {
@@ -1602,7 +1628,7 @@ loop:
 					n.logFailure(r, bodyBytes, apiPath, res.u.ID, res.resp.StatusCode, res.resp.Header, failedBody, nil, res.duration, "hedged_attempt_failed", "", res.idx+1)
 				}
 			}
-			res.u.CBFailure()
+			res.tok.Failure()
 			res.u.RecordScoreErrorForPath(apiPath)
 			n.pool.RefreshUpstreamPathScoreMetrics(res.u, apiPath)
 			res.u.RecordError()
@@ -1626,8 +1652,9 @@ loop:
 			drainResults(inflight)
 			if pruningResp != nil {
 				pruningResp.resp.Body.Close() //nolint:errcheck
+				pruningResp.tok.Release()
 			}
-			return nil, nil, ctx.Err()
+			return nil, nil, upstream.CBToken{}, ctx.Err()
 		}
 	}
 
@@ -1642,6 +1669,14 @@ loop:
 		// which would turn the buffered 404 into a read-error 502.
 		pruneBody, pruneReadErr := readAndFinalizeResponseBody(pruningResp.resp, n.maxResponseBytes)
 		pruningResp.resp.Body.Close() //nolint:errcheck
+		// Settled only now that the body has been read: a pruning-shaped
+		// response is not an upstream fault, but a truncated one is, and
+		// crediting at buffer time would let it close a half-open circuit.
+		if pruneReadErr != nil {
+			pruningResp.tok.Failure()
+		} else {
+			pruningResp.tok.Success()
+		}
 		cancelAll()
 		maxArchiveAttempts := maxFire
 		if fs.Retry != nil && fs.Retry.MaxAttempts > maxArchiveAttempts {
@@ -1652,38 +1687,38 @@ loop:
 		// most of that budget racing two upstreams, the archive retry may
 		// not complete — callers see ctx-deadline. Acceptable tradeoff:
 		// keeps the client's overall deadline honored.
-		archiveResp, archiveU, archiveErr := n.promoteToArchive(ctx, apiPath, r, bodyBytes, triedByID, maxArchiveAttempts, target)
+		archiveResp, archiveU, archiveTok, archiveErr := n.promoteToArchive(ctx, apiPath, r, bodyBytes, triedByID, maxArchiveAttempts, target)
 		if archiveErr == nil && archiveResp != nil {
 			metricArchivePromotion.WithLabelValues(n.id, archivePromotionOnError).Inc()
 			slog.Debug("promoting hedge pruning result to archive upstream", "network", n.id, "api_path", apiPath, "archive_upstream", archiveU.ID)
-			return archiveResp, archiveU, nil
+			return archiveResp, archiveU, archiveTok, nil
 		}
 		if archiveErr != nil {
 			slog.Debug("archive promotion after hedge pruning failed", "network", n.id, "api_path", apiPath, "err", archiveErr)
 		}
 		if pruneReadErr != nil {
-			return nil, nil, fmt.Errorf("read hedge pruning response body: %w", pruneReadErr)
+			return nil, nil, upstream.CBToken{}, fmt.Errorf("read hedge pruning response body: %w", pruneReadErr)
 		}
 		pruningResp.resp.Body = io.NopCloser(bytes.NewReader(pruneBody))
-		return pruningResp.resp, pruningResp.u, nil
+		return pruningResp.resp, pruningResp.u, upstream.CBToken{}, nil
 	}
 
 	cancelAll()
-	return nil, nil, fmt.Errorf("all hedged requests failed: %w", lastErr)
+	return nil, nil, upstream.CBToken{}, fmt.Errorf("all hedged requests failed: %w", lastErr)
 }
 
 // promoteToArchive runs a sequential pass over the archive-capable upstreams
 // not already tried by the caller, returning the first successful (non-5xx,
-// non-pruning) response. Returns (nil, nil, nil) if no archive upstreams are
-// available or all fail. Caller is responsible for closing any buffered
-// non-archive response if this succeeds.
-func (n *Network) promoteToArchive(ctx context.Context, apiPath string, r *http.Request, bodyBytes []byte, triedByID map[string]struct{}, maxAttempts int, target HistoricalTarget) (*http.Response, *upstream.Upstream, error) {
+// non-pruning) response and its unsettled CBToken. Returns a nil response if
+// no archive upstreams are available or all fail. Caller is responsible for
+// closing any buffered non-archive response if this succeeds.
+func (n *Network) promoteToArchive(ctx context.Context, apiPath string, r *http.Request, bodyBytes []byte, triedByID map[string]struct{}, maxAttempts int, target HistoricalTarget) (*http.Response, *upstream.Upstream, upstream.CBToken, error) {
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
 	archiveUps := n.pool.SelectForPathArchive(apiPath, maxAttempts)
 	if len(archiveUps) == 0 {
-		return nil, nil, nil
+		return nil, nil, upstream.CBToken{}, nil
 	}
 	var lastErr error
 	for _, u := range archiveUps {
@@ -1694,22 +1729,23 @@ func (n *Network) promoteToArchive(ctx context.Context, apiPath string, r *http.
 		if bodyBytes != nil {
 			body = bytes.NewReader(bodyBytes)
 		}
-		resp, err := n.forward(ctx, u, r, body)
+		resp, tok, err := n.forward(ctx, u, r, body)
 		if err != nil {
 			lastErr = err
 			if isClientCancel(ctx, err) {
-				return nil, nil, err
+				tok.Release()
+				return nil, nil, upstream.CBToken{}, err
 			}
 			if errors.Is(err, upstream.ErrCircuitUnavailable) {
 				continue
 			}
-			u.CBFailure()
+			tok.Failure()
 			continue
 		}
 		if resp.StatusCode >= 500 {
 			resp.Body.Close() //nolint:errcheck
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
-			u.CBFailure()
+			tok.Failure()
 			continue
 		}
 		// Archive upstreams still subject to pruning classification —
@@ -1719,20 +1755,22 @@ func (n *Network) promoteToArchive(ctx context.Context, apiPath string, r *http.
 		if isPruningError(resp.StatusCode, peeked, target) {
 			resp.Body.Close() //nolint:errcheck
 			lastErr = fmt.Errorf("archive upstream returned pruning-shaped HTTP %d", resp.StatusCode)
-			u.CBSuccess() // not an upstream fault
+			tok.Release() // discarded unread: not a fault, but no verified success either
 			continue
 		}
-		u.CBSuccess()
-		return resp, u, nil
+		return resp, u, tok, nil
 	}
-	return nil, nil, lastErr
+	return nil, nil, upstream.CBToken{}, lastErr
 }
 
-func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Request, body io.Reader) (*http.Response, error) {
+// forward dispatches one request to u and never settles the returned CBToken;
+// the caller must settle it exactly once (Success/Failure/Release), including
+// on error returns.
+func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Request, body io.Reader) (*http.Response, upstream.CBToken, error) {
 	dest := u.URL + pathAndQueryForUpstream(r.URL)
 	req, err := http.NewRequestWithContext(ctx, r.Method, dest, body)
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", upstream.SanitizeError(err))
+		return nil, upstream.CBToken{}, fmt.Errorf("build request: %w", upstream.SanitizeError(err))
 	}
 
 	copyRequestHeaders(req.Header, r.Header)
@@ -1747,28 +1785,28 @@ func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Req
 
 	// Append the immediate peer to the XFF chain, per convention. Appending
 	// the extracted client IP instead would duplicate the (spoofable) first
-	// XFF entry and lose the real peer address.
+	// XFF entry and lose the real peer address. Read the existing chain from
+	// the filtered outbound headers, not r.Header, so a client nominating
+	// X-Forwarded-For via Connection cannot smuggle it past the hop-by-hop
+	// stripping in copyRequestHeaders.
 	peer := remoteAddrHost(r)
-	if existing := r.Header.Get("X-Forwarded-For"); existing != "" {
+	if existing := req.Header.Get("X-Forwarded-For"); existing != "" {
 		req.Header.Set("X-Forwarded-For", existing+", "+peer)
 	} else {
 		req.Header.Set("X-Forwarded-For", peer)
 	}
 	req.Header.Set("X-Forwarded-Host", r.Host)
 
-	if !u.CBTryAcquire() {
-		return nil, upstream.ErrCircuitUnavailable
+	tok, ok := u.CBTryAcquire()
+	if !ok {
+		return nil, upstream.CBToken{}, upstream.ErrCircuitUnavailable
 	}
 	u.ConsumeRateToken()
 	u.IncrActive()
 	resp, err := u.Client.Do(req)
 	if err != nil {
 		u.DecrActive()
-		err = upstream.SanitizeError(err)
-		if isClientCancel(ctx, err) {
-			u.CBRelease()
-		}
-		return nil, err
+		return nil, tok, upstream.SanitizeError(err)
 	}
 
 	// Decompress gzip upstream response so caching and body processing work correctly.
@@ -1779,14 +1817,14 @@ func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Req
 		if gErr != nil {
 			resp.Body.Close() //nolint:errcheck
 			u.DecrActive()
-			return nil, fmt.Errorf("invalid gzip response body: %w", gErr)
+			return nil, tok, fmt.Errorf("invalid gzip response body: %w", gErr)
 		}
 		resp.Body = &gzipReadCloser{gzip: gr, orig: resp.Body}
 		resp.Header.Del("Content-Encoding")
 		resp.Header.Del("Content-Length")
 	}
 
-	return u.TrackResponse(resp), nil
+	return u.TrackResponse(resp), tok, nil
 }
 
 func (n *Network) logFailure(r *http.Request, reqBody []byte, apiPath, upstreamID string, status int, responseHeaders http.Header, responseBody []byte, err error, duration time.Duration, kind, selector string, attempt int) {
@@ -2005,19 +2043,31 @@ func copyResponseHeaders(dst, src http.Header) {
 	}
 }
 
+// hopByHopHeadersFor returns the headers to strip: the static set plus any
+// nominated by this message's Connection header (RFC 7230 §6.1). The returned
+// map is read-only — the common case shares the static set rather than
+// allocating a copy per request.
 func hopByHopHeadersFor(headers http.Header) map[string]struct{} {
-	out := make(map[string]struct{}, len(hopByHopHeaderSet)+4)
-	for name := range hopByHopHeaderSet {
-		out[name] = struct{}{}
-	}
+	var nominated map[string]struct{}
 	for _, value := range headers.Values("Connection") {
 		for token := range strings.SplitSeq(value, ",") {
-			if name := strings.ToLower(strings.TrimSpace(token)); name != "" {
-				out[name] = struct{}{}
+			name := strings.ToLower(strings.TrimSpace(token))
+			if name == "" {
+				continue
 			}
+			if _, static := hopByHopHeaderSet[name]; static {
+				continue
+			}
+			if nominated == nil {
+				nominated = maps.Clone(hopByHopHeaderSet)
+			}
+			nominated[name] = struct{}{}
 		}
 	}
-	return out
+	if nominated == nil {
+		return hopByHopHeaderSet
+	}
+	return nominated
 }
 
 // ObfuscateUpstreamID returns a stable 8-character hex token for an upstream ID

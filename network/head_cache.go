@@ -120,7 +120,7 @@ func (n *Network) populateCacheKey(ctx context.Context, key string, source *upst
 		preferID = source.ID
 	}
 
-	resp, _, err := n.executeWithFailsafe(
+	resp, _, cbTok, err := n.executeFS(
 		ctx,
 		req,
 		nil,
@@ -135,13 +135,23 @@ func (n *Network) populateCacheKey(ctx context.Context, key string, source *upst
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Pre-warm discards a non-2xx body unread, so it can vouch for a fault
+		// but not for a success — crediting one would let an unreadable
+		// response satisfy a circuit-breaker recovery probe.
+		if resp.StatusCode >= 500 {
+			cbTok.Failure()
+		} else {
+			cbTok.Release()
+		}
 		return nil
 	}
 
 	body, err := readAndFinalizeResponseBody(resp, n.maxResponseBytes)
 	if err != nil {
+		cbTok.Failure()
 		return fmt.Errorf("read pre-warm response body: %w", err)
 	}
+	cbTok.Success()
 	if !representationMatches(parsed.acceptBinary, resp.Header) {
 		return nil
 	}

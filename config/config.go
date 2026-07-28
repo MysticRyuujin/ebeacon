@@ -309,15 +309,27 @@ func Load(path string) (*Config, error) {
 	cfg := &Config{}
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
-	if err := decoder.Decode(cfg); err != nil {
+	// An empty or comment-only file decodes to io.EOF; fall through to
+	// validation so the operator gets an actionable error naming what is
+	// missing rather than a bare "EOF".
+	if err := decoder.Decode(cfg); err != nil && err != io.EOF {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		if err == nil {
+	// Drain the remaining documents rather than probing only the next one: a
+	// trailing "---" produces a null document, and stopping there would let a
+	// real second document hide behind it and be silently ignored.
+	for {
+		var extra any
+		err := decoder.Decode(&extra)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("parse config: %w", err)
+		}
+		if extra != nil {
 			return nil, fmt.Errorf("parse config: multiple YAML documents are not supported")
 		}
-		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.applyDefaults()
 	cfg.expandSecrets()
@@ -736,7 +748,7 @@ func (c *Config) validate() error {
 		if err := validateLiteralServeMuxPath("metrics.path", c.Metrics.Path); err != nil {
 			return err
 		}
-		if c.Metrics.Path == "/" {
+		if strings.TrimRight(c.Metrics.Path, "/") == "" {
 			return fmt.Errorf("metrics.path must not be \"/\" (it would shadow the proxy root)")
 		}
 		if c.UI.Enabled && strings.TrimRight(c.Metrics.Path, "/") == strings.TrimRight(c.UI.BasePath, "/") {
@@ -803,11 +815,11 @@ func validateLiteralServeMuxPath(name, value string) error {
 		strings.IndexFunc(value, func(r rune) bool { return unicode.IsControl(r) || unicode.IsSpace(r) }) >= 0 {
 		return fmt.Errorf("%s must be a literal HTTP path without whitespace, control characters, wildcards, query, or fragment syntax, got %q", name, value)
 	}
-	canonical := strings.TrimSuffix(value, "/")
-	if canonical == "" {
-		canonical = "/"
-	}
-	if path.Clean(value) != canonical {
+	// path.Clean collapses "//" (and longer runs) to "/", so comparing against
+	// it alone would accept a pattern ServeMux can never match.
+	cleaned := path.Clean(value)
+	trailingSlashOK := cleaned != "/" && value == cleaned+"/"
+	if value != cleaned && !trailingSlashOK {
 		return fmt.Errorf("%s must be a clean HTTP path, got %q", name, value)
 	}
 	return nil

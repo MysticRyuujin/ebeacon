@@ -437,6 +437,112 @@ func TestSSERelay_ReconnectsToBackupAfterDisconnect(t *testing.T) {
 	}
 }
 
+func TestSSERelay_UpstreamServingNoEventsTripsCircuitBreaker(t *testing.T) {
+	hijackClose := func(w http.ResponseWriter) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		conn.Close() //nolint:errcheck
+	}
+
+	// Three shapes of upstream that accept the stream and then serve nothing
+	// useful. None may be credited with a success, or the failure count would
+	// reset on every reconnect and the breaker could never open.
+	tests := []struct {
+		name  string
+		serve func(w http.ResponseWriter)
+	}{
+		{"drops connection before any data", func(w http.ResponseWriter) {
+			hijackClose(w)
+		}},
+		{"closes stream cleanly without events", func(w http.ResponseWriter) {}},
+		{"delivers only keep-alive newlines", func(w http.ResponseWriter) {
+			_, _ = w.Write([]byte("\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			hijackClose(w)
+		}},
+		{"delivers only comment frames", func(w http.ResponseWriter) {
+			_, _ = w.Write([]byte(": ping\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			hijackClose(w)
+		}},
+		{"replays an event already seen", func(w http.ResponseWriter) {
+			_, _ = w.Write([]byte("event: head\ndata: same-every-time\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			hijackClose(w)
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				tc.serve(w)
+			}))
+			defer up.Close()
+
+			pool, err := upstream.NewPool(
+				netID(t),
+				[]config.UpstreamConfig{{
+					ID:  "flapping",
+					URL: up.URL,
+					Failsafe: &config.FailsafeConfig{
+						CircuitBreaker: &config.CircuitBreakerConfig{
+							FailureThreshold: 3,
+							SuccessThreshold: 1,
+							HalfOpenAfter:    time.Hour,
+						},
+					},
+				}},
+				config.RoutingConfig{LoadBalancing: "round-robin"},
+				config.HealthConfig{CheckInterval: time.Hour, FinalityInterval: time.Hour, MaxSyncDistance: 10},
+				nil,
+			)
+			if err != nil {
+				t.Fatalf("new pool: %v", err)
+			}
+
+			relay := newSSERelay("mainnet", pool)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			req := httptest.NewRequest(http.MethodGet, "/eth/v1/events?topics=head", nil).WithContext(ctx)
+			req.Header.Set("Accept", "text/event-stream")
+			rec := httptest.NewRecorder()
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				relay.Serve(rec, req, "flapping", requiredUpstreamSelector{})
+			}()
+
+			u := pool.ByID("flapping")
+			deadline := time.Now().Add(3 * time.Second)
+			for u.IsReady() {
+				if time.Now().After(deadline) {
+					cancel()
+					<-done
+					t.Fatal("repeated cycles never opened the circuit breaker")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			cancel()
+			<-done
+		})
+	}
+}
+
 func TestSSERelay_SendsPingCommentsDuringIdlePeriods(t *testing.T) {
 	prev := ssePingInterval
 	ssePingInterval = 20 * time.Millisecond

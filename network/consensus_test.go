@@ -3,6 +3,8 @@ package network
 import (
 	"compress/gzip"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -280,5 +282,39 @@ func TestConsensusPolicy_ServerErrorOpensBreaker(t *testing.T) {
 
 	if u.IsReady() {
 		t.Fatal("a 5xx consensus response must count as a circuit-breaker failure")
+	}
+}
+
+func TestConsensusPolicy_GatedParticipantsReportCircuitUnavailable(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":"ok"}`))
+	}))
+	defer srv.Close()
+
+	cb := &config.CircuitBreakerConfig{FailureThreshold: 1, SuccessThreshold: 1, HalfOpenAfter: time.Millisecond}
+	ups := make([]*upstream.Upstream, 3)
+	for i := range ups {
+		ups[i] = upstream.New("testnet", config.UpstreamConfig{ID: fmt.Sprintf("u%d", i), URL: srv.URL}, cb, 100)
+	}
+
+	// Hold the recovery probe on two of the three participants, as a
+	// concurrent request would, leaving too few to reach agreement.
+	for _, u := range ups[:2] {
+		u.CBFailure()
+	}
+	time.Sleep(2 * time.Millisecond)
+	for _, u := range ups[:2] {
+		if _, ok := u.CBTryAcquire(); !ok {
+			t.Fatal("failed to hold the recovery probe")
+		}
+	}
+
+	cp := &ConsensusPolicy{MaxParticipants: 3, AgreementThreshold: 2}
+	_, _, err := cp.Execute(context.Background(), ups, func(u *upstream.Upstream) (*http.Request, error) {
+		return http.NewRequest(http.MethodGet, u.URL, nil)
+	})
+	if !errors.Is(err, upstream.ErrCircuitUnavailable) {
+		t.Fatalf("gated participants must surface ErrCircuitUnavailable so the caller can fall back, got %v", err)
 	}
 }

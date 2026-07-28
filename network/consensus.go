@@ -76,11 +76,12 @@ func (cp *ConsensusPolicy) Execute(
 				return
 			}
 			req = req.WithContext(ctx)
-			if !u.CBTryAcquire() {
+			tok, ok := u.CBTryAcquire()
+			if !ok {
 				results[idx] = consensusResult{err: upstream.ErrCircuitUnavailable, upstream: u}
 				return
 			}
-			defer u.CBRelease()
+			defer tok.Release()
 			u.ConsumeRateToken()
 			u.IncrActive()
 			resp, err := u.Client.Do(req)
@@ -89,8 +90,8 @@ func (cp *ConsensusPolicy) Execute(
 				u.DecrActive()
 				// A client disconnect cancels every participant's request;
 				// that is not an upstream fault, so don't open breakers.
-				if !isClientCancel(ctx, err) && !errors.Is(err, upstream.ErrCircuitUnavailable) {
-					u.CBFailure()
+				if !isClientCancel(ctx, err) {
+					tok.Failure()
 				}
 				results[idx] = consensusResult{err: err, upstream: u}
 				return
@@ -100,14 +101,12 @@ func (cp *ConsensusPolicy) Execute(
 			u.DecrActive()
 			u.RecordResponseStatus(resp.StatusCode)
 			if readErr != nil {
-				u.CBFailure()
+				tok.Failure()
 				results[idx] = consensusResult{err: readErr, upstream: u}
 				return
 			}
-			if resp.StatusCode < 500 {
-				u.CBSuccess()
-			} else {
-				u.CBFailure()
+			settleTokenForStatus(tok, resp.StatusCode)
+			if resp.StatusCode >= 500 {
 				u.RecordError()
 			}
 			results[idx] = consensusResult{
@@ -164,5 +163,15 @@ func (cp *ConsensusPolicy) Execute(
 		return resp, best.upstream, nil
 	}
 
+	gated := 0
+	for _, r := range results {
+		if errors.Is(r.err, upstream.ErrCircuitUnavailable) {
+			gated++
+		}
+	}
+	if gated > 0 && n-gated < cp.AgreementThreshold {
+		return nil, nil, fmt.Errorf("consensus unavailable: %d of %d participants gated by recovery probe, need %d agreement: %w",
+			gated, n, cp.AgreementThreshold, upstream.ErrCircuitUnavailable)
+	}
 	return nil, nil, fmt.Errorf("consensus not reached: %d participants, need %d agreement", n, cp.AgreementThreshold)
 }
