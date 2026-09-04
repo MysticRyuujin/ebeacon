@@ -5,7 +5,7 @@
 # of the Go compiler — a multi-arch build that would otherwise spend ~10
 # minutes emulating arm64 instructions on an amd64 runner now finishes in
 # the time of two native compiles.
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS build
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src
