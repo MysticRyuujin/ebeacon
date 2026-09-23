@@ -38,8 +38,7 @@ func newMultiPool(t *testing.T, networkID string, ids ...string) *upstream.Pool 
 func TestPool_UpdateFinalizedEpoch_RejectsImplausibleEpoch(t *testing.T) {
 	t.Parallel()
 	pool := newMinimalPool(t, "net-fin-guard")
-	pool.BlockCache().SetSlotTiming(time.Now().Unix()-100*32*12, 12)
-	pool.SetSlotsPerEpoch(32)
+	pool.SetChainTiming(time.Now().Unix()-100*32*12, 12, 32)
 
 	if got := pool.UpdateFinalizedEpoch(90); got != 90 {
 		t.Fatalf("plausible epoch rejected: got %d want 90", got)
@@ -71,8 +70,7 @@ func TestPool_StartStateSync_RejectsImplausibleSeed(t *testing.T) {
 	st.PublishFinalized("net-fin-seed", 5_000_000)
 
 	pool := newMinimalPool(t, "net-fin-seed")
-	pool.BlockCache().SetSlotTiming(time.Now().Unix()-100*32*12, 12)
-	pool.SetSlotsPerEpoch(32)
+	pool.SetChainTiming(time.Now().Unix()-100*32*12, 12, 32)
 	pool.SetSharedState(st)
 	pool.StartStateSync()
 

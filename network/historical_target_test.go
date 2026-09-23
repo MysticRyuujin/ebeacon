@@ -1,6 +1,10 @@
 package network
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/mysticryuujin/ebeacon/config"
+)
 
 func uint64Ptr(n uint64) *uint64 { return &n }
 
@@ -219,9 +223,9 @@ func TestClassifyHistoricalTarget(t *testing.T) {
 
 func TestHistoricalTargetRequiresArchive(t *testing.T) {
 	const headSlot uint64 = 10_000_000 // arbitrary "now"
-	headEpoch := headSlot / SlotsPerEpoch
-	blocksRetentionSlots := blocksRetentionEpochs * SlotsPerEpoch
-	blobSidecarsRetentionSlots := blobSidecarsRetentionEpochs * SlotsPerEpoch
+	headEpoch := headSlot / config.DefaultSlotsPerEpoch
+	blocksRetentionSlots := blocksRetentionEpochs * config.DefaultSlotsPerEpoch
+	blobSidecarsRetentionSlots := blobSidecarsRetentionEpochs * config.DefaultSlotsPerEpoch
 
 	tests := []struct {
 		name   string
@@ -357,7 +361,7 @@ func TestHistoricalTargetRequiresArchive(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.target.RequiresArchive(tt.head, SlotsPerEpoch); got != tt.want {
+			if got := tt.target.RequiresArchive(tt.head, config.DefaultSlotsPerEpoch); got != tt.want {
 				t.Errorf("RequiresArchive(%d): got %v want %v", tt.head, got, tt.want)
 			}
 		})
@@ -380,7 +384,7 @@ func TestHistoricalTargetRequiresArchiveUsesConfiguredSlotsPerEpoch(t *testing.T
 		Kind: HistoricalKindBlockByID,
 		Slot: uint64Ptr(1),
 	}
-	if stillRecentAt32.RequiresArchive(head, SlotsPerEpoch) {
+	if stillRecentAt32.RequiresArchive(head, config.DefaultSlotsPerEpoch) {
 		t.Fatal("same head should remain within the default 32-slot epoch retention")
 	}
 

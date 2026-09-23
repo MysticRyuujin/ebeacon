@@ -79,12 +79,28 @@ func (m *MemoryStore) Delete(key string) {
 	}
 }
 
-func (m *MemoryStore) Promote(key string) {
+func (m *MemoryStore) PromoteIf(fn func(key string) bool) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if el, ok := m.items[key]; ok {
-		el.Value.(*Entry).expires = time.Time{}
+	// Expired entries are swept as in Keys and Entries, so finality events
+	// keep reclaiming memory the way the scan-based promotion did.
+	now := time.Now()
+	n := 0
+	for el := m.lru.Front(); el != nil; {
+		next := el.Next()
+		e := el.Value.(*Entry)
+		switch {
+		case e.expires.IsZero():
+		case now.After(e.expires):
+			m.lru.Remove(el)
+			delete(m.items, e.key)
+		case fn(e.key):
+			e.expires = time.Time{}
+			n++
+		}
+		el = next
 	}
+	return n
 }
 
 func (m *MemoryStore) Entries(limit int, includeBody bool) []*Entry {

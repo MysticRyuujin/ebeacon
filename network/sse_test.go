@@ -46,7 +46,7 @@ func TestSSERelay_StreamsLargeEventAndSetsHeaders(t *testing.T) {
 	req.Header.Set("Accept", "text/event-stream")
 	rec := httptest.NewRecorder()
 
-	relay.Serve(rec, req, "", requiredUpstreamSelector{})
+	relay.Serve(rec, req, "", upstream.Selector{})
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status: got %d body %q", rec.Code, rec.Body.String())
@@ -420,7 +420,7 @@ func TestSSERelay_ReconnectsToBackupAfterDisconnect(t *testing.T) {
 	req.Header.Set("Accept", "text/event-stream")
 	rec := httptest.NewRecorder()
 
-	relay.Serve(rec, req, "primary", requiredUpstreamSelector{})
+	relay.Serve(rec, req, "primary", upstream.Selector{})
 
 	body := rec.Body.String()
 	if rec.Code != http.StatusOK {
@@ -524,7 +524,7 @@ func TestSSERelay_UpstreamServingNoEventsTripsCircuitBreaker(t *testing.T) {
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				relay.Serve(rec, req, "flapping", requiredUpstreamSelector{})
+				relay.Serve(rec, req, "flapping", upstream.Selector{})
 			}()
 
 			u := pool.ByID("flapping")
@@ -577,7 +577,7 @@ func TestSSERelay_SendsPingCommentsDuringIdlePeriods(t *testing.T) {
 	req.Header.Set("Accept", "text/event-stream")
 	rec := httptest.NewRecorder()
 
-	relay.Serve(rec, req, "", requiredUpstreamSelector{})
+	relay.Serve(rec, req, "", upstream.Selector{})
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status: got %d body %q", rec.Code, rec.Body.String())
@@ -618,7 +618,7 @@ func TestSSERelay_StopsPromptlyOnClientDisconnect(t *testing.T) {
 	rec := httptest.NewRecorder()
 
 	start := time.Now()
-	relay.Serve(rec, req, "", requiredUpstreamSelector{})
+	relay.Serve(rec, req, "", upstream.Selector{})
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Fatalf("relay did not stop promptly on client disconnect: %v", elapsed)
 	}
@@ -651,7 +651,7 @@ func TestSSERelay_FlushesTerminalEventWithoutBlankLine(t *testing.T) {
 	req.Header.Set("Accept", "text/event-stream")
 	rec := httptest.NewRecorder()
 
-	relay.Serve(rec, req, "", requiredUpstreamSelector{})
+	relay.Serve(rec, req, "", upstream.Selector{})
 
 	body := rec.Body.String()
 	if rec.Code != http.StatusOK {
@@ -707,7 +707,7 @@ func TestSSERelay_ReconnectsOnIdleUpstream(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/eth/v1/events?topics=head", nil).WithContext(ctx)
 	req.Header.Set("Accept", "text/event-stream")
 	rec := httptest.NewRecorder()
-	relay.Serve(rec, req, "", requiredUpstreamSelector{})
+	relay.Serve(rec, req, "", upstream.Selector{})
 
 	mu.Lock()
 	defer mu.Unlock()

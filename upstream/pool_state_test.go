@@ -116,6 +116,7 @@ func TestPool_SharedState_HeadPublish(t *testing.T) {
 
 	stateA := newRedisState(t, mr)
 	poolA := newMinimalPool(t, "net-a3")
+	observer := newRedisState(t, mr)
 	poolA.SetSharedState(stateA)
 
 	// Allow the background subscription goroutine to establish before publishing.
@@ -127,7 +128,7 @@ func TestPool_SharedState_HeadPublish(t *testing.T) {
 
 	// The head update should be on the subscription channel.
 	select {
-	case update := <-stateA.SubscribeHead():
+	case update := <-observer.SubscribeHead():
 		if update.Network != "net-a3" || update.Slot != 200 || update.Root != "0xabc" {
 			t.Fatalf("unexpected head update: slot=%d root=%s", update.Slot, update.Root)
 		}
@@ -144,6 +145,7 @@ func TestPool_SharedState_HeadDedup(t *testing.T) {
 
 	stateA := newRedisState(t, mr)
 	poolA := newMinimalPool(t, "net-a4")
+	observer := newRedisState(t, mr)
 	poolA.SetSharedState(stateA)
 
 	// Allow the background subscription goroutine to establish before publishing.
@@ -155,14 +157,14 @@ func TestPool_SharedState_HeadDedup(t *testing.T) {
 
 	// Drain the one expected message.
 	select {
-	case <-stateA.SubscribeHead():
+	case <-observer.SubscribeHead():
 	case <-time.After(time.Second):
 		t.Fatal("expected at least one head update")
 	}
 
 	// Channel should now be empty.
 	select {
-	case extra := <-stateA.SubscribeHead():
+	case extra := <-observer.SubscribeHead():
 		t.Fatalf("unexpected duplicate head update: %+v", extra)
 	case <-time.After(100 * time.Millisecond):
 		// good — no duplicate
@@ -312,5 +314,29 @@ func TestPool_SharedState_CrossNetworkIsolation(t *testing.T) {
 			return
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+// TestPool_SharedState_NoIndirectHeadEcho verifies that an instance whose only
+// view of a head came from shared state does not re-publish it, which would
+// hand the originating instance a phantom remote vote for its own head.
+func TestPool_SharedState_NoIndirectHeadEcho(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+
+	stateA := newRedisState(t, mr)
+	stateB := newRedisState(t, mr)
+	time.Sleep(50 * time.Millisecond)
+
+	poolB := newMinimalPool(t, "net-echo")
+	poolB.SetSharedState(stateB)
+
+	poolB.RecordRemoteHead(42, "0x1234")
+	poolB.SyncCanonicalHead()
+
+	select {
+	case up := <-stateA.SubscribeHead():
+		t.Fatalf("pool B re-published a remote-only head: %+v", up)
+	case <-time.After(200 * time.Millisecond):
 	}
 }

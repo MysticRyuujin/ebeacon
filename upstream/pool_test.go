@@ -187,7 +187,7 @@ func TestPool_Select_WeightedScore(t *testing.T) {
 	}
 }
 
-func TestPool_NodeHealthStatusForSelector(t *testing.T) {
+func TestPool_NodeHealthStatusBySelector(t *testing.T) {
 	t.Parallel()
 	health := config.HealthConfig{MaxSyncDistance: 10}
 	cb := &config.CircuitBreakerConfig{
@@ -227,11 +227,13 @@ func TestPool_NodeHealthStatusForSelector(t *testing.T) {
 		{name: "client type", selector: "client:lighthouse", want: HealthDegraded},
 		{name: "glob", selector: "*teku*", want: HealthUp},
 		{name: "no matches", selector: "missing-*", want: HealthDown},
+		{name: "glob prefix", selector: "glob:teku-*", want: HealthUp},
+		{name: "all upstreams", selector: "", want: HealthUp},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := p.NodeHealthStatusForSelector(tt.selector); got != tt.want {
+			if got := p.NodeHealthStatus(ParseSelector(tt.selector)); got != tt.want {
 				t.Fatalf("selector %q: got %v want %v", tt.selector, got, tt.want)
 			}
 		})

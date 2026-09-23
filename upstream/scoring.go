@@ -16,12 +16,17 @@ type ScoreSnapshot struct {
 
 // ScoreTracker tracks rolling request metrics for computing an upstream's quality score.
 type ScoreTracker struct {
-	mu         sync.RWMutex
+	mu         sync.Mutex
 	windowSize int
 	latencies  []time.Duration
 	errors     []bool // true = error
 	pos        int
 	count      int
+
+	// snapshot caches Snapshot's result until the next record. Routing and
+	// metrics read it several times per request; writes happen once.
+	snapshot      ScoreSnapshot
+	snapshotValid bool
 }
 
 // NewScoreTracker creates a ScoreTracker with the given rolling window size.
@@ -37,83 +42,36 @@ func NewScoreTracker(windowSize int) *ScoreTracker {
 }
 
 // RecordSuccess records a successful request with its latency.
-func (s *ScoreTracker) RecordSuccess(d time.Duration) {
+func (s *ScoreTracker) RecordSuccess(d time.Duration) { s.record(d, false) }
+
+// RecordError records a failed request.
+func (s *ScoreTracker) RecordError() { s.record(0, true) }
+
+func (s *ScoreTracker) record(d time.Duration, isErr bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	idx := s.pos % s.windowSize
 	s.latencies[idx] = d
-	s.errors[idx] = false
+	s.errors[idx] = isErr
+	s.snapshotValid = false
 	s.pos++
 	if s.count < s.windowSize {
 		s.count++
 	}
-}
-
-// RecordError records a failed request.
-func (s *ScoreTracker) RecordError() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	idx := s.pos % s.windowSize
-	s.latencies[idx] = 0
-	s.errors[idx] = true
-	s.pos++
-	if s.count < s.windowSize {
-		s.count++
-	}
-}
-
-// ErrorRate returns the proportion of errors in the rolling window [0.0, 1.0].
-func (s *ScoreTracker) ErrorRate() float64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.count == 0 {
-		return 0
-	}
-	errs := 0
-	for i := 0; i < s.count; i++ {
-		if s.errors[i] {
-			errs++
-		}
-	}
-	return float64(errs) / float64(s.count)
-}
-
-// P90Latency returns the 90th percentile latency of successful requests.
-// P90 is preferred over mean because beacon chain operations are deadline-driven:
-// a validator must attest within 4 seconds of the slot start or lose rewards.
-// Mean latency can look acceptable while P90 spikes indicate tail-latency
-// problems that would cause intermittent missed attestations.
-func (s *ScoreTracker) P90Latency() time.Duration {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	successful := make([]time.Duration, 0, s.count)
-	for i := 0; i < s.count; i++ {
-		if !s.errors[i] && s.latencies[i] > 0 {
-			successful = append(successful, s.latencies[i])
-		}
-	}
-	if len(successful) == 0 {
-		return 0
-	}
-
-	sort.Slice(successful, func(i, j int) bool { return successful[i] < successful[j] })
-
-	idx := int(math.Ceil(float64(len(successful))*0.9)) - 1
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= len(successful) {
-		idx = len(successful) - 1
-	}
-	return successful[idx]
 }
 
 // Snapshot returns the current rolling score inputs under a single lock.
 func (s *ScoreTracker) Snapshot() ScoreSnapshot {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.snapshotValid {
+		s.snapshot = s.computeSnapshot()
+		s.snapshotValid = true
+	}
+	return s.snapshot
+}
 
+func (s *ScoreTracker) computeSnapshot() ScoreSnapshot {
 	snapshot := ScoreSnapshot{Samples: s.count}
 	if s.count == 0 {
 		return snapshot
@@ -168,21 +126,4 @@ func calculateScore(errorWeight, latencyWeight, headLagWeight, syncDistWeight, e
 	headLagScore := (1.0 / (1.0 + float64(headLag))) * headLagWeight
 	syncDistScore := (1.0 / (1.0 + float64(syncDist))) * syncDistWeight
 	return errorScore + latencyScore + headLagScore + syncDistScore
-}
-
-// Score computes a composite quality score (higher = better).
-// headLag is the number of slots behind the pool's canonical head.
-// syncDist is the upstream's reported sync distance.
-func (s *ScoreTracker) Score(errorWeight, latencyWeight, headLagWeight, syncDistWeight float64, headLag, syncDist uint64) float64 {
-	snapshot := s.Snapshot()
-	return calculateScore(
-		errorWeight,
-		latencyWeight,
-		headLagWeight,
-		syncDistWeight,
-		snapshot.ErrorRate,
-		snapshot.P90Latency,
-		headLag,
-		syncDist,
-	)
 }

@@ -26,9 +26,6 @@ type Session struct {
 }
 
 func (s *Session) Allow() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.lastSeen = time.Now()
 	if s.limiter == nil {
 		return true
 	}
@@ -76,23 +73,37 @@ func newSessionManager(ratePerSec float64, burst int, sessionTimeout time.Durati
 func (sm *SessionManager) Get(r *http.Request) *Session {
 	ip := ClientIP(r)
 
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
+	// Touch under sm.mu so cleanup, which holds the write lock, cannot evict
+	// the session between lookup and touch and split its rate limiter.
+	sm.mu.RLock()
 	s, ok := sm.byIP[ip]
-	if !ok {
-		var lim *rate.Limiter
-		if sm.lim != rate.Inf {
-			lim = rate.NewLimiter(sm.lim, sm.burst)
-		}
-		s = &Session{ip: ip, limiter: lim, lastSeen: time.Now()}
-		sm.byIP[ip] = s
+	if ok {
+		s.touch()
+	}
+	sm.mu.RUnlock()
+	if ok {
 		return s
 	}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if s, ok = sm.byIP[ip]; ok {
+		s.touch()
+		return s
+	}
+	var lim *rate.Limiter
+	if sm.lim != rate.Inf {
+		lim = rate.NewLimiter(sm.lim, sm.burst)
+	}
+	s = &Session{ip: ip, limiter: lim, lastSeen: time.Now()}
+	sm.byIP[ip] = s
+	return s
+}
+
+func (s *Session) touch() {
 	s.mu.Lock()
 	s.lastSeen = time.Now()
 	s.mu.Unlock()
-	return s
 }
 
 // StartCleanup launches a background goroutine that evicts idle sessions.

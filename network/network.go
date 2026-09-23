@@ -11,7 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -26,7 +26,6 @@ import (
 	"github.com/mysticryuujin/ebeacon/reqctx"
 	"github.com/mysticryuujin/ebeacon/upstream"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"golang.org/x/sync/singleflight"
 	"golang.org/x/time/rate"
 )
@@ -105,6 +104,22 @@ var namedSlotIDs = map[string]bool{
 // named identifier (head, finalized, justified) rather than a numeric slot or
 // state root. Bare /eth/v1/beacon/headers (no block_id) also returns true
 // because the omitted block_id defaults to head.
+// isFinalizedPath reports whether path addresses data that the finalized
+// checkpoint at finalizedEpoch has fixed. A checkpoint at epoch E finalizes
+// slots up to E*slotsPerEpoch. Epoch-keyed data (e.g. attestation rewards
+// for epoch N) can depend on inclusions through epoch N+1, so it requires
+// N+2 <= E, written as N <= E-2 to avoid uint64 wrap on a huge epoch.
+func isFinalizedPath(path string, finalizedEpoch, slotsPerEpoch uint64) bool {
+	if finalizedEpoch == 0 {
+		return false
+	}
+	if slot, ok := pathNumericSlot(path); ok && slot <= finalizedEpoch*slotsPerEpoch {
+		return true
+	}
+	epoch, ok := pathNumericEpoch(path)
+	return ok && finalizedEpoch >= 2 && epoch <= finalizedEpoch-2
+}
+
 func pathHasNamedSlotID(path string) bool {
 	segments := strings.Split(strings.Trim(path, "/"), "/")
 	if len(segments) < 4 || segments[0] != "eth" || len(segments[1]) < 2 ||
@@ -161,19 +176,6 @@ var noisyCacheQueryPathRe = regexp.MustCompile(`^/eth/v\d+/node/(?:peer_count|sy
 
 var peersCacheQueryPathRe = regexp.MustCompile(`^/eth/v\d+/node/peers$`)
 
-// ethConsensusHeaders are Ethereum Beacon API response headers defined in the
-// consensus spec that clients depend on to interpret response bodies correctly.
-// For example, Eth-Consensus-Version tells the client which fork (Bellatrix,
-// Capella, Deneb, …) the response was encoded for, and Eth-Execution-Payload-Blinded
-// indicates whether a block contains a full or blinded execution payload.
-// These must survive any header-filtering we do before writing the response.
-var ethConsensusHeaders = []string{
-	"Eth-Consensus-Version",
-	"Eth-Execution-Payload-Value",
-	"Eth-Execution-Payload-Blinded",
-	"Eth-Execution-Requests-Included",
-}
-
 // Network handles all proxying for a single beacon chain network.
 type Network struct {
 	id       string
@@ -221,37 +223,16 @@ type Network struct {
 	reqByAPIKeyPath     *prometheus.CounterVec
 	cacheByMethod       *prometheus.CounterVec
 	cacheByPath         *prometheus.CounterVec
-	reqDuration         *prometheus.HistogramVec
-	reqDurationByMethod *prometheus.HistogramVec
-	reqDurationByPath   *prometheus.HistogramVec
+	reqDuration         prometheus.ObserverVec
+	reqDurationByMethod prometheus.ObserverVec
+	reqDurationByPath   prometheus.ObserverVec
 	cacheServed         prometheus.Counter
 	multiplexedTotal    prometheus.Counter
 }
 
 type compiledFailsafeOverride struct {
-	re       *regexp.Regexp
-	methods  map[string]bool
+	pathMethodRule
 	failsafe config.FailsafeConfig
-}
-
-type requiredUpstreamSelector struct {
-	upstreamID string
-	clientType string
-	glob       string
-}
-
-func (s requiredUpstreamSelector) enabled() bool {
-	return s.upstreamID != "" || s.clientType != "" || s.glob != ""
-}
-
-func (s requiredUpstreamSelector) label() string {
-	if s.clientType != "" {
-		return "client:" + s.clientType
-	}
-	if s.glob != "" {
-		return "glob:" + s.glob
-	}
-	return s.upstreamID
 }
 
 type selectedUpstreamUnavailableError struct {
@@ -286,8 +267,7 @@ func New(cfg *config.NetworkConfig, globalCfg *config.Config) (*Network, error) 
 	if err != nil {
 		return nil, fmt.Errorf("network %s: %w", cfg.ID, err)
 	}
-	pool.BlockCache().SetSlotTiming(cfg.GenesisTime, cfg.SecondsPerSlot)
-	pool.SetSlotsPerEpoch(uint64(cfg.SlotsPerEpoch))
+	pool.SetChainTiming(cfg.GenesisTime, cfg.SecondsPerSlot, uint64(cfg.SlotsPerEpoch))
 
 	n := &Network{
 		id:               cfg.ID,
@@ -344,20 +324,13 @@ func New(cfg *config.NetworkConfig, globalCfg *config.Config) (*Network, error) 
 
 	// Per-method failsafe overrides
 	for _, fo := range cfg.FailsafeOverrides {
-		re, err := regexp.Compile(fo.PathPattern)
+		rule, err := compilePathMethodRule(fo.PathPattern, fo.Methods)
 		if err != nil {
 			slog.Warn("invalid failsafe override pattern", "network", cfg.ID, "pattern", fo.PathPattern)
 			continue
 		}
-		var methods map[string]bool
-		if len(fo.Methods) > 0 {
-			methods = make(map[string]bool, len(fo.Methods))
-			for _, m := range fo.Methods {
-				methods[strings.ToUpper(m)] = true
-			}
-		}
 		n.failsafeOverrides = append(n.failsafeOverrides, compiledFailsafeOverride{
-			re: re, methods: methods, failsafe: fo.Failsafe,
+			pathMethodRule: rule, failsafe: mergeFailsafe(n.failsafe, fo.Failsafe),
 		})
 	}
 
@@ -368,80 +341,19 @@ func New(cfg *config.NetworkConfig, globalCfg *config.Config) (*Network, error) 
 	}
 
 	// Prometheus metrics (per-network labels).
-	n.reqTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name:        "ebeacon_requests_total",
-		Help:        "Proxy requests by upstream and HTTP status class",
-		ConstLabels: prometheus.Labels{"network": cfg.ID},
-	}, []string{"upstream", "status_class"})
-
-	n.reqDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:        "ebeacon_request_duration_seconds",
-		Help:        "End-to-end proxy request duration",
-		Buckets:     prometheus.DefBuckets,
-		ConstLabels: prometheus.Labels{"network": cfg.ID},
-	}, []string{"upstream"})
-
-	n.reqDurationByMethod = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:        "ebeacon_request_duration_by_method_seconds",
-		Help:        "End-to-end proxy request duration by HTTP method",
-		Buckets:     prometheus.DefBuckets,
-		ConstLabels: prometheus.Labels{"network": cfg.ID},
-	}, []string{"method"})
-
-	n.reqDurationByPath = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:        "ebeacon_request_duration_by_path_seconds",
-		Help:        "End-to-end proxy request duration by normalized Beacon API path",
-		Buckets:     prometheus.DefBuckets,
-		ConstLabels: prometheus.Labels{"network": cfg.ID},
-	}, []string{"upstream", "api_path"})
-
-	n.reqByMethod = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name:        "ebeacon_requests_by_method_total",
-		Help:        "Proxy requests by HTTP method and status class",
-		ConstLabels: prometheus.Labels{"network": cfg.ID},
-	}, []string{"method", "status_class"})
-
-	n.reqByPath = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name:        "ebeacon_requests_by_path_total",
-		Help:        "Proxy requests by normalized Beacon API path and status class",
-		ConstLabels: prometheus.Labels{"network": cfg.ID},
-	}, []string{"api_path", "status_class"})
-
-	n.reqByAPIKey = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name:        "ebeacon_requests_by_api_key_total",
-		Help:        "Proxy requests by API key, HTTP method, and status class",
-		ConstLabels: prometheus.Labels{"network": cfg.ID},
-	}, []string{"api_key", "method", "status_class"})
-
-	n.reqByAPIKeyPath = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name:        "ebeacon_requests_by_api_key_path_total",
-		Help:        "Proxy requests by API key, normalized Beacon API path, and status class",
-		ConstLabels: prometheus.Labels{"network": cfg.ID},
-	}, []string{"api_key", "api_path", "status_class"})
-
-	n.cacheByMethod = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name:        "ebeacon_cache_requests_by_method_total",
-		Help:        "Cache outcome by HTTP method (hit, miss, bypass_method, bypass_policy)",
-		ConstLabels: prometheus.Labels{"network": cfg.ID},
-	}, []string{"method", "cache_result"})
-
-	n.cacheByPath = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name:        "ebeacon_cache_requests_by_path_total",
-		Help:        "Cache outcome by normalized Beacon API path",
-		ConstLabels: prometheus.Labels{"network": cfg.ID},
-	}, []string{"api_path", "cache_result"})
-
-	n.cacheServed = promauto.NewCounter(prometheus.CounterOpts{
-		Name:        "ebeacon_cache_served_total",
-		Help:        "Responses served from cache",
-		ConstLabels: prometheus.Labels{"network": cfg.ID},
-	})
-
-	n.multiplexedTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name:        "ebeacon_multiplexed_total",
-		Help:        "Requests served via deduplication",
-		ConstLabels: prometheus.Labels{"network": cfg.ID},
-	})
+	netLabel := prometheus.Labels{"network": cfg.ID}
+	n.reqTotal = metricReqTotal.MustCurryWith(netLabel)
+	n.reqDuration = metricReqDuration.MustCurryWith(netLabel)
+	n.reqDurationByMethod = metricReqDurationByMethod.MustCurryWith(netLabel)
+	n.reqDurationByPath = metricReqDurationByPath.MustCurryWith(netLabel)
+	n.reqByMethod = metricReqByMethod.MustCurryWith(netLabel)
+	n.reqByPath = metricReqByPath.MustCurryWith(netLabel)
+	n.reqByAPIKey = metricReqByAPIKey.MustCurryWith(netLabel)
+	n.reqByAPIKeyPath = metricReqByAPIKeyPath.MustCurryWith(netLabel)
+	n.cacheByMethod = metricCacheByMethod.MustCurryWith(netLabel)
+	n.cacheByPath = metricCacheByPath.MustCurryWith(netLabel)
+	n.cacheServed = metricCacheServed.WithLabelValues(cfg.ID)
+	n.multiplexedTotal = metricMultiplexedTotal.WithLabelValues(cfg.ID)
 
 	return n, nil
 }
@@ -453,34 +365,31 @@ func (n *Network) Pool() *upstream.Pool { return n.pool }
 func (n *Network) ID() string { return n.id }
 
 // HealthStatus returns the best health status across all upstreams in this network.
-func (n *Network) HealthStatus() upstream.HealthStatus { return n.pool.NodeHealthStatus() }
+func (n *Network) HealthStatus() upstream.HealthStatus {
+	return n.pool.NodeHealthStatus(upstream.Selector{})
+}
 
 func (n *Network) serveHealthz(w http.ResponseWriter, clientUpstream string) {
-	var total, up, degraded, down int
-	var hs upstream.HealthStatus
-	if clientUpstream != "" {
-		total, up, degraded, down = n.pool.HealthCountsForSelector(clientUpstream)
-		hs = n.pool.NodeHealthStatusForSelector(clientUpstream)
-	} else {
-		total, up, degraded, down = n.pool.HealthCounts()
-		hs = n.pool.NodeHealthStatus()
-	}
-
-	var status string
-	var code int
-	switch hs {
-	case upstream.HealthUp:
-		status, code = "ok", http.StatusOK
-	case upstream.HealthDegraded:
-		status, code = "degraded", http.StatusOK
-	default:
-		status, code = "down", http.StatusServiceUnavailable
-	}
+	sel := upstream.ParseSelector(clientUpstream)
+	total, up, degraded, down := n.pool.HealthCounts(sel)
+	status, code := HealthzStatus(n.pool.NodeHealthStatus(sel))
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	fmt.Fprintf(w, `{"status":%q,"upstreams":%d,"healthy":%d,"degraded":%d,"down":%d}`, //nolint:errcheck
 		status, total, up, degraded, down)
+}
+
+// HealthzStatus maps a health status to the /healthz status label and HTTP code.
+func HealthzStatus(hs upstream.HealthStatus) (string, int) {
+	switch hs {
+	case upstream.HealthUp:
+		return "ok", http.StatusOK
+	case upstream.HealthDegraded:
+		return "degraded", http.StatusOK
+	default:
+		return "down", http.StatusServiceUnavailable
+	}
 }
 
 // Cache returns the cache instance (may be nil).
@@ -517,19 +426,21 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	r, clientUpstream := n.rewriteClientPath(r)
 	apiPath := normalizeAPIPath(r.URL.Path)
+	observe := func(status int) {
+		n.observeMethodStatus(r.Method, apiPath, status)
+		n.observeAPIKey(apiKey, r.Method, apiPath, status)
+	}
+	reject := func(status int, msg string) {
+		observe(status)
+		http.Error(w, msg, status)
+	}
 
 	// Intercept /eth/v1/node/health: respond synthetically so load balancers
 	// get an accurate answer without forwarding to a sick node. When a client
 	// prefix is present (e.g. /lighthouse/eth/v1/node/health), scope the
 	// answer to that upstream subset.
 	if r.URL.Path == "/eth/v1/node/health" {
-		var hs upstream.HealthStatus
-		if clientUpstream != "" {
-			hs = n.pool.NodeHealthStatusForSelector(clientUpstream)
-		} else {
-			hs = n.pool.NodeHealthStatus()
-		}
-		switch hs {
+		switch n.pool.NodeHealthStatus(upstream.ParseSelector(clientUpstream)) {
 		case upstream.HealthUp:
 			w.WriteHeader(http.StatusOK)
 		case upstream.HealthDegraded:
@@ -550,9 +461,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Blocked paths (evaluated on path after client-prefix normalization).
 	for _, pat := range n.blocked {
 		if pat.MatchString(r.URL.Path) {
-			n.observeMethodStatus(r.Method, apiPath, http.StatusForbidden)
-			n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusForbidden)
-			http.Error(w, "forbidden", http.StatusForbidden)
+			reject(http.StatusForbidden, "forbidden")
 			return
 		}
 	}
@@ -562,9 +471,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if n.routing != nil {
 		deny, ru, hit := n.routing.matchRouteRule(r.Method, r.URL.Path)
 		if hit && deny {
-			n.observeMethodStatus(r.Method, apiPath, http.StatusForbidden)
-			n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusForbidden)
-			http.Error(w, "forbidden", http.StatusForbidden)
+			reject(http.StatusForbidden, "forbidden")
 			return
 		}
 		ruleUpstream, ruleHit = ru, hit
@@ -573,9 +480,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Global rate limiter
 	if n.globalLimiter != nil && !n.globalLimiter.Allow() {
 		w.Header().Set("X-Ebeacon-Rate-Limited", "global")
-		n.observeMethodStatus(r.Method, apiPath, http.StatusTooManyRequests)
-		n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusTooManyRequests)
-		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		reject(http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	}
 
@@ -585,9 +490,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sess = n.sessions.Get(r)
 		if n.rl.PerIP != nil && !sess.Allow() {
 			w.Header().Set("X-Ebeacon-Rate-Limited", "per-ip")
-			n.observeMethodStatus(r.Method, apiPath, http.StatusTooManyRequests)
-			n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusTooManyRequests)
-			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			reject(http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
 	}
@@ -596,25 +499,25 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	directive := upstreamDirective(r)
 	preferID := ""
 	cacheScope := ""
-	var requiredSelector requiredUpstreamSelector
+	var requiredSelector upstream.Selector
 	if directive != "" {
-		requiredSelector = requiredSelectorFromValue(directive)
+		requiredSelector = upstream.ParseSelector(directive)
 		// Bare known client-type names (e.g. "lighthouse") should behave
 		// identically to the "client:lighthouse" prefix and to the path-based
 		// /lighthouse/eth/v1/... selector. Promote to a client-type selector
 		// only when the pool actually has upstreams of that type, matching the
 		// pool-aware logic in inferClientSelectorPath.
-		if requiredSelector.upstreamID != "" && isKnownClientType(requiredSelector.upstreamID) &&
-			len(n.pool.SelectByClientType(strings.ToLower(requiredSelector.upstreamID), 1)) > 0 {
-			requiredSelector = requiredUpstreamSelector{clientType: strings.ToLower(requiredSelector.upstreamID)}
+		if requiredSelector.ID != "" && upstream.IsKnownClientType(requiredSelector.ID) &&
+			n.pool.HasMatching(upstream.Selector{ClientType: strings.ToLower(requiredSelector.ID)}) {
+			requiredSelector = upstream.Selector{ClientType: strings.ToLower(requiredSelector.ID)}
 		}
-		cacheScope = requiredSelector.label()
+		cacheScope = requiredSelector.String()
 	} else if ruleHit && ruleUpstream != "" {
 		preferID = ruleUpstream
 		cacheScope = preferID
 	} else if clientUpstream != "" {
-		requiredSelector = requiredSelectorFromValue(clientUpstream)
-		cacheScope = requiredSelector.label()
+		requiredSelector = upstream.ParseSelector(clientUpstream)
+		cacheScope = requiredSelector.String()
 	} else if sess != nil && n.cfg.Routing.StickySession {
 		preferID = sess.StickyUpstream()
 	}
@@ -637,26 +540,10 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if entry := n.cache.Get(cacheKey); entry != nil {
 				n.observeCacheByMethod(r.Method, apiPath, "hit")
 				n.cacheServed.Inc()
-				n.observeMethodStatus(r.Method, apiPath, entry.Status())
-				n.observeAPIKey(apiKey, r.Method, apiPath, entry.Status())
-				cachedHeaders := entry.Headers().Clone()
-				cachedHeaders.Set("X-Ebeacon-Cache", "HIT")
-				copyResponseHeaders(w.Header(), cachedHeaders)
-				if n.gzipEnabled && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") &&
-					cachedHeaders.Get("Content-Encoding") == "" && len(entry.Body()) > 1024 &&
-					!strings.EqualFold(cachedHeaders.Get("Content-Type"), "application/octet-stream") {
-					w.Header().Set("Content-Encoding", "gzip")
-					w.Header().Del("Content-Length")
-					w.WriteHeader(entry.Status())
-					gz := gzipPool.Get().(*gzip.Writer)
-					gz.Reset(w)
-					gz.Write(entry.Body()) //nolint:errcheck
-					gz.Close()             //nolint:errcheck
-					gzipPool.Put(gz)
-				} else {
-					w.WriteHeader(entry.Status())
-					w.Write(entry.Body()) //nolint:errcheck
-				}
+				observe(entry.Status())
+				copyEndToEndHeaders(w.Header(), entry.Headers())
+				w.Header().Set("X-Ebeacon-Cache", "HIT")
+				n.writeBody(w, r, entry.Status(), entry.Headers(), entry.Body(), entry)
 				return
 			}
 			n.observeCacheByMethod(r.Method, apiPath, "miss")
@@ -675,15 +562,13 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var err error
 		bodyBytes, err = io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
 		if err != nil {
-			n.observeMethodStatus(r.Method, apiPath, http.StatusBadRequest)
-			n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusBadRequest)
+			observe(http.StatusBadRequest)
 			n.logFailure(r, bodyBytes, apiPath, "", http.StatusBadRequest, nil, nil, err, 0, "request_body_read_error", "", 0)
 			http.Error(w, "failed to read request body", http.StatusBadRequest)
 			return
 		}
 		if len(bodyBytes) > maxRequestBody {
-			n.observeMethodStatus(r.Method, apiPath, http.StatusRequestEntityTooLarge)
-			n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusRequestEntityTooLarge)
+			observe(http.StatusRequestEntityTooLarge)
 			n.logFailure(r, nil, apiPath, "", http.StatusRequestEntityTooLarge, nil, nil, nil, 0, "request_body_too_large", "", 0)
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
@@ -698,6 +583,9 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var resp *http.Response
 	var u *upstream.Upstream
 	var execErr error
+	// On the multiplexed path the leader has already read and finalized the body.
+	var respBody []byte
+	var bodyBuffered bool
 	// Settled after the response body is read: a response whose body turns
 	// out to be unreadable must not credit a half-open recovery probe. The
 	// multiplexed path settles inside the leader closure instead, so cbTok
@@ -751,8 +639,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			// This caller's client is gone; the shared execution keeps
 			// running for any other waiters. Nothing useful can be written.
-			n.observeMethodStatus(r.Method, apiPath, statusClientClosedRequest)
-			n.observeAPIKey(apiKey, r.Method, apiPath, statusClientClosedRequest)
+			observe(statusClientClosedRequest)
 			return
 		}
 		if res.Shared {
@@ -764,14 +651,15 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			mr := res.Val.(*muxResult)
 			// All multiplexed callers share mr.resp, so concurrent calls to
 			// finalizeResponseBody (which writes Content-Length into the header
-			// map) and copyResponseHeaders (which iterates it) would race.
+			// map) and copyEndToEndHeaders (which iterates it) would race.
 			// Give each goroutine a shallow-copied response with its own header
 			// clone to break the aliasing.
 			cloned := *mr.resp
 			cloned.Header = mr.resp.Header.Clone()
-			cloned.Body = io.NopCloser(bytes.NewReader(mr.body))
+			cloned.Body = http.NoBody
 			resp = &cloned
 			u = mr.u
+			respBody, bodyBuffered = mr.body, true
 		} else {
 			execErr = fmt.Errorf("multiplexed request failed")
 		}
@@ -789,8 +677,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"selector", selectedErr.selector,
 				"err", execErr)
 			n.reqTotal.WithLabelValues("none", "error").Inc()
-			n.observeMethodStatus(r.Method, apiPath, http.StatusServiceUnavailable)
-			n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusServiceUnavailable)
+			observe(http.StatusServiceUnavailable)
 			n.logFailure(r, bodyBytes, apiPath, "", http.StatusServiceUnavailable, nil, nil, execErr, time.Since(start), "selected_upstream_unavailable", selectedErr.selector, 0)
 			http.Error(w, "selected upstream unavailable", http.StatusServiceUnavailable)
 			return
@@ -798,8 +685,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		slog.Error("all upstreams failed",
 			"network", n.id, "method", r.Method, "path", r.URL.Path, "err", execErr)
 		n.reqTotal.WithLabelValues("none", "error").Inc()
-		n.observeMethodStatus(r.Method, apiPath, http.StatusBadGateway)
-		n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusBadGateway)
+		observe(http.StatusBadGateway)
 		n.logFailure(r, bodyBytes, apiPath, "", http.StatusBadGateway, nil, nil, execErr, time.Since(start), "all_upstreams_failed", "", 0)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
@@ -810,7 +696,10 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sess.SetSticky(u.ID)
 	}
 
-	respBody, err := readAndFinalizeResponseBody(resp, n.maxResponseBytes)
+	var err error
+	if !bodyBuffered {
+		respBody, err = readAndFinalizeResponseBody(resp, n.maxResponseBytes)
+	}
 	if err != nil {
 		slog.Error("failed to read upstream response body",
 			"network", n.id,
@@ -820,16 +709,12 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"status", resp.StatusCode,
 			"err", err)
 		n.reqTotal.WithLabelValues(u.ID, "error").Inc()
-		n.observeMethodStatus(r.Method, apiPath, http.StatusBadGateway)
-		n.observeAPIKey(apiKey, r.Method, apiPath, http.StatusBadGateway)
+		observe(http.StatusBadGateway)
 		n.reqDuration.WithLabelValues(u.ID).Observe(time.Since(start).Seconds())
 		n.reqDurationByMethod.WithLabelValues(strings.ToUpper(r.Method)).Observe(time.Since(start).Seconds())
 		n.reqDurationByPath.WithLabelValues(u.ID, apiPath).Observe(time.Since(start).Seconds())
 		if !isClientCancel(r.Context(), err) {
-			u.RecordScoreErrorForPath(apiPath)
-			n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
-			u.RecordError()
-			cbTok.Failure()
+			n.recordUpstreamFailure(u, cbTok, apiPath)
 		} else {
 			cbTok.Release()
 		}
@@ -849,8 +734,7 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	duration := time.Since(start)
 	n.reqTotal.WithLabelValues(u.ID, httpStatusClass(resp.StatusCode)).Inc()
-	n.observeMethodStatus(r.Method, apiPath, resp.StatusCode)
-	n.observeAPIKey(apiKey, r.Method, apiPath, resp.StatusCode)
+	observe(resp.StatusCode)
 	n.reqDuration.WithLabelValues(u.ID).Observe(duration.Seconds())
 	n.reqDurationByMethod.WithLabelValues(strings.ToUpper(r.Method)).Observe(duration.Seconds())
 	n.reqDurationByPath.WithLabelValues(u.ID, apiPath).Observe(duration.Seconds())
@@ -872,63 +756,61 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if ct := u.ClientType(); ct != "" && ct != "unknown" {
 		w.Header().Set("X-Ebeacon-Client-Type", ct)
 	}
-	copyResponseHeaders(w.Header(), resp.Header)
-
-	// gzip compression for client if accepted and response is not already compressed.
-	// SSZ (application/octet-stream) is skipped: binary payloads compress poorly and
-	// CL clients requesting SSZ expect raw bytes without a transport re-encoding step.
-	if n.gzipEnabled && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") &&
-		resp.Header.Get("Content-Encoding") == "" && len(respBody) > 1024 &&
-		!strings.EqualFold(resp.Header.Get("Content-Type"), "application/octet-stream") {
-		w.Header().Set("Content-Encoding", "gzip")
-		w.Header().Del("Content-Length")
-		w.WriteHeader(resp.StatusCode)
-		gz := gzipPool.Get().(*gzip.Writer)
-		gz.Reset(w)
-		gz.Write(respBody) //nolint:errcheck
-		gz.Close()         //nolint:errcheck
-		gzipPool.Put(gz)
-	} else {
-		w.WriteHeader(resp.StatusCode)
-		w.Write(respBody) //nolint:errcheck
-	}
+	copyEndToEndHeaders(w.Header(), resp.Header)
+	n.writeBody(w, r, resp.StatusCode, resp.Header, respBody, nil)
 }
 
-func requiredSelectorFromValue(id string) requiredUpstreamSelector {
-	if strings.HasPrefix(id, "client:") {
-		return requiredUpstreamSelector{clientType: strings.TrimPrefix(id, "client:")}
+// writeBody writes status and body, gzip-encoding the body when the client
+// accepts it and the response is not already compressed. SSZ
+// (application/octet-stream) is skipped: binary payloads compress poorly and
+// CL clients requesting SSZ expect raw bytes without a transport re-encoding
+// step. A non-nil entry supplies its memoized compressed body.
+func (n *Network) writeBody(w http.ResponseWriter, r *http.Request, status int, hdr http.Header, body []byte, entry *cache.Entry) {
+	if !n.gzipEnabled || !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") ||
+		hdr.Get("Content-Encoding") != "" || len(body) <= 1024 ||
+		strings.EqualFold(hdr.Get("Content-Type"), "application/octet-stream") {
+		w.WriteHeader(status)
+		w.Write(body) //nolint:errcheck
+		return
 	}
-	// "glob:" is label()'s spelling of a glob selector in cache-key scopes;
-	// without this strip the whole prefixed string is treated as the pattern
-	// and pre-warm never matches an upstream. (An upstream literally named
-	// "glob:x" would misparse — acceptable.)
-	if strings.HasPrefix(id, "glob:") {
-		return requiredUpstreamSelector{glob: strings.TrimPrefix(id, "glob:")}
+	w.Header().Set("Content-Encoding", "gzip")
+	w.Header().Del("Content-Length")
+	w.WriteHeader(status)
+	if entry != nil {
+		w.Write(entry.GzipBody(gzipBytes)) //nolint:errcheck
+		return
 	}
-	if strings.ContainsAny(id, "*?[") {
-		return requiredUpstreamSelector{glob: id}
-	}
-	return requiredUpstreamSelector{upstreamID: id}
+	writeGzip(w, body)
+}
+
+func writeGzip(w io.Writer, body []byte) {
+	gz := gzipPool.Get().(*gzip.Writer)
+	gz.Reset(w)
+	gz.Write(body) //nolint:errcheck
+	gz.Close()     //nolint:errcheck
+	gzipPool.Put(gz)
+}
+
+func gzipBytes(body []byte) []byte {
+	var buf bytes.Buffer
+	writeGzip(&buf, body)
+	return buf.Bytes()
 }
 
 // effectiveFailsafe returns the failsafe config for a request, checking per-method overrides.
 func (n *Network) effectiveFailsafe(method, path string) config.FailsafeConfig {
 	m := strings.ToUpper(method)
 	for _, fo := range n.failsafeOverrides {
-		if !fo.re.MatchString(path) {
-			continue
+		if fo.matches(m, path) {
+			return fo.failsafe
 		}
-		if len(fo.methods) > 0 && !fo.methods[m] {
-			continue
-		}
-		return mergeFailsafe(n.failsafe, fo.failsafe)
 	}
 	return n.failsafe
 }
 
 func mergeFailsafe(base, override config.FailsafeConfig) config.FailsafeConfig {
 	result := base
-	// Clone overridden sections: they alias the shared compiled override and
+	// Clone overridden sections: they alias the network config and
 	// ApplyFailsafeDefaults mutates in place, so aliasing would race concurrent
 	// requests. base's sections are already defaulted and never written.
 	if override.Timeout != nil {
@@ -974,27 +856,20 @@ func isClientCancel(ctx context.Context, err error) bool {
 	return errors.Is(err, context.Canceled) && errors.Is(ctx.Err(), context.Canceled)
 }
 
-func (n *Network) executeSelectedFS(ctx context.Context, r *http.Request, bodyBytes []byte, required requiredUpstreamSelector, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, upstream.CBToken, error) {
-	if required.upstreamID != "" {
-		u := n.pool.ByID(required.upstreamID)
+func (n *Network) executeSelectedFS(ctx context.Context, r *http.Request, bodyBytes []byte, required upstream.Selector, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, upstream.CBToken, error) {
+	if required.ID != "" {
+		u := n.pool.ByID(required.ID)
 		if u == nil {
-			return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.label()}
+			return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.String()}
 		}
-		var body io.Reader
-		if bodyBytes != nil {
-			body = bytes.NewReader(bodyBytes)
-		}
-		resp, tok, err := n.forward(ctx, u, r, body)
+		resp, tok, err := n.forward(ctx, u, r, bodyBytes)
 		if err != nil {
 			if isClientCancel(ctx, err) {
 				tok.Release()
 			} else if !errors.Is(err, upstream.ErrCircuitUnavailable) {
-				tok.Failure()
-				u.RecordScoreErrorForPath(apiPath)
-				n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
-				u.RecordError()
+				n.recordUpstreamFailure(u, tok, apiPath)
 			}
-			return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.label(), err: err}
+			return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.String(), err: err}
 		}
 		if resp.StatusCode >= 500 {
 			u.RecordError()
@@ -1002,30 +877,14 @@ func (n *Network) executeSelectedFS(ctx context.Context, r *http.Request, bodyBy
 		return resp, u, tok, nil
 	}
 
-	if required.glob != "" {
-		maxAttempts := 1
-		if fs.Retry != nil {
-			maxAttempts = fs.Retry.MaxAttempts
-		}
-		ups := n.pool.SelectByGlobForPath(required.glob, apiPath, maxAttempts)
-		if len(ups) == 0 {
-			return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.label()}
-		}
-		return n.executeSelectedCandidatesFS(ctx, r, bodyBytes, required, fs, ups, apiPath)
-	}
-
-	maxAttempts := 1
-	if fs.Retry != nil {
-		maxAttempts = fs.Retry.MaxAttempts
-	}
-	ups := n.pool.SelectByClientTypeForPath(required.clientType, apiPath, maxAttempts)
+	ups := n.pool.SelectMatching(required, apiPath, fs.MaxAttempts())
 	if len(ups) == 0 {
-		return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.label()}
+		return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.String()}
 	}
 	return n.executeSelectedCandidatesFS(ctx, r, bodyBytes, required, fs, ups, apiPath)
 }
 
-func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Request, bodyBytes []byte, required requiredUpstreamSelector, fs config.FailsafeConfig, ups []*upstream.Upstream, apiPath string) (*http.Response, *upstream.Upstream, upstream.CBToken, error) {
+func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Request, bodyBytes []byte, required upstream.Selector, fs config.FailsafeConfig, ups []*upstream.Upstream, apiPath string) (*http.Response, *upstream.Upstream, upstream.CBToken, error) {
 	var lastResp *http.Response
 	var lastUpstream *upstream.Upstream
 	var lastTok upstream.CBToken
@@ -1056,17 +915,12 @@ func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Reque
 			select {
 			case <-ctx.Done():
 				dropBuffered()
-				return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.label(), err: ctx.Err()}
+				return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.String(), err: ctx.Err()}
 			case <-time.After(delay):
 			}
 		}
 
-		var body io.Reader
-		if bodyBytes != nil {
-			body = bytes.NewReader(bodyBytes)
-		}
-
-		resp, tok, err := n.forward(ctx, u, r, body)
+		resp, tok, err := n.forward(ctx, u, r, bodyBytes)
 		if err == nil && resp.StatusCode < 500 {
 			peeked, peekErr := peekBodyForPruning(resp, target)
 			if peekErr != nil {
@@ -1121,7 +975,7 @@ func (n *Network) executeSelectedCandidatesFS(ctx context.Context, r *http.Reque
 	if lastResp != nil {
 		return lastResp, lastUpstream, lastTok, nil
 	}
-	return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.label(), err: lastErr}
+	return nil, nil, upstream.CBToken{}, &selectedUpstreamUnavailableError{selector: required.String(), err: lastErr}
 }
 
 // dedupKey computes a hash key for request deduplication. acceptBinary must
@@ -1152,24 +1006,13 @@ func dedupKey(networkID, method string, u *url.URL, body []byte, scope string, a
 // capped to the time remaining in the current Ethereum slot. This prevents a
 // response cached late in slot N from being served as fresh data in slot N+1.
 func (n *Network) effectiveCacheTTL(policyTTL time.Duration, path string) time.Duration {
-	finalizedSlot := n.pool.FinalizedSlot()
-	if finalizedSlot != 0 {
-		if slot, ok := pathNumericSlot(path); ok && slot <= finalizedSlot {
-			return 0 // finalized → cache forever
-		}
-		// Epoch-keyed data (e.g. attestation rewards for epoch N) can depend
-		// on inclusions through epoch N+1, so require N+2 <= finalized epoch.
-		// Written as epoch <= finalized-2 to avoid uint64 wrap on a huge epoch.
-		if fe := n.pool.FinalizedEpoch(); fe >= 2 {
-			if epoch, ok := pathNumericEpoch(path); ok && epoch <= fe-2 {
-				return 0 // finalized epoch → cache forever
-			}
-		}
+	if isFinalizedPath(path, n.pool.FinalizedEpoch(), n.pool.SlotsPerEpoch()) {
+		return 0 // finalized → cache forever
 	}
 	if policyTTL > 0 && n.cfg.GenesisTime != 0 && pathHasNamedSlotID(path) {
 		slotSeconds := n.cfg.SecondsPerSlot
 		if slotSeconds <= 0 {
-			slotSeconds = 12
+			slotSeconds = config.DefaultSecondsPerSlot
 		}
 		elapsed := (time.Now().Unix() - n.cfg.GenesisTime) % slotSeconds
 		if elapsed < 0 {
@@ -1191,7 +1034,7 @@ func (n *Network) effectiveCacheTTL(policyTTL time.Duration, path string) time.D
 // consumer after the body is read: a response whose body turns out to be
 // unreadable must not count as a circuit-breaker recovery success. A zero
 // token means settlement already happened internally.
-func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []byte, preferID string, required requiredUpstreamSelector, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, upstream.CBToken, error) {
+func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []byte, preferID string, required upstream.Selector, fs config.FailsafeConfig, apiPath string) (*http.Response, *upstream.Upstream, upstream.CBToken, error) {
 	var timeoutCancel context.CancelFunc
 	if fs.Timeout != nil {
 		ctx, timeoutCancel = context.WithTimeout(ctx, fs.Timeout.Duration)
@@ -1202,7 +1045,7 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 		}
 	}
 
-	if required.enabled() {
+	if required.Enabled() {
 		resp, u, tok, err := n.executeSelectedFS(ctx, r, bodyBytes, required, fs, apiPath)
 		if err != nil {
 			cancelTimeout()
@@ -1262,18 +1105,9 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 		ups := selectForPath(apiPath, n.consensus.MaxParticipants)
 		if len(ups) >= n.consensus.AgreementThreshold {
 			resp, u, err := n.consensus.Execute(ctx, ups, func(u *upstream.Upstream) (*http.Request, error) {
-				dest := u.URL + pathAndQueryForUpstream(r.URL)
-				var body io.Reader
-				if bodyBytes != nil {
-					body = bytes.NewReader(bodyBytes)
-				}
-				req, err := http.NewRequestWithContext(ctx, r.Method, dest, body)
+				req, err := newUpstreamRequest(ctx, u, r.Method, r, bodyBytes)
 				if err != nil {
 					return nil, err
-				}
-				copyRequestHeaders(req.Header, r.Header)
-				for k, v := range u.Headers {
-					req.Header.Set(k, v)
 				}
 				// Strip the client's Accept-Encoding so Go's transport
 				// negotiates gzip itself and transparently decompresses:
@@ -1295,10 +1129,7 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 		}
 	}
 
-	maxAttempts := 1
-	if fs.Retry != nil {
-		maxAttempts = fs.Retry.MaxAttempts
-	}
+	maxAttempts := fs.MaxAttempts()
 
 	// Hedge: fire parallel requests after a delay.
 	if fs.Hedge != nil {
@@ -1350,13 +1181,8 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 			}
 		}
 
-		var body io.Reader
-		if bodyBytes != nil {
-			body = bytes.NewReader(bodyBytes)
-		}
-
 		attemptStarted := time.Now()
-		resp, tok, err := n.forward(ctx, u, r, body)
+		resp, tok, err := n.forward(ctx, u, r, bodyBytes)
 		if err == nil && resp.StatusCode < 500 {
 			// Pruning-shaped response on a historical target: if we have
 			// archive upstreams we haven't yet tried, promote and re-enter
@@ -1416,17 +1242,10 @@ func (n *Network) executeFS(ctx context.Context, r *http.Request, bodyBytes []by
 			slog.Warn("upstream bad status", "network", n.id, "upstream", u.ID, "attempt", i+1, "status", resp.StatusCode)
 			failedBody, readErr := readAndFinalizeResponseBody(resp, n.maxResponseBytes)
 			resp.Body.Close() //nolint:errcheck
-			if readErr != nil {
-				n.logFailure(r, bodyBytes, apiPath, u.ID, resp.StatusCode, resp.Header, nil, readErr, time.Since(attemptStarted), "upstream_attempt_failed", "", i+1)
-			} else {
-				n.logFailure(r, bodyBytes, apiPath, u.ID, resp.StatusCode, resp.Header, failedBody, nil, time.Since(attemptStarted), "upstream_attempt_failed", "", i+1)
-			}
+			n.logFailure(r, bodyBytes, apiPath, u.ID, resp.StatusCode, resp.Header, failedBody, readErr, time.Since(attemptStarted), "upstream_attempt_failed", "", i+1)
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 		}
-		tok.Failure()
-		u.RecordScoreErrorForPath(apiPath)
-		n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
-		u.RecordError()
+		n.recordUpstreamFailure(u, tok, apiPath)
 	}
 
 	cancelTimeout()
@@ -1488,12 +1307,8 @@ func (n *Network) executeHedgeFS(ctx context.Context, ups []*upstream.Upstream, 
 		idx := len(cancels)
 		cancels = append(cancels, cancel)
 		go func(idx int) {
-			var body io.Reader
-			if bodyBytes != nil {
-				body = bytes.NewReader(bodyBytes)
-			}
 			started := time.Now()
-			resp, tok, err := n.forward(reqCtx, u, r, body)
+			resp, tok, err := n.forward(reqCtx, u, r, bodyBytes)
 			resultCh <- result{resp: resp, u: u, tok: tok, err: err, idx: idx, duration: time.Since(started)}
 		}(idx)
 	}
@@ -1622,16 +1437,9 @@ loop:
 				failedBody, readErr := readAndFinalizeResponseBody(res.resp, n.maxResponseBytes)
 				lastErr = fmt.Errorf("HTTP %d", res.resp.StatusCode)
 				res.resp.Body.Close() //nolint:errcheck
-				if readErr != nil {
-					n.logFailure(r, bodyBytes, apiPath, res.u.ID, res.resp.StatusCode, res.resp.Header, nil, readErr, res.duration, "hedged_attempt_failed", "", res.idx+1)
-				} else {
-					n.logFailure(r, bodyBytes, apiPath, res.u.ID, res.resp.StatusCode, res.resp.Header, failedBody, nil, res.duration, "hedged_attempt_failed", "", res.idx+1)
-				}
+				n.logFailure(r, bodyBytes, apiPath, res.u.ID, res.resp.StatusCode, res.resp.Header, failedBody, readErr, res.duration, "hedged_attempt_failed", "", res.idx+1)
 			}
-			res.tok.Failure()
-			res.u.RecordScoreErrorForPath(apiPath)
-			n.pool.RefreshUpstreamPathScoreMetrics(res.u, apiPath)
-			res.u.RecordError()
+			n.recordUpstreamFailure(res.u, res.tok, apiPath)
 			triedByID[res.u.ID] = struct{}{}
 			if inflight == 0 && fired >= maxFire {
 				break loop
@@ -1679,9 +1487,7 @@ loop:
 		}
 		cancelAll()
 		maxArchiveAttempts := maxFire
-		if fs.Retry != nil && fs.Retry.MaxAttempts > maxArchiveAttempts {
-			maxArchiveAttempts = fs.Retry.MaxAttempts
-		}
+		maxArchiveAttempts = max(maxArchiveAttempts, fs.MaxAttempts())
 		// The sequential archive pass runs under the parent request ctx so
 		// the outer failsafe timeout continues to apply. If hedge consumed
 		// most of that budget racing two upstreams, the archive retry may
@@ -1725,11 +1531,7 @@ func (n *Network) promoteToArchive(ctx context.Context, apiPath string, r *http.
 		if _, already := triedByID[u.ID]; already {
 			continue
 		}
-		var body io.Reader
-		if bodyBytes != nil {
-			body = bytes.NewReader(bodyBytes)
-		}
-		resp, tok, err := n.forward(ctx, u, r, body)
+		resp, tok, err := n.forward(ctx, u, r, bodyBytes)
 		if err != nil {
 			lastErr = err
 			if isClientCancel(ctx, err) {
@@ -1766,16 +1568,10 @@ func (n *Network) promoteToArchive(ctx context.Context, apiPath string, r *http.
 // forward dispatches one request to u and never settles the returned CBToken;
 // the caller must settle it exactly once (Success/Failure/Release), including
 // on error returns.
-func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Request, body io.Reader) (*http.Response, upstream.CBToken, error) {
-	dest := u.URL + pathAndQueryForUpstream(r.URL)
-	req, err := http.NewRequestWithContext(ctx, r.Method, dest, body)
+func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Request, body []byte) (*http.Response, upstream.CBToken, error) {
+	req, err := newUpstreamRequest(ctx, u, r.Method, r, body)
 	if err != nil {
 		return nil, upstream.CBToken{}, fmt.Errorf("build request: %w", upstream.SanitizeError(err))
-	}
-
-	copyRequestHeaders(req.Header, r.Header)
-	for k, v := range u.Headers {
-		req.Header.Set(k, v)
 	}
 
 	// Request gzip from upstream if enabled and not SSE
@@ -1788,7 +1584,7 @@ func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Req
 	// XFF entry and lose the real peer address. Read the existing chain from
 	// the filtered outbound headers, not r.Header, so a client nominating
 	// X-Forwarded-For via Connection cannot smuggle it past the hop-by-hop
-	// stripping in copyRequestHeaders.
+	// stripping in copyEndToEndHeaders.
 	peer := remoteAddrHost(r)
 	if existing := req.Header.Get("X-Forwarded-For"); existing != "" {
 		req.Header.Set("X-Forwarded-For", existing+", "+peer)
@@ -1797,16 +1593,9 @@ func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Req
 	}
 	req.Header.Set("X-Forwarded-Host", r.Host)
 
-	tok, ok := u.CBTryAcquire()
-	if !ok {
-		return nil, upstream.CBToken{}, upstream.ErrCircuitUnavailable
-	}
-	u.ConsumeRateToken()
-	u.IncrActive()
-	resp, err := u.Client.Do(req)
+	resp, tok, err := u.Do(req)
 	if err != nil {
-		u.DecrActive()
-		return nil, tok, upstream.SanitizeError(err)
+		return nil, tok, err
 	}
 
 	// Decompress gzip upstream response so caching and body processing work correctly.
@@ -1816,7 +1605,6 @@ func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Req
 		gr, gErr := gzip.NewReader(resp.Body)
 		if gErr != nil {
 			resp.Body.Close() //nolint:errcheck
-			u.DecrActive()
 			return nil, tok, fmt.Errorf("invalid gzip response body: %w", gErr)
 		}
 		resp.Body = &gzipReadCloser{gzip: gr, orig: resp.Body}
@@ -1824,11 +1612,42 @@ func (n *Network) forward(ctx context.Context, u *upstream.Upstream, r *http.Req
 		resp.Header.Del("Content-Length")
 	}
 
-	return u.TrackResponse(resp), tok, nil
+	return resp, tok, nil
+}
+
+// newUpstreamRequest builds the request to u for client request r, copying
+// the client's end-to-end headers and applying u's configured headers.
+func newUpstreamRequest(ctx context.Context, u *upstream.Upstream, method string, r *http.Request, body []byte) (*http.Request, error) {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u.URL+pathAndQueryForUpstream(r.URL), reader)
+	if err != nil {
+		return nil, err
+	}
+	copyEndToEndHeaders(req.Header, r.Header)
+	for k, v := range u.Headers {
+		req.Header.Set(k, v)
+	}
+	return req, nil
+}
+
+// recordUpstreamFailure settles tok as a failure and charges the attempt to
+// u's route score and error metrics.
+func (n *Network) recordUpstreamFailure(u *upstream.Upstream, tok upstream.CBToken, apiPath string) {
+	tok.Failure()
+	u.RecordScoreErrorForPath(apiPath)
+	n.pool.RefreshUpstreamPathScoreMetrics(u, apiPath)
+	u.RecordError()
 }
 
 func (n *Network) logFailure(r *http.Request, reqBody []byte, apiPath, upstreamID string, status int, responseHeaders http.Header, responseBody []byte, err error, duration time.Duration, kind, selector string, attempt int) {
-	debuglog.Default().LogEvent(debuglog.Event{
+	logger := debuglog.Default()
+	if !logger.Enabled() {
+		return
+	}
+	logger.LogEvent(debuglog.Event{
 		Kind:            kind,
 		Network:         n.id,
 		APIPath:         apiPath,
@@ -1944,10 +1763,10 @@ func pathAndQueryForCache(u *url.URL) string {
 	if path == "" {
 		path = "/"
 	}
-	q := u.Query()
-	q.Del("secret")
-	q.Del("use-upstream")
-	q.Del("token")
+	if u.RawQuery == "" {
+		return path
+	}
+	q := forwardableQuery(u)
 	// Default node cache policies don't use arbitrary query args; drop all query
 	// params to prevent cache-key explosion via random noise. /node/peers is the
 	// exception: its spec-defined state/direction filters change the response,
@@ -1994,15 +1813,22 @@ func pathAndQueryForUpstream(u *url.URL) string {
 	if path == "" {
 		path = "/"
 	}
-	q := u.Query()
-	// Strip eBeacon-internal query params before forwarding to the upstream.
-	q.Del("secret")
-	q.Del("use-upstream")
-	q.Del("token")
-	if enc := q.Encode(); enc != "" {
+	if u.RawQuery == "" {
+		return path
+	}
+	if enc := forwardableQuery(u).Encode(); enc != "" {
 		return path + "?" + enc
 	}
 	return path
+}
+
+// forwardableQuery returns the query without eBeacon-internal parameters.
+func forwardableQuery(u *url.URL) url.Values {
+	q := u.Query()
+	q.Del("secret")
+	q.Del("use-upstream")
+	q.Del("token")
+	return q
 }
 
 func isEventStream(r *http.Request) bool {
@@ -2010,7 +1836,10 @@ func isEventStream(r *http.Request) bool {
 		strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/events")
 }
 
-func copyRequestHeaders(dst, src http.Header) {
+// copyEndToEndHeaders copies src into dst without hop-by-hop headers. It is
+// used in both directions, so consensus headers such as Eth-Consensus-Version
+// pass through unchanged.
+func copyEndToEndHeaders(dst, src http.Header) {
 	skip := hopByHopHeadersFor(src)
 	for k, vv := range src {
 		if _, blocked := skip[strings.ToLower(k)]; blocked {
@@ -2018,27 +1847,6 @@ func copyRequestHeaders(dst, src http.Header) {
 		}
 		for _, v := range vv {
 			dst.Add(k, v)
-		}
-	}
-}
-
-func copyResponseHeaders(dst, src http.Header) {
-	skip := hopByHopHeadersFor(src)
-	for k, vv := range src {
-		if _, blocked := skip[strings.ToLower(k)]; blocked {
-			continue
-		}
-		for _, v := range vv {
-			dst.Add(k, v)
-		}
-	}
-	// Explicitly preserve Ethereum consensus headers even if they were skipped
-	for _, h := range ethConsensusHeaders {
-		if _, blocked := skip[strings.ToLower(h)]; blocked {
-			continue
-		}
-		if v := src.Get(h); v != "" {
-			dst.Set(h, v)
 		}
 	}
 }
@@ -2075,10 +1883,19 @@ func hopByHopHeadersFor(headers http.Header) map[string]struct{} {
 // produces the same token, so a client can share it in a bug report and we can
 // identify the upstream without exposing the actual node address.
 func ObfuscateUpstreamID(id string) string {
+	if v, ok := obfuscatedIDs.Load(id); ok {
+		return v.(string)
+	}
 	h := fnv.New32a()
 	h.Write([]byte(id))
-	return fmt.Sprintf("%08x", h.Sum32())
+	token := fmt.Sprintf("%08x", h.Sum32())
+	obfuscatedIDs.Store(id, token)
+	return token
 }
+
+// obfuscatedIDs memoizes ObfuscateUpstreamID, which runs on every response.
+// Keys are configured upstream IDs, so the map stays small.
+var obfuscatedIDs sync.Map
 
 func retryDelay(cfg *config.RetryConfig, attempt int) time.Duration {
 	delay := float64(cfg.Delay)

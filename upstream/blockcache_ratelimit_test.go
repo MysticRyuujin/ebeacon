@@ -126,7 +126,7 @@ func TestBlockCache_CanonicalHeadSeenBy_ExcludesRemote(t *testing.T) {
 
 	// A canonical head reported only by another ebeacon instance via shared
 	// state cannot serve client requests locally and must not appear.
-	bc.AddBlock("remote", 100, "root-canon", "p99")
+	bc.AddBlock(remoteVoter, 100, "root-canon", "p99")
 
 	if got := bc.CanonicalHeadSeenBy(); got != nil {
 		t.Fatalf("expected nil when only remote has reported, got %v", got)
@@ -138,7 +138,7 @@ func TestBlockCache_CanonicalHeadSeenBy_ExcludesRemote(t *testing.T) {
 	if len(seen) != 1 || !seen["a"] {
 		t.Fatalf("expected {a} after local reports head, got %v", seen)
 	}
-	if seen["remote"] {
+	if seen[remoteVoter] {
 		t.Fatalf("remote pseudo-ID must never appear in canonical set: %v", seen)
 	}
 }
@@ -203,7 +203,7 @@ func TestBlockCache_RejectsImplausibleFutureSlot(t *testing.T) {
 
 	// A slot far beyond wall clock (wrong chain / corrupt shared state)
 	// must not poison maxSlot or the canonical head.
-	bc.AddBlock("remote", 20_000_000, "root-bogus", "p")
+	bc.AddBlock(remoteVoter, 20_000_000, "root-bogus", "p")
 	if got := bc.MaxSlot(); got != 99 {
 		t.Fatalf("maxSlot poisoned by future slot: got %d want 99", got)
 	}
@@ -233,7 +233,7 @@ func TestBlockCache_ToleratesClockSkew(t *testing.T) {
 	}
 
 	// A grossly-future slot is still rejected.
-	bc.AddBlock("remote", 100_000, "root-bogus", "p")
+	bc.AddBlock(remoteVoter, 100_000, "root-bogus", "p")
 	if got := bc.MaxSlot(); got != 140 {
 		t.Fatalf("maxSlot poisoned by future slot: got %d want 140", got)
 	}
@@ -264,5 +264,35 @@ func TestBlockCache_ShorterSlotTimeAcceptsRealSlots(t *testing.T) {
 	bc12.AddBlock("a", 240, "root-240", "p239")
 	if got := bc12.MaxSlot(); got != 0 {
 		t.Fatalf("sanity: 12s cache should reject slot 240 at 1200s, got %d", got)
+	}
+}
+
+func TestBlockCache_LocalCanonicalHead_IgnoresRemoteVotes(t *testing.T) {
+	t.Parallel()
+	bc := NewBlockCache(32, 2)
+
+	bc.AddBlock("a", 100, "root-a", "p99")
+	bc.AddBlock("b", 100, "root-b", "p99")
+	bc.AddBlock(remoteVoter, 100, "root-b", "p99")
+	bc.AddBlock(remoteVoter, 101, "root-remote-only", "root-b")
+
+	if slot, root := bc.CanonicalHead(); slot != 101 || root != "root-remote-only" {
+		t.Fatalf("CanonicalHead = %d/%s, want 101/root-remote-only", slot, root)
+	}
+	if slot, root := bc.LocalCanonicalHead(); slot != 100 || root != "root-a" {
+		t.Fatalf("LocalCanonicalHead = %d/%s, want 100/root-a (remote vote must not break the tie)", slot, root)
+	}
+}
+
+func TestBlockCache_UpstreamNamedRemoteKeepsItsVote(t *testing.T) {
+	t.Parallel()
+	bc := NewBlockCache(32, 2)
+	bc.AddBlock("remote", 100, "root-a", "p99")
+
+	if slot, root := bc.LocalCanonicalHead(); slot != 100 || root != "root-a" {
+		t.Fatalf("LocalCanonicalHead = %d/%s, want 100/root-a", slot, root)
+	}
+	if seen := bc.CanonicalHeadSeenBy(); !seen["remote"] {
+		t.Fatalf("upstream configured as %q must stay routable, got %v", "remote", seen)
 	}
 }

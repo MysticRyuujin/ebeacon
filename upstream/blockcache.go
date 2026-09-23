@@ -3,6 +3,8 @@ package upstream
 import (
 	"sync"
 	"time"
+
+	"github.com/mysticryuujin/ebeacon/config"
 )
 
 // Block represents a beacon chain block header tracked for fork detection.
@@ -13,6 +15,11 @@ type Block struct {
 	SeenBy     map[string]bool // upstream IDs that reported this block
 	FirstSeen  time.Time
 }
+
+// remoteVoter is the SeenBy ID for heads that other eBeacon instances publish
+// through shared state. The "@" keeps it outside the configurable upstream ID
+// pattern, so a real upstream can never share it.
+const remoteVoter = "@remote"
 
 // BlockCache tracks recent block headers from all upstreams to determine the canonical fork.
 //
@@ -31,7 +38,12 @@ type BlockCache struct {
 	followDistance  uint64
 	maxHeadDistance uint64
 	genesisTime     int64 // unix seconds; 0 disables future-slot rejection
-	secondsPerSlot  int64 // chain slot duration; 0 falls back to 12
+	secondsPerSlot  int64 // chain slot duration; 0 means the default
+
+	// canonSlot and canonRoot cache the canonical head; every write
+	// recomputes them so the per-request fork checks skip the slot walk.
+	canonSlot uint64
+	canonRoot string
 }
 
 // NewBlockCache creates a BlockCache with the given follow distance and max head distance.
@@ -64,7 +76,7 @@ func (bc *BlockCache) currentWallClockSlotLocked() (uint64, bool) {
 	}
 	slotSeconds := bc.secondsPerSlot
 	if slotSeconds <= 0 {
-		slotSeconds = 12
+		slotSeconds = config.DefaultSecondsPerSlot
 	}
 	elapsed := now - bc.genesisTime + int64(clockSkewTolerance.Seconds())
 	return uint64(elapsed) / uint64(slotSeconds), true
@@ -99,6 +111,8 @@ func (bc *BlockCache) AddBlock(upstreamID string, slot uint64, root, parentRoot 
 		bc.maxSlot = slot
 	}
 
+	defer bc.refreshCanonicalHeadLocked()
+
 	if b, ok := bc.rootMap[root]; ok {
 		b.SeenBy[upstreamID] = true
 		return
@@ -120,33 +134,16 @@ func (bc *BlockCache) AddBlock(upstreamID string, slot uint64, root, parentRoot 
 func (bc *BlockCache) CanonicalHead() (slot uint64, root string) {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
+	return bc.canonicalHeadLocked()
+}
 
-	if bc.maxSlot == 0 {
-		return 0, ""
-	}
-
-	// Walk back from maxSlot looking for a slot with blocks
-	for s := bc.maxSlot; s > 0 && s > bc.maxSlot-bc.maxHeadDistance-1; s-- {
-		blocks := bc.slotMap[s]
-		if len(blocks) == 0 {
-			continue
-		}
-		var best *Block
-		bestCount := 0
-		for _, b := range blocks {
-			count := len(b.SeenBy)
-			// Tie-break by root string to ensure deterministic selection
-			// across calls; the ordering has no semantic meaning.
-			if count > bestCount || (count == bestCount && best != nil && b.Root < best.Root) {
-				best = b
-				bestCount = count
-			}
-		}
-		if best != nil {
-			return best.Slot, best.Root
-		}
-	}
-	return 0, ""
+// LocalCanonicalHead is CanonicalHead counting only this instance's upstream
+// votes. Shared state publishes this head: a head chosen with remote votes
+// would echo another instance's vote back to it as a new vote.
+func (bc *BlockCache) LocalCanonicalHead() (slot uint64, root string) {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return bc.canonicalHead(false)
 }
 
 // IsOnCanonicalFork returns true if the upstream has reported a block at or near the canonical head.
@@ -158,39 +155,7 @@ func (bc *BlockCache) CanonicalHead() (slot uint64, root string) {
 //     competing minority chain and must not receive validator duties, as acting
 //     on its view could result in slashable offenses or missed attestations.
 func (bc *BlockCache) IsOnCanonicalFork(upstreamID string) bool {
-	bc.mu.RLock()
-	defer bc.mu.RUnlock()
-
-	canonSlot, canonRoot := bc.canonicalHeadLocked()
-	if canonSlot == 0 {
-		return true // no data yet, assume on canonical fork
-	}
-
-	// Check if upstream has seen the canonical head block.
-	if b, ok := bc.rootMap[canonRoot]; ok {
-		if b.SeenBy[upstreamID] {
-			return true
-		}
-	}
-
-	// If the upstream reported a different block at the canonical slot,
-	// consider it on a competing fork (not merely lagging).
-	for _, b := range bc.slotMap[canonSlot] {
-		if b.SeenBy[upstreamID] {
-			return false
-		}
-	}
-
-	// Otherwise treat the upstream as canonical if it is only slightly behind.
-	for s := canonSlot - 1; s > 0 && canonSlot-s <= bc.maxHeadDistance; s-- {
-		for _, b := range bc.slotMap[s] {
-			if b.SeenBy[upstreamID] {
-				return true
-			}
-		}
-	}
-
-	return false
+	return bc.ForkStatus(upstreamID) == "canonical"
 }
 
 // CanonicalHeadSeenBy returns the set of upstream IDs that have reported the
@@ -199,7 +164,7 @@ func (bc *BlockCache) IsOnCanonicalFork(upstreamID string) bool {
 // paths (/head, /finalized, /justified). Returns nil if no canonical head is
 // known yet; callers should fail open in that case.
 //
-// The "remote" pseudo-ID published by other ebeacon instances via shared state
+// The remoteVoter pseudo-ID published by other ebeacon instances via shared state
 // is excluded from the result because it cannot serve client requests.
 func (bc *BlockCache) CanonicalHeadSeenBy() map[string]bool {
 	bc.mu.RLock()
@@ -215,7 +180,7 @@ func (bc *BlockCache) CanonicalHeadSeenBy() map[string]bool {
 	}
 	out := make(map[string]bool, len(b.SeenBy))
 	for id := range b.SeenBy {
-		if id == "remote" {
+		if id == remoteVoter {
 			continue
 		}
 		out[id] = true
@@ -279,21 +244,31 @@ func (bc *BlockCache) IsForked(upstreamID string) bool {
 }
 
 func (bc *BlockCache) canonicalHeadLocked() (uint64, string) {
+	return bc.canonSlot, bc.canonRoot
+}
+
+func (bc *BlockCache) refreshCanonicalHeadLocked() {
+	bc.canonSlot, bc.canonRoot = bc.canonicalHead(true)
+}
+
+func (bc *BlockCache) canonicalHead(countRemote bool) (uint64, string) {
 	if bc.maxSlot == 0 {
 		return 0, ""
 	}
 	for s := bc.maxSlot; s > 0 && s > bc.maxSlot-bc.maxHeadDistance-1; s-- {
-		blocks := bc.slotMap[s]
-		if len(blocks) == 0 {
-			continue
-		}
 		var best *Block
 		bestCount := 0
-		for _, b := range blocks {
+		for _, b := range bc.slotMap[s] {
 			count := len(b.SeenBy)
+			if !countRemote && b.SeenBy[remoteVoter] {
+				count--
+			}
+			if count == 0 {
+				continue
+			}
 			// Tie-break by root string to ensure deterministic selection
 			// across calls; the ordering has no semantic meaning.
-			if count > bestCount || (count == bestCount && best != nil && b.Root < best.Root) {
+			if count > bestCount || (count == bestCount && b.Root < best.Root) {
 				best = b
 				bestCount = count
 			}
@@ -314,6 +289,7 @@ func (bc *BlockCache) Cleanup() {
 		return
 	}
 	cutoff := bc.maxSlot - bc.followDistance
+	defer bc.refreshCanonicalHeadLocked()
 
 	for slot, blocks := range bc.slotMap {
 		if slot < cutoff {

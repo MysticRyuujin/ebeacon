@@ -3,13 +3,16 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/mysticryuujin/ebeacon/config"
 	networkpkg "github.com/mysticryuujin/ebeacon/network"
+	"github.com/mysticryuujin/ebeacon/reqctx"
 	"github.com/mysticryuujin/ebeacon/upstream"
 	"golang.org/x/time/rate"
 )
@@ -120,10 +123,7 @@ func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request, pathKey str
 		return nil, false
 	}
 	if result.KeyID != "" {
-		r = WithAPIKeyID(r, result.KeyID)
-	}
-	if result.Tier != "" {
-		r = WithAPIKeyTier(r, result.Tier)
+		r = reqctx.WithAPIKeyID(r, result.KeyID)
 	}
 	if !applyAuthRateLimits(w, p.keyLimiters, p.tierLimiters, result) {
 		return nil, false
@@ -167,65 +167,32 @@ func (p *Proxy) isPathKey(candidate string) bool {
 }
 
 func (p *Proxy) availableNetworks() string {
-	ids := make([]string, 0, len(p.networks))
-	for id := range p.networks {
-		ids = append(ids, id)
-	}
-	return strings.Join(ids, ", ")
+	return strings.Join(slices.Sorted(maps.Keys(p.networks)), ", ")
 }
 
 func (p *Proxy) serveHealthz(w http.ResponseWriter) {
-	// Determine overall status: ok if all networks healthy, degraded if any
-	// are degraded, down only if all are down.
-	allDown := true
-	anyDegraded := false
-	ids := make([]string, 0, len(p.networks))
-	for id := range p.networks {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-
-	for _, id := range ids {
-		switch p.networks[id].HealthStatus() {
-		case upstream.HealthUp:
-			allDown = false
-		case upstream.HealthDegraded:
-			allDown = false
-			anyDegraded = true
+	// Overall status: ok if all networks are healthy, degraded if any is
+	// degraded, and down only if all are down.
+	networks := make(map[string]string, len(p.networks))
+	best := upstream.HealthDown
+	for id, n := range p.networks {
+		hs := n.HealthStatus()
+		networks[id], _ = networkpkg.HealthzStatus(hs)
+		if hs == upstream.HealthUp && best == upstream.HealthDown {
+			best = upstream.HealthUp
+		} else if hs == upstream.HealthDegraded {
+			best = upstream.HealthDegraded
 		}
 	}
+	status, code := networkpkg.HealthzStatus(best)
 
-	var status string
-	var code int
-	switch {
-	case allDown:
-		status, code = "down", http.StatusServiceUnavailable
-	case anyDegraded:
-		status, code = "degraded", http.StatusOK
-	default:
-		status, code = "ok", http.StatusOK
-	}
-
+	body, _ := json.Marshal(struct {
+		Status   string            `json:"status"`
+		Networks map[string]string `json:"networks"`
+	}{status, networks})
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	fmt.Fprintf(w, `{"status":%q,"networks":{`, status) //nolint:errcheck
-	for i, id := range ids {
-		ns := p.networks[id].HealthStatus()
-		var ns2 string
-		switch ns {
-		case upstream.HealthUp:
-			ns2 = "ok"
-		case upstream.HealthDegraded:
-			ns2 = "degraded"
-		default:
-			ns2 = "down"
-		}
-		if i > 0 {
-			fmt.Fprint(w, ",") //nolint:errcheck
-		}
-		fmt.Fprintf(w, "%q:%q", id, ns2) //nolint:errcheck
-	}
-	fmt.Fprint(w, "}}") //nolint:errcheck
+	w.Write(body) //nolint:errcheck
 }
 
 func joinRest(segments []string) string {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/netip"
 	"net/url"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/redis/go-redis/v9"
 	"gopkg.in/yaml.v3"
 )
 
@@ -148,6 +150,14 @@ type FailsafeConfig struct {
 	Consensus      *ConsensusConfig      `yaml:"consensus"`
 }
 
+// MaxAttempts returns the retry attempt budget, or 1 when retry is not configured.
+func (f FailsafeConfig) MaxAttempts() int {
+	if f.Retry == nil {
+		return 1
+	}
+	return f.Retry.MaxAttempts
+}
+
 // ConsensusConfig sends the same request to N upstreams and requires M agreement.
 type ConsensusConfig struct {
 	Enabled            bool `yaml:"enabled"`
@@ -249,14 +259,50 @@ type CacheConfig struct {
 	Policies []CachePolicy     `yaml:"policies"`
 }
 
-// RedisCacheConfig configures the Redis cache backend.
-type RedisCacheConfig struct {
+// RedisConfig holds the Redis connection settings shared by the cache and
+// shared-state backends.
+type RedisConfig struct {
 	URL        string `yaml:"url"`
 	Username   string `yaml:"username"` // overrides URL username; supports ${ENV_VAR}
 	Password   string `yaml:"password"` // overrides URL password; supports ${ENV_VAR}
 	DB         int    `yaml:"db"`       // overrides URL database index (default 0)
-	KeyPrefix  string `yaml:"keyPrefix"`
 	MaxRetries int    `yaml:"maxRetries"`
+}
+
+// Options returns client options from URL with the explicit fields applied.
+func (r *RedisConfig) Options() (*redis.Options, error) {
+	opts, err := redis.ParseURL(r.URL)
+	if err != nil {
+		return nil, err
+	}
+	if r.Username != "" {
+		opts.Username = r.Username
+	}
+	if r.Password != "" {
+		opts.Password = r.Password
+	}
+	if r.DB != 0 {
+		opts.DB = r.DB
+	}
+	if r.MaxRetries > 0 {
+		opts.MaxRetries = r.MaxRetries
+	}
+	return opts, nil
+}
+
+func (r *RedisConfig) expandEnv() {
+	if r.Username != "" {
+		r.Username = os.ExpandEnv(r.Username)
+	}
+	if r.Password != "" {
+		r.Password = os.ExpandEnv(r.Password)
+	}
+}
+
+// RedisCacheConfig configures the Redis cache backend.
+type RedisCacheConfig struct {
+	RedisConfig `yaml:",inline"`
+	KeyPrefix   string `yaml:"keyPrefix"`
 }
 
 // CachePolicy maps a path pattern to a TTL. TTL=0 means cache forever.
@@ -278,13 +324,7 @@ type StateConfig struct {
 }
 
 // RedisStateConfig for shared state via Redis pub/sub.
-type RedisStateConfig struct {
-	URL        string `yaml:"url"`
-	Username   string `yaml:"username"` // overrides URL username; supports ${ENV_VAR}
-	Password   string `yaml:"password"` // overrides URL password; supports ${ENV_VAR}
-	DB         int    `yaml:"db"`       // overrides URL database index (default 0)
-	MaxRetries int    `yaml:"maxRetries"`
-}
+type RedisStateConfig = RedisConfig
 
 // UIConfig controls the embedded web dashboard.
 type UIConfig struct {
@@ -334,6 +374,30 @@ func Load(path string) (*Config, error) {
 	cfg.applyDefaults()
 	cfg.expandSecrets()
 	return cfg, cfg.validate()
+}
+
+// WarnIgnoredFailsafe logs failsafe sections that the schema accepts at a
+// level where the runtime does not apply them. Rejecting them would break
+// existing configs. Call it after logging is configured.
+func (c *Config) WarnIgnoredFailsafe() {
+	for i := range c.Networks {
+		warnIgnoredFailsafe(&c.Networks[i])
+	}
+}
+
+func warnIgnoredFailsafe(n *NetworkConfig) {
+	for _, u := range n.Upstreams {
+		if fs := u.Failsafe; fs != nil && (fs.Timeout != nil || fs.Retry != nil || fs.Hedge != nil || fs.Consensus != nil) {
+			slog.Warn("upstream failsafe applies only circuitBreaker; timeout, retry, hedge, and consensus are ignored",
+				"network", n.ID, "upstream", u.ID)
+		}
+	}
+	for _, fo := range n.FailsafeOverrides {
+		if fo.Failsafe.CircuitBreaker != nil || fo.Failsafe.Consensus != nil {
+			slog.Warn("failsafeOverrides apply only timeout, retry, and hedge; circuitBreaker and consensus are ignored",
+				"network", n.ID, "pathPattern", fo.PathPattern)
+		}
+	}
 }
 
 // EffectiveFailsafe merges global defaults with per-network overrides.
@@ -481,6 +545,12 @@ func applyDebugLoggingDefaults(dl *DebugLoggingConfig) {
 	}
 }
 
+// Chain timing defaults applied when a network does not set them.
+const (
+	DefaultSecondsPerSlot int64  = 12
+	DefaultSlotsPerEpoch  uint64 = 32
+)
+
 // knownGenesisTimes maps well-known network IDs to their genesis unix timestamps.
 // These are permanent chain constants that never change.
 var knownGenesisTimes = map[string]int64{
@@ -502,13 +572,13 @@ func applyNetworkDefaults(n *NetworkConfig) {
 		}
 	}
 	if n.SecondsPerSlot == 0 {
-		n.SecondsPerSlot = 12
+		n.SecondsPerSlot = DefaultSecondsPerSlot
 	}
 	if n.SlotsPerEpoch == 0 {
 		if s, ok := knownSlotsPerEpoch[strings.ToLower(n.ID)]; ok {
 			n.SlotsPerEpoch = s
 		} else {
-			n.SlotsPerEpoch = 32
+			n.SlotsPerEpoch = int64(DefaultSlotsPerEpoch)
 		}
 	}
 	if n.Routing.LoadBalancing == "" {
@@ -569,21 +639,11 @@ func (c *Config) expandSecrets() {
 	}
 
 	if r := c.State.Redis; r != nil {
-		if r.Username != "" {
-			r.Username = os.ExpandEnv(r.Username)
-		}
-		if r.Password != "" {
-			r.Password = os.ExpandEnv(r.Password)
-		}
+		r.expandEnv()
 	}
 	for i := range c.Networks {
 		if r := c.Networks[i].Cache.Redis; r != nil {
-			if r.Username != "" {
-				r.Username = os.ExpandEnv(r.Username)
-			}
-			if r.Password != "" {
-				r.Password = os.ExpandEnv(r.Password)
-			}
+			r.expandEnv()
 		}
 		for j := range c.Networks[i].Upstreams {
 			u := &c.Networks[i].Upstreams[j]
@@ -656,6 +716,24 @@ func mergeHedgeConfig(base, override *HedgeConfig) *HedgeConfig {
 	return out
 }
 
+// defaultCircuitBreaker holds the settings used when no circuit breaker is
+// configured.
+var defaultCircuitBreaker = CircuitBreakerConfig{
+	FailureThreshold: 5,
+	SuccessThreshold: 2,
+	HalfOpenAfter:    30 * time.Second,
+}
+
+// UpstreamCircuitBreaker returns the circuit breaker for one upstream: base
+// (the network's effective settings, or the defaults when nil) with the
+// upstream's non-zero override fields applied.
+func UpstreamCircuitBreaker(base, override *CircuitBreakerConfig) CircuitBreakerConfig {
+	if base == nil {
+		base = &defaultCircuitBreaker
+	}
+	return *mergeCircuitBreakerConfig(base, override)
+}
+
 func mergeCircuitBreakerConfig(base, override *CircuitBreakerConfig) *CircuitBreakerConfig {
 	if override == nil {
 		return base
@@ -705,13 +783,13 @@ func applyFailsafeDefaults(fs *FailsafeConfig) {
 	}
 	if cb := fs.CircuitBreaker; cb != nil {
 		if cb.FailureThreshold == 0 {
-			cb.FailureThreshold = 5
+			cb.FailureThreshold = defaultCircuitBreaker.FailureThreshold
 		}
 		if cb.SuccessThreshold == 0 {
-			cb.SuccessThreshold = 2
+			cb.SuccessThreshold = defaultCircuitBreaker.SuccessThreshold
 		}
 		if cb.HalfOpenAfter == 0 {
-			cb.HalfOpenAfter = 30 * time.Second
+			cb.HalfOpenAfter = defaultCircuitBreaker.HalfOpenAfter
 		}
 	}
 }

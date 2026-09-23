@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mysticryuujin/ebeacon/config"
+	"github.com/mysticryuujin/ebeacon/debuglog"
 	networkpkg "github.com/mysticryuujin/ebeacon/network"
 )
 
@@ -308,7 +309,7 @@ func TestStatusAPI_UpstreamsEndpointIncludesScoreDetails(t *testing.T) {
 	}
 
 	upstream.UpdateSyncStatus(false, 128, 0)
-	upstream.UpdateHeadBlock(128, "0xabc", "0xdef")
+	upstream.UpdateHeadBlock(128, "0xabc")
 	pool.BlockCache().AddBlock(upstream.ID, 128, "0xabc", "0xdef")
 	upstream.RecordSuccess(25 * time.Millisecond)
 	upstream.RecordSuccess(40 * time.Millisecond)
@@ -410,7 +411,7 @@ func TestSanitizeCacheHeaders(t *testing.T) {
 		"X-Ebeacon-Secret-Token": {"top-secret"},
 		"Etag":                   {"\"v1\""},
 	}
-	out := sanitizeCacheHeaders(in)
+	out := debuglog.SanitizeHeaders(in)
 
 	if got := out.Get("Content-Type"); got != "application/json" {
 		t.Fatalf("content-type: got %q", got)
@@ -429,7 +430,7 @@ func TestSanitizeCacheHeaders(t *testing.T) {
 		t.Fatalf("source Authorization mutated: got %q", got)
 	}
 	// Empty input passes through.
-	if got := sanitizeCacheHeaders(nil); len(got) != 0 {
+	if got := debuglog.SanitizeHeaders(nil); len(got) != 0 {
 		t.Fatalf("nil input: got %v", got)
 	}
 }

@@ -3,10 +3,13 @@ package upstream
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mysticryuujin/ebeacon/config"
@@ -47,10 +50,12 @@ type beaconHeaderResponse struct {
 	} `json:"data"`
 }
 
-var clientTypePatterns = []struct {
+type clientTypePattern struct {
 	re       *regexp.Regexp
 	typeName string
-}{
+}
+
+var clientTypePatterns = []clientTypePattern{
 	{regexp.MustCompile(`(?i)^Lighthouse/`), ClientLighthouse},
 	{regexp.MustCompile(`(?i)^Prysm/`), ClientPrysm},
 	{regexp.MustCompile(`(?i)^teku/`), ClientTeku},
@@ -58,6 +63,13 @@ var clientTypePatterns = []struct {
 	{regexp.MustCompile(`(?i)^Lodestar/`), ClientLodestar},
 	{regexp.MustCompile(`(?i)^Grandine/`), ClientGrandine},
 	{regexp.MustCompile(`(?i)^Caplin/`), ClientCaplin},
+}
+
+// IsKnownClientType reports whether name (any case) is a client type that
+// version detection can assign.
+func IsKnownClientType(name string) bool {
+	name = strings.ToLower(name)
+	return slices.ContainsFunc(clientTypePatterns, func(p clientTypePattern) bool { return p.typeName == name })
 }
 
 // HealthMonitor runs background health checks against all upstreams in a pool.
@@ -79,6 +91,26 @@ func (h *HealthMonitor) recordProbeSuccess(u *Upstream, started time.Time) {
 func (h *HealthMonitor) recordProbeError(u *Upstream) {
 	u.RecordScoreError()
 	h.pool.RefreshUpstreamScoreMetrics(u)
+}
+
+// getJSON fetches path from u with the probe timeout and decodes a 200
+// response into out.
+func getJSON(ctx context.Context, u *Upstream, path string, out any) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := probeRequest(ctx, u, path)
+	if err != nil {
+		return err
+	}
+	resp, err := u.Client.Do(req)
+	if err != nil {
+		return SanitizeError(err)
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
 }
 
 func probeRequest(ctx context.Context, u *Upstream, path string) (*http.Request, error) {
@@ -105,32 +137,12 @@ func (h *HealthMonitor) start(ctx context.Context) {
 
 // monitorSync polls /eth/v1/node/syncing at checkInterval.
 func (h *HealthMonitor) monitorSync(ctx context.Context, u *Upstream) {
-	h.checkSync(ctx, u)
-	ticker := time.NewTicker(h.cfg.CheckInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			h.checkSync(ctx, u)
-		}
-	}
+	every(ctx, h.cfg.CheckInterval, func() { h.checkSync(ctx, u) })
 }
 
 // monitorFinality polls /eth/v1/beacon/states/head/finality_checkpoints at finalityInterval.
 func (h *HealthMonitor) monitorFinality(ctx context.Context, u *Upstream) {
-	h.checkFinality(ctx, u)
-	ticker := time.NewTicker(h.cfg.FinalityInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			h.checkFinality(ctx, u)
-		}
-	}
+	every(ctx, h.cfg.FinalityInterval, func() { h.checkFinality(ctx, u) })
 }
 
 func (h *HealthMonitor) checkSync(ctx context.Context, u *Upstream) {
@@ -200,26 +212,8 @@ func (h *HealthMonitor) checkFinality(ctx context.Context, u *Upstream) {
 	}
 	started := time.Now()
 
-	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	req, err := probeRequest(checkCtx, u, "/eth/v1/beacon/states/head/finality_checkpoints")
-	if err != nil {
-		return
-	}
-
-	resp, err := u.Client.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		if resp != nil {
-			resp.Body.Close() //nolint:errcheck
-		}
-		h.recordProbeError(u)
-		return
-	}
-	defer resp.Body.Close() //nolint:errcheck
-
 	var fc finalityCheckpointsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&fc); err != nil {
+	if err := getJSON(ctx, u, "/eth/v1/beacon/states/head/finality_checkpoints", &fc); err != nil {
 		h.recordProbeError(u)
 		return
 	}
@@ -239,43 +233,15 @@ func (h *HealthMonitor) checkFinality(ctx context.Context, u *Upstream) {
 }
 
 func (h *HealthMonitor) monitorVersion(ctx context.Context, u *Upstream) {
-	h.checkVersion(ctx, u)
 	// Client type (Lighthouse, Teku, etc.) never changes at runtime; 5-minute
 	// polling is just a safety net in case a node is replaced in-place.
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			h.checkVersion(ctx, u)
-		}
-	}
+	every(ctx, 5*time.Minute, func() { h.checkVersion(ctx, u) })
 }
 
 func (h *HealthMonitor) checkVersion(ctx context.Context, u *Upstream) {
 	started := time.Now()
-	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	req, err := probeRequest(checkCtx, u, "/eth/v1/node/version")
-	if err != nil {
-		return
-	}
-
-	resp, err := u.Client.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		if resp != nil {
-			resp.Body.Close() //nolint:errcheck
-		}
-		h.recordProbeError(u)
-		return
-	}
-	defer resp.Body.Close() //nolint:errcheck
-
 	var v nodeVersionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+	if err := getJSON(ctx, u, "/eth/v1/node/version", &v); err != nil {
 		h.recordProbeError(u)
 		return
 	}
@@ -292,21 +258,11 @@ func (h *HealthMonitor) checkVersion(ctx context.Context, u *Upstream) {
 }
 
 // monitorHead polls /eth/v1/beacon/headers/head at checkInterval to track
-// each upstream's view of the chain tip. We poll rather than subscribe to SSE
-// here because SSE streams are managed per-client in sse.go; the health monitor
-// needs its own independent view to detect fork divergence across upstreams.
+// each upstream's view of the chain tip. It runs alongside the head watcher's
+// SSE subscription (network/head_watcher.go) so fork detection still gets
+// fresh heads when an upstream's event stream is down.
 func (h *HealthMonitor) monitorHead(ctx context.Context, u *Upstream) {
-	h.checkHead(ctx, u)
-	ticker := time.NewTicker(h.cfg.CheckInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			h.checkHead(ctx, u)
-		}
-	}
+	every(ctx, h.cfg.CheckInterval, func() { h.checkHead(ctx, u) })
 }
 
 func (h *HealthMonitor) checkHead(ctx context.Context, u *Upstream) {
@@ -315,26 +271,8 @@ func (h *HealthMonitor) checkHead(ctx context.Context, u *Upstream) {
 	}
 	started := time.Now()
 
-	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	req, err := probeRequest(checkCtx, u, "/eth/v1/beacon/headers/head")
-	if err != nil {
-		return
-	}
-
-	resp, err := u.Client.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		if resp != nil {
-			resp.Body.Close() //nolint:errcheck
-		}
-		h.recordProbeError(u)
-		return
-	}
-	defer resp.Body.Close() //nolint:errcheck
-
 	var bh beaconHeaderResponse
-	if err := json.NewDecoder(resp.Body).Decode(&bh); err != nil {
+	if err := getJSON(ctx, u, "/eth/v1/beacon/headers/head", &bh); err != nil {
 		h.recordProbeError(u)
 		return
 	}
@@ -345,7 +283,7 @@ func (h *HealthMonitor) checkHead(ctx context.Context, u *Upstream) {
 		return
 	}
 
-	u.UpdateHeadBlock(slot, bh.Data.Root, bh.Data.Header.Message.ParentRoot)
+	u.UpdateHeadBlock(slot, bh.Data.Root)
 	h.pool.blockCache.AddBlock(u.ID, slot, bh.Data.Root, bh.Data.Header.Message.ParentRoot)
 	h.pool.SyncCanonicalHead()
 	h.recordProbeSuccess(u, started)
@@ -356,17 +294,7 @@ func (h *HealthMonitor) checkHead(ctx context.Context, u *Upstream) {
 }
 
 func (h *HealthMonitor) monitorNodeHealth(ctx context.Context, u *Upstream) {
-	h.checkNodeHealth(ctx, u)
-	ticker := time.NewTicker(h.cfg.CheckInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			h.checkNodeHealth(ctx, u)
-		}
-	}
+	every(ctx, h.cfg.CheckInterval, func() { h.checkNodeHealth(ctx, u) })
 }
 
 // checkNodeHealth polls /eth/v1/node/health. The Beacon API spec defines only
@@ -416,14 +344,20 @@ func (h *HealthMonitor) checkNodeHealth(ctx context.Context, u *Upstream) {
 }
 
 func (h *HealthMonitor) cleanupBlockCache(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
+	every(ctx, 30*time.Second, h.pool.blockCache.Cleanup)
+}
+
+// every runs fn now and then at each interval until ctx is done.
+func every(ctx context.Context, interval time.Duration, fn func()) {
+	fn()
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			h.pool.blockCache.Cleanup()
+			fn()
 		}
 	}
 }

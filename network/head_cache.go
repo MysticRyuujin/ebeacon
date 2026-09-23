@@ -113,9 +113,9 @@ func (n *Network) populateCacheKey(ctx context.Context, key string, source *upst
 	}
 
 	preferID := ""
-	required := requiredUpstreamSelector{}
+	required := upstream.Selector{}
 	if parsed.scope != "" {
-		required = requiredSelectorFromValue(parsed.scope)
+		required = upstream.ParseSelector(parsed.scope)
 	} else if source != nil {
 		preferID = source.ID
 	}

@@ -34,6 +34,7 @@ func main() {
 	}
 
 	setupLogging(cfg.LogLevel)
+	cfg.WarnIgnoredFailsafe()
 	if err := networkpkg.SetTrustedProxies(cfg.Server.TrustedProxies); err != nil {
 		fmt.Fprintf(os.Stderr, "invalid server.trustedProxies: %v\n", err)
 		os.Exit(1)
@@ -55,7 +56,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var sharedState state.SharedState
+	var sharedState *state.RedisState
 	switch cfg.State.Driver {
 	case "redis":
 		rs, err := state.NewRedisState(cfg.State.Redis)
@@ -71,7 +72,6 @@ func main() {
 		}
 		slog.Info("shared state: redis", "url", redactedURL)
 	default:
-		sharedState = state.NewLocalState()
 		slog.Info("shared state: local")
 	}
 
@@ -104,8 +104,10 @@ func main() {
 			slog.Error("failed to create network", "network", cfg.Networks[i].ID, "err", err)
 			os.Exit(1)
 		}
-		n.Pool().SetSharedState(sharedState)
-		n.Pool().StartStateSync() // seed finalized epoch before health monitoring starts
+		if sharedState != nil {
+			n.Pool().SetSharedState(sharedState)
+			n.Pool().StartStateSync() // seed finalized epoch before health monitoring starts
+		}
 		n.Start(ctx)
 		networks[cfg.Networks[i].ID] = n
 		allNetworks[cfg.Networks[i].ID] = n
@@ -116,24 +118,26 @@ func main() {
 	}
 
 	// Fan-out head updates from shared state to all network pools.
-	go func() {
-		ch := sharedState.SubscribeHead()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case update, ok := <-ch:
-				if !ok {
+	if sharedState != nil {
+		go func() {
+			ch := sharedState.SubscribeHead()
+			for {
+				select {
+				case <-ctx.Done():
 					return
+				case update, ok := <-ch:
+					if !ok {
+						return
+					}
+					n, ok := allNetworks[update.Network]
+					if !ok {
+						continue
+					}
+					n.Pool().RecordRemoteHead(update.Slot, update.Root)
 				}
-				n, ok := allNetworks[update.Network]
-				if !ok {
-					continue
-				}
-				n.Pool().RecordRemoteHead(update.Slot, update.Root)
 			}
-		}
-	}()
+		}()
+	}
 	p := proxy.New(networks)
 	if cfg.Auth != nil {
 		p.SetAuth(cfg.Auth)

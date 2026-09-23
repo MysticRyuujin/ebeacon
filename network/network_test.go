@@ -760,7 +760,7 @@ func TestCopyHeaders_DoNotMutateSource(t *testing.T) {
 		"X-Remove-Me":            []string{"connection-scoped"},
 	}
 	dstReq := http.Header{}
-	copyRequestHeaders(dstReq, srcReq)
+	copyEndToEndHeaders(dstReq, srcReq)
 	if got := dstReq.Get("Connection"); got != "" {
 		t.Fatalf("request hop-by-hop header copied: %q", got)
 	}
@@ -802,7 +802,7 @@ func TestCopyHeaders_DoNotMutateSource(t *testing.T) {
 		"X-Response-Internal": []string{"remove"},
 	}
 	dstResp := http.Header{}
-	copyResponseHeaders(dstResp, srcResp)
+	copyEndToEndHeaders(dstResp, srcResp)
 	if got := dstResp.Get("Transfer-Encoding"); got != "" {
 		t.Fatalf("response hop-by-hop header copied: %q", got)
 	}
@@ -3271,9 +3271,9 @@ func TestForward_ConnectionNominatedXFFIsNotSmuggled(t *testing.T) {
 
 func TestRequiredSelectorFromValue_GlobPrefixRoundTrip(t *testing.T) {
 	t.Parallel()
-	sel := requiredUpstreamSelector{glob: "*lighthouse*"}
-	parsed := requiredSelectorFromValue(sel.label())
-	if parsed.glob != "*lighthouse*" || parsed.upstreamID != "" || parsed.clientType != "" {
+	sel := upstream.Selector{Glob: "*lighthouse*"}
+	parsed := upstream.ParseSelector(sel.String())
+	if parsed.Glob != "*lighthouse*" || parsed.ID != "" || parsed.ClientType != "" {
 		t.Fatalf("glob scope label must round-trip, got %+v", parsed)
 	}
 }

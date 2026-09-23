@@ -60,15 +60,6 @@ func AuthenticateRequest(r *http.Request, auth *config.AuthConfig, extraSecrets 
 	return AuthResult{}
 }
 
-// AuthSecretMatches checks whether the request presents the expected API key / secret.
-// Deprecated: prefer AuthenticateRequest for new code.
-func AuthSecretMatches(r *http.Request, secret string) bool {
-	if secret == "" {
-		return true
-	}
-	return constantTimeEquals(extractSecret(r), secret)
-}
-
 // extractSecret pulls the credential from the request using all supported mechanisms:
 // X-EBEACON-Secret-Token, X-API-Key, Authorization: Bearer, ?secret=
 func extractSecret(r *http.Request) string {

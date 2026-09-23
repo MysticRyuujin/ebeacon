@@ -12,8 +12,8 @@ import (
 func newTestRedisStore(t *testing.T, mr *miniredis.Miniredis, prefix string) *RedisStore {
 	t.Helper()
 	store, err := NewRedisStore(&config.RedisCacheConfig{
-		URL:       "redis://" + mr.Addr(),
-		KeyPrefix: prefix,
+		RedisConfig: config.RedisConfig{URL: "redis://" + mr.Addr()},
+		KeyPrefix:   prefix,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +74,9 @@ func TestRedisStore_Promote(t *testing.T) {
 	store := newTestRedisStore(t, mr, "")
 
 	store.Set("k1", makeEntry("k1", 200, []byte(`{}`)), 50*time.Millisecond)
-	store.Promote("k1")
+	if got := store.PromoteIf(func(k string) bool { return k == "k1" }); got != 1 {
+		t.Fatalf("PromoteIf promoted %d entries, want 1", got)
+	}
 	mr.FastForward(100 * time.Millisecond)
 
 	_, ok := store.Get("k1")
@@ -141,15 +143,15 @@ func TestRedisStore_Password(t *testing.T) {
 	mr := miniredis.RunT(t)
 	mr.RequireAuth("s3cr3t")
 
-	_, err := NewRedisStore(&config.RedisCacheConfig{URL: "redis://" + mr.Addr()})
+	_, err := NewRedisStore(&config.RedisCacheConfig{RedisConfig: config.RedisConfig{URL: "redis://" + mr.Addr()}})
 	if err == nil {
 		t.Fatal("expected error connecting without password")
 	}
 
-	store, err := NewRedisStore(&config.RedisCacheConfig{
+	store, err := NewRedisStore(&config.RedisCacheConfig{RedisConfig: config.RedisConfig{
 		URL:      "redis://" + mr.Addr(),
 		Password: "s3cr3t",
-	})
+	}})
 	if err != nil {
 		t.Fatalf("expected success with correct password: %v", err)
 	}

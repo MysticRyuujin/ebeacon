@@ -1,11 +1,13 @@
 package upstream
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
 	"math"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -23,6 +25,8 @@ type Pool struct {
 	mu        sync.RWMutex
 	upstreams []*Upstream
 	rrCounter atomic.Uint64
+	// hasArchive is fixed at construction because upstreams never change.
+	hasArchive bool
 
 	routing    config.RoutingConfig
 	monitor    *HealthMonitor
@@ -32,11 +36,11 @@ type Pool struct {
 	// Slots at or before epoch*slotsPerEpoch can be cached forever.
 	finalizedEpoch atomic.Uint64
 
-	// slotsPerEpoch is the chain's SLOTS_PER_EPOCH; 0 means the 32 default.
-	slotsPerEpoch atomic.Uint64
+	// slotsPerEpoch is the chain's SLOTS_PER_EPOCH; 0 means the default.
+	slotsPerEpoch uint64
 
 	// sharedState propagates head and finalized updates across instances.
-	sharedState state.SharedState
+	sharedState *state.RedisState
 
 	// lastPublished tracks the most recently published canonical head to avoid
 	// redundant publishes when the head has not changed.
@@ -78,6 +82,7 @@ func NewPool(networkID string, upstreamCfgs []config.UpstreamConfig, routing con
 		upstreams:  upstreams,
 		routing:    routing,
 		blockCache: NewBlockCache(health.FollowDistance, health.MaxHeadDistance),
+		hasArchive: slices.ContainsFunc(upstreams, (*Upstream).IsArchive),
 	}
 	p.monitor = newHealthMonitor(upstreams, p, health)
 	p.RefreshScoreMetrics()
@@ -118,38 +123,17 @@ func (p *Pool) scoreDetailsWithWeights(u *Upstream, canonicalSlot uint64, weight
 	if u == nil {
 		return UpstreamScoreDetails{LoadBalancing: p.routing.LoadBalancing}
 	}
-	snapshot := u.ScoreSnapshotForPath(apiPath)
-	headSlot := u.HeadSlot()
-	var headLag uint64
-	if canonicalSlot > headSlot {
-		headLag = canonicalSlot - headSlot
-	}
-	syncDistance := u.SyncDistance()
-	return UpstreamScoreDetails{
-		LoadBalancing: p.routing.LoadBalancing,
-		Score: calculateScore(
-			weights.ErrorRate,
-			weights.Latency,
-			weights.HeadLag,
-			weights.SyncDistance,
-			snapshot.ErrorRate,
-			snapshot.P90Latency,
-			headLag,
-			syncDistance,
-		),
-		ErrorRate:    snapshot.ErrorRate,
-		P90Latency:   snapshot.P90Latency,
-		HeadLag:      headLag,
-		SyncDistance: syncDistance,
-		Samples:      snapshot.Samples,
-	}
+	return p.scoreDetails(u, canonicalSlot, weights, u.ScoreSnapshotForPath(apiPath))
 }
 
 func (p *Pool) rawPathScoreDetailsWithWeights(u *Upstream, canonicalSlot uint64, weights config.ScoreWeightsConfig, apiPath string) UpstreamScoreDetails {
 	if u == nil {
 		return UpstreamScoreDetails{LoadBalancing: p.routing.LoadBalancing}
 	}
-	snapshot := u.PathScoreSnapshot(apiPath)
+	return p.scoreDetails(u, canonicalSlot, weights, u.PathScoreSnapshot(apiPath))
+}
+
+func (p *Pool) scoreDetails(u *Upstream, canonicalSlot uint64, weights config.ScoreWeightsConfig, snapshot ScoreSnapshot) UpstreamScoreDetails {
 	headSlot := u.HeadSlot()
 	var headLag uint64
 	if canonicalSlot > headSlot {
@@ -274,42 +258,18 @@ func (p *Pool) GetForPath(preferID, apiPath string) (*Upstream, error) {
 	return ups[0], nil
 }
 
-// SelectByClientType returns up to n upstreams for a single client type,
-// ordered by the normal load-balancing policy and limited to that client set.
-func (p *Pool) SelectByClientType(clientType string, n int) []*Upstream {
-	return p.SelectByClientTypeForPath(clientType, "", n)
-}
-
-// SelectByClientTypeForPath returns up to n upstreams for a single client type,
-// ordered by the load-balancing policy using route-scoped score data when available.
-func (p *Pool) SelectByClientTypeForPath(clientType, apiPath string, n int) []*Upstream {
+// HasMatching reports whether any upstream matches sel.
+func (p *Pool) HasMatching(sel Selector) bool {
 	p.mu.RLock()
-	all := make([]*Upstream, 0, len(p.upstreams))
-	for _, u := range p.upstreams {
-		if u.ClientType() == clientType {
-			all = append(all, u)
-		}
-	}
-	p.mu.RUnlock()
-	return p.selectFromCandidatesForPath(all, n, apiPath, false)
+	defer p.mu.RUnlock()
+	return slices.ContainsFunc(p.upstreams, sel.Match)
 }
 
-// SelectByGlob returns up to n upstreams whose IDs match the glob pattern,
-// ordered by the normal load-balancing policy and limited to that match set.
-func (p *Pool) SelectByGlob(pattern string, n int) []*Upstream {
-	return p.SelectByGlobForPath(pattern, "", n)
-}
-
-// SelectByGlobForPath returns up to n upstreams whose IDs match the glob
-// pattern, using route-scoped score data when available.
-func (p *Pool) SelectByGlobForPath(pattern, apiPath string, n int) []*Upstream {
+// SelectMatching returns up to n upstreams that match sel, ordered by the
+// load-balancing policy using route-scoped score data when available.
+func (p *Pool) SelectMatching(sel Selector, apiPath string, n int) []*Upstream {
 	p.mu.RLock()
-	all := make([]*Upstream, 0, len(p.upstreams))
-	for _, u := range p.upstreams {
-		if matched, _ := path.Match(pattern, u.ID); matched {
-			all = append(all, u)
-		}
-	}
+	all := filter(p.upstreams, sel.Match)
 	p.mu.RUnlock()
 	return p.selectFromCandidatesForPath(all, n, apiPath, false)
 }
@@ -385,14 +345,7 @@ func (p *Pool) SelectForPathArchive(apiPath string, n int) []*Upstream {
 // for this pool; when no archive upstream exists, pruning errors are returned
 // unchanged (no behavior change from pre-archive versions).
 func (p *Pool) HasArchive() bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	for _, u := range p.upstreams {
-		if u.IsArchive() {
-			return true
-		}
-	}
-	return false
+	return p.hasArchive
 }
 
 func (p *Pool) selectFromCandidatesForPath(all []*Upstream, n int, apiPath string, preferCanonicalHead bool) []*Upstream {
@@ -445,93 +398,27 @@ func (p *Pool) selectFromCandidatesForPath(all []*Upstream, n int, apiPath strin
 	return ordered[:n]
 }
 
-// ByClientType returns the first upstream matching the given client type, or nil.
-func (p *Pool) ByClientType(ct string) *Upstream {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	for _, u := range p.upstreams {
-		if u.ClientType() == ct {
-			return u
-		}
+// NodeHealthStatus returns the best health status among upstreams that match
+// sel, or HealthDown if none match.
+func (p *Pool) NodeHealthStatus(sel Selector) HealthStatus {
+	_, up, degraded, _ := p.HealthCounts(sel)
+	switch {
+	case up > 0:
+		return HealthUp
+	case degraded > 0:
+		return HealthDegraded
+	default:
+		return HealthDown
 	}
-	return nil
 }
 
-// NodeHealthStatus returns the best health status across all upstreams.
-// Used to respond synthetically to /eth/v1/node/health.
-func (p *Pool) NodeHealthStatus() HealthStatus {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	best := HealthDown
-	for _, u := range p.upstreams {
-		if h := u.Health(); h > best {
-			best = h
-		}
-	}
-	return best
-}
-
-// NodeHealthStatusForSelector returns the best health status for upstreams
-// matching selector, which is in the same format as clientUpstream:
-// "client:<type>", a glob pattern, or a bare upstream ID.
-// Returns HealthDown if no upstreams match.
-func (p *Pool) NodeHealthStatusForSelector(selector string) HealthStatus {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	best := HealthDown
-	for _, u := range p.upstreams {
-		var match bool
-		switch {
-		case strings.HasPrefix(selector, "client:"):
-			match = u.ClientType() == strings.TrimPrefix(selector, "client:")
-		case strings.ContainsAny(selector, "*?["):
-			match, _ = path.Match(selector, u.ID)
-		default:
-			match = u.ID == selector
-		}
-		if match {
-			if h := u.Health(); h > best {
-				best = h
-			}
-		}
-	}
-	return best
-}
-
-// HealthCounts returns total, up, degraded, and down counts across all upstreams.
-func (p *Pool) HealthCounts() (total, up, degraded, down int) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	total = len(p.upstreams)
-	for _, u := range p.upstreams {
-		switch u.Health() {
-		case HealthUp:
-			up++
-		case HealthDegraded:
-			degraded++
-		default:
-			down++
-		}
-	}
-	return
-}
-
-// HealthCountsForSelector returns total, up, degraded, and down counts for
-// upstreams matching selector. Same selector format as NodeHealthStatusForSelector.
-func (p *Pool) HealthCountsForSelector(selector string) (total, up, degraded, down int) {
+// HealthCounts returns total, up, degraded, and down counts for upstreams
+// that match sel.
+func (p *Pool) HealthCounts(sel Selector) (total, up, degraded, down int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for _, u := range p.upstreams {
-		var match bool
-		switch {
-		case strings.HasPrefix(selector, "client:"):
-			match = u.ClientType() == strings.TrimPrefix(selector, "client:")
-		case strings.ContainsAny(selector, "*?["):
-			match, _ = path.Match(selector, u.ID)
-		default:
-			match = u.ID == selector
-		}
-		if !match {
+		if !sel.Match(u) {
 			continue
 		}
 		total++
@@ -547,17 +434,16 @@ func (p *Pool) HealthCountsForSelector(selector string) (total, up, degraded, do
 	return
 }
 
-// SetSlotsPerEpoch sets the chain's SLOTS_PER_EPOCH. Call once before Start.
-func (p *Pool) SetSlotsPerEpoch(n uint64) {
-	p.slotsPerEpoch.Store(n)
+// SetChainTiming sets the chain's genesis time, slot duration, and
+// SLOTS_PER_EPOCH. Call once before Start.
+func (p *Pool) SetChainTiming(genesisTime, secondsPerSlot int64, slotsPerEpoch uint64) {
+	p.blockCache.SetSlotTiming(genesisTime, secondsPerSlot)
+	p.slotsPerEpoch = slotsPerEpoch
 }
 
-// SlotsPerEpoch returns the chain's SLOTS_PER_EPOCH, defaulting to 32.
+// SlotsPerEpoch returns the chain's SLOTS_PER_EPOCH.
 func (p *Pool) SlotsPerEpoch() uint64 {
-	if n := p.slotsPerEpoch.Load(); n != 0 {
-		return n
-	}
-	return 32
+	return cmp.Or(p.slotsPerEpoch, config.DefaultSlotsPerEpoch)
 }
 
 // FinalizedEpoch returns the highest finalized epoch seen across all upstreams.
@@ -633,7 +519,7 @@ func (p *Pool) seedFinalizedEpoch(epoch uint64) {
 
 // SetSharedState attaches shared state for cross-instance coordination.
 // Must be called before Start.
-func (p *Pool) SetSharedState(s state.SharedState) {
+func (p *Pool) SetSharedState(s *state.RedisState) {
 	p.sharedState = s
 }
 
@@ -652,7 +538,7 @@ func (p *Pool) SyncCanonicalHead() {
 	if p.sharedState == nil {
 		return
 	}
-	slot, root := p.blockCache.CanonicalHead()
+	slot, root := p.blockCache.LocalCanonicalHead()
 	if slot == 0 || root == "" {
 		return
 	}
@@ -674,7 +560,7 @@ func (p *Pool) SyncCanonicalHead() {
 // RecordRemoteHead records a canonical head block published by another instance
 // so it contributes to local fork detection.
 func (p *Pool) RecordRemoteHead(slot uint64, root string) {
-	p.blockCache.AddBlock("remote", slot, root, "")
+	p.blockCache.AddBlock(remoteVoter, slot, root, "")
 }
 
 // orderRNG is a per-request xorshift64 PRNG used to randomise upstream ordering.

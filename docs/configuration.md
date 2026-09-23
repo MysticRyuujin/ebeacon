@@ -181,7 +181,9 @@ failsafe:
     agreementThreshold: 2
 ```
 
-Network-level failsafe config merges with global values field by field: a network block that sets only `retry.delay` inherits the global `timeout`, `maxAttempts`, and everything else it doesn't mention. `consensus` can also be overridden (or disabled) per network. Upstream-level `failsafe.circuitBreaker` overrides the merged result for that upstream.
+Network-level failsafe config merges with global values field by field: a network block that sets only `retry.delay` inherits the global `timeout`, `maxAttempts`, and everything else it doesn't mention. `consensus` can also be overridden (or disabled) per network. Upstream-level `failsafe.circuitBreaker` overrides the merged result for that upstream. At the upstream level, only `circuitBreaker` applies.
+
+A `failsafeOverrides` entry works differently: each section it sets (`timeout`, `retry`, `hedge`) replaces the whole network section, and unset fields in that section take the defaults. For example, an override that sets only `retry.delay` uses the default `maxAttempts`, not the network value. Overrides do not apply `circuitBreaker` or `consensus`. eBeacon logs a warning at startup for failsafe fields that it ignores.
 
 ## `networks` and upstreams
 

@@ -127,7 +127,9 @@ func TestCache_PromotePreventsExpiry(t *testing.T) {
 	h := http.Header{}
 	h.Set("Content-Type", "application/json")
 	c.Set("promote-key", 200, h, []byte(`{}`), 20*time.Millisecond)
-	c.Promote("promote-key")
+	if got := c.PromoteIf(func(k string) bool { return k == "promote-key" }); got != 1 {
+		t.Fatalf("PromoteIf promoted %d entries, want 1", got)
+	}
 
 	time.Sleep(35 * time.Millisecond)
 
@@ -209,5 +211,19 @@ func TestCache_EntriesSkipsBodyUnlessRequested(t *testing.T) {
 	}
 	if got := string(withBody[0].Body); got != string(body) {
 		t.Fatalf("body with includeBody: got %q want %q", got, body)
+	}
+}
+
+func TestMemoryStore_PromoteIfSweepsExpired(t *testing.T) {
+	t.Parallel()
+	m := NewMemoryStore(10)
+	m.Set("expired", &Entry{key: "expired", expires: time.Now().Add(-time.Second)}, time.Second)
+	m.Set("live", &Entry{key: "live", expires: time.Now().Add(time.Minute)}, time.Minute)
+
+	if got := m.PromoteIf(func(string) bool { return true }); got != 1 {
+		t.Fatalf("PromoteIf promoted %d entries, want 1", got)
+	}
+	if got := m.Len(); got != 1 {
+		t.Fatalf("Len after PromoteIf = %d, want 1 (expired entry swept)", got)
 	}
 }

@@ -172,7 +172,7 @@ Unknown YAML fields are rejected to catch misspellings. Network and upstream IDs
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | **server**       | `host`, `port`, `maxTimeout`, `enableGzip`, `maxResponseBodyBytes`, `trustedProxies`                                                           |
 | **cors**         | `allowedOrigins`, `allowedMethods`, `allowedHeaders`, `exposedHeaders`, `allowCredentials`, `maxAge` for browser access                        |
-| **failsafe**     | `timeout`, `retry`, `hedge`, `circuitBreaker`, `consensus` — global defaults merged per network/upstream                                       |
+| **failsafe**     | `timeout`, `retry`, `hedge`, `circuitBreaker`, `consensus` — global defaults merged per network; see docs                                      |
 | **health**       | `checkInterval`, `finalityInterval`, `maxSyncDistance`, `followDistance`, `maxHeadDistance` — sync/finality polling and degradation thresholds |
 | **rateLimiting** | `perIP`, `global` — token-bucket `limit` and `burst`                                                                                           |
 | **metrics**      | `enabled`, `path` — Prometheus scrape endpoint on the proxy port                                                                               |

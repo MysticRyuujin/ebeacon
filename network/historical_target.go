@@ -3,6 +3,8 @@ package network
 import (
 	"strconv"
 	"strings"
+
+	"github.com/mysticryuujin/ebeacon/config"
 )
 
 // HistoricalKind enumerates the categories of Beacon API endpoints that target
@@ -21,10 +23,6 @@ const (
 	HistoricalKindRewardsEpoch                  // /beacon/rewards/attestations/{epoch}
 	HistoricalKindLiveness                      // /validator/liveness/{epoch}
 )
-
-// SlotsPerEpoch is the default Ethereum consensus-layer value. Individual
-// networks may override it (for example, Gnosis and Chiado use 16).
-const SlotsPerEpoch uint64 = 32
 
 // Per-endpoint retention thresholds. Epoch-based protocol minimums are
 // converted to slots using the configured network value at classification
@@ -82,7 +80,7 @@ func (t HistoricalTarget) RequiresArchive(headSlot, slotsPerEpoch uint64) bool {
 		return false
 	}
 	if slotsPerEpoch == 0 {
-		slotsPerEpoch = SlotsPerEpoch
+		slotsPerEpoch = config.DefaultSlotsPerEpoch
 	}
 	headEpoch := headSlot / slotsPerEpoch
 
