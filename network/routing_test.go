@@ -43,12 +43,8 @@ func (p inferSelectorPoolStub) ByID(id string) *upstream.Upstream {
 	return p.byID[id]
 }
 
-func (p inferSelectorPoolStub) SelectByClientType(clientType string, n int) []*upstream.Upstream {
-	ups := p.byClient[clientType]
-	if len(ups) > n {
-		return ups[:n]
-	}
-	return ups
+func (p inferSelectorPoolStub) HasMatching(sel upstream.Selector) bool {
+	return len(p.byClient[sel.ClientType]) > 0
 }
 
 func TestInferClientSelectorPath_ClientType(t *testing.T) {
@@ -94,7 +90,7 @@ func TestCompiledRouting_matchRouteRule_Deny(t *testing.T) {
 	t.Parallel()
 	cr := &compiledRouting{
 		routeRules: []compiledRouteRule{
-			{re: regexp.MustCompile(`^/eth/v1/debug/`), deny: true},
+			{pathMethodRule: pathMethodRule{re: regexp.MustCompile(`^/eth/v1/debug/`)}, deny: true},
 		},
 	}
 	deny, _, hit := cr.matchRouteRule("GET", "/eth/v1/debug/foo")
@@ -108,8 +104,10 @@ func TestCompiledRouting_matchRouteRule_MethodFilter(t *testing.T) {
 	cr := &compiledRouting{
 		routeRules: []compiledRouteRule{
 			{
-				re:         regexp.MustCompile(`^/eth/v1/node/version$`),
-				methods:    map[string]bool{"POST": true},
+				pathMethodRule: pathMethodRule{
+					re:      regexp.MustCompile(`^/eth/v1/node/version$`),
+					methods: map[string]bool{"POST": true},
+				},
 				upstreamID: "teku",
 			},
 		},

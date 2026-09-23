@@ -147,7 +147,7 @@ func (l *Logger) LogEvent(event Event) {
 
 	request := map[string]any{
 		"path":    event.Path,
-		"headers": sanitizeHeaders(event.RequestHeaders),
+		"headers": SanitizeHeaders(event.RequestHeaders),
 	}
 	if query := sanitizeQuery(event.RawQuery); query != "" {
 		request["query"] = query
@@ -157,7 +157,7 @@ func (l *Logger) LogEvent(event Event) {
 	}
 
 	response := map[string]any{}
-	if headers := sanitizeHeaders(event.ResponseHeaders); len(headers) > 0 {
+	if headers := SanitizeHeaders(event.ResponseHeaders); len(headers) > 0 {
 		response["headers"] = headers
 	}
 	if body := previewBody(event.ResponseHeaders, event.ResponseBody, l.maxBodyBytes); body != nil {
@@ -202,11 +202,13 @@ func (l *Logger) LogEvent(event Event) {
 	l.logger.LogAttrs(context.Background(), slog.LevelInfo, "debug exchange", attrs...)
 }
 
-func sanitizeHeaders(headers http.Header) map[string][]string {
+// SanitizeHeaders returns a copy of headers with sensitive values replaced by
+// "[REDACTED]". Keys with no values are dropped.
+func SanitizeHeaders(headers http.Header) http.Header {
 	if len(headers) == 0 {
 		return nil
 	}
-	out := make(map[string][]string, len(headers))
+	out := make(http.Header, len(headers))
 	for key, values := range headers {
 		if len(values) == 0 {
 			continue
@@ -315,11 +317,4 @@ func isTextBody(contentType string, body []byte) bool {
 		return true
 	}
 	return utf8.Valid(body)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

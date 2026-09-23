@@ -22,10 +22,36 @@ type compiledClientRoute struct {
 }
 
 type compiledRouteRule struct {
-	re         *regexp.Regexp
-	methods    map[string]bool // uppercase; nil means any method
+	pathMethodRule
 	upstreamID string
 	deny       bool
+}
+
+// pathMethodRule matches a path regex and, when methods is non-nil, one of
+// the uppercase methods.
+type pathMethodRule struct {
+	re      *regexp.Regexp
+	methods map[string]bool
+}
+
+func compilePathMethodRule(pattern string, methods []string) (pathMethodRule, error) {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return pathMethodRule{}, err
+	}
+	rule := pathMethodRule{re: re}
+	if len(methods) > 0 {
+		rule.methods = make(map[string]bool, len(methods))
+		for _, m := range methods {
+			rule.methods[strings.ToUpper(strings.TrimSpace(m))] = true
+		}
+	}
+	return rule, nil
+}
+
+// matches reports whether the rule applies; method must be uppercase.
+func (r pathMethodRule) matches(method, path string) bool {
+	return (r.methods == nil || r.methods[method]) && r.re.MatchString(path)
 }
 
 func compileRouting(cfg *config.RoutingConfig) (*compiledRouting, error) {
@@ -44,22 +70,14 @@ func compileRouting(cfg *config.RoutingConfig) (*compiledRouting, error) {
 		})
 	}
 	for _, rr := range cfg.RouteRules {
-		re, err := regexp.Compile(rr.PathPattern)
+		rule, err := compilePathMethodRule(rr.PathPattern, rr.Methods)
 		if err != nil {
 			return nil, fmt.Errorf("route rule pattern %q: %w", rr.PathPattern, err)
 		}
-		var methods map[string]bool
-		if len(rr.Methods) > 0 {
-			methods = make(map[string]bool, len(rr.Methods))
-			for _, m := range rr.Methods {
-				methods[strings.ToUpper(strings.TrimSpace(m))] = true
-			}
-		}
 		out.routeRules = append(out.routeRules, compiledRouteRule{
-			re:         re,
-			methods:    methods,
-			upstreamID: rr.UpstreamID,
-			deny:       rr.Deny,
+			pathMethodRule: rule,
+			upstreamID:     rr.UpstreamID,
+			deny:           rr.Deny,
 		})
 	}
 	return out, nil
@@ -95,13 +113,8 @@ func (r *compiledRouting) applyClientPrefix(path string) (newPath string, upstre
 		}
 
 		var rest string
-		switch {
-		case strings.HasPrefix(path, cr.prefix):
+		if strings.HasPrefix(path, cr.prefix) {
 			rest = strings.TrimPrefix(path, cr.prefix)
-		case path == base:
-			rest = ""
-		default:
-			rest = ""
 		}
 		if rest != "" && !strings.HasPrefix(rest, "/") {
 			rest = "/" + rest
@@ -126,10 +139,7 @@ func (r *compiledRouting) matchRouteRule(method, path string) (deny bool, upstre
 	}
 	m := strings.ToUpper(method)
 	for _, rule := range r.routeRules {
-		if !rule.re.MatchString(path) {
-			continue
-		}
-		if len(rule.methods) > 0 && !rule.methods[m] {
+		if !rule.matches(m, path) {
 			continue
 		}
 		if rule.deny {
@@ -150,24 +160,9 @@ func cloneRequestWithPath(r *http.Request, path string) *http.Request {
 	return r2
 }
 
-func isKnownClientType(selector string) bool {
-	switch strings.ToLower(selector) {
-	case upstream.ClientLighthouse,
-		upstream.ClientPrysm,
-		upstream.ClientTeku,
-		upstream.ClientNimbus,
-		upstream.ClientLodestar,
-		upstream.ClientGrandine,
-		upstream.ClientCaplin:
-		return true
-	default:
-		return false
-	}
-}
-
 func inferClientSelectorPath(path string, pool interface {
 	ByID(id string) *upstream.Upstream
-	SelectByClientType(clientType string, n int) []*upstream.Upstream
+	HasMatching(sel upstream.Selector) bool
 }) (newPath string, upstreamID string, matched bool) {
 	trimmed := strings.TrimPrefix(path, "/")
 	selector, rest, ok := strings.Cut(trimmed, "/")
@@ -178,9 +173,9 @@ func inferClientSelectorPath(path string, pool interface {
 		return path, "", false
 	}
 	rewritten := "/" + rest
-	if isKnownClientType(selector) {
+	if upstream.IsKnownClientType(selector) {
 		clientType := strings.ToLower(selector)
-		if len(pool.SelectByClientType(clientType, 1)) > 0 {
+		if pool.HasMatching(upstream.Selector{ClientType: clientType}) {
 			return rewritten, "client:" + clientType, true
 		}
 	}

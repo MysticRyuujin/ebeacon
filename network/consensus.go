@@ -76,18 +76,9 @@ func (cp *ConsensusPolicy) Execute(
 				return
 			}
 			req = req.WithContext(ctx)
-			tok, ok := u.CBTryAcquire()
-			if !ok {
-				results[idx] = consensusResult{err: upstream.ErrCircuitUnavailable, upstream: u}
-				return
-			}
+			resp, tok, err := u.Do(req)
 			defer tok.Release()
-			u.ConsumeRateToken()
-			u.IncrActive()
-			resp, err := u.Client.Do(req)
 			if err != nil {
-				err = upstream.SanitizeError(err)
-				u.DecrActive()
 				// A client disconnect cancels every participant's request;
 				// that is not an upstream fault, so don't open breakers.
 				if !isClientCancel(ctx, err) {
@@ -98,7 +89,6 @@ func (cp *ConsensusPolicy) Execute(
 			}
 			body, readErr := readBodyCapped(resp.Body, cp.MaxBodyBytes)
 			resp.Body.Close() //nolint:errcheck
-			u.DecrActive()
 			u.RecordResponseStatus(resp.StatusCode)
 			if readErr != nil {
 				tok.Failure()
@@ -133,23 +123,25 @@ func (cp *ConsensusPolicy) Execute(
 		h.Write(b) //nolint:errcheck
 		return h.Sum64()
 	}
+	keys := make([]bodyKey, len(results))
 	counts := make(map[bodyKey]int)
-	for _, r := range results {
+	for i, r := range results {
 		if r.err != nil {
 			continue
 		}
-		counts[bodyKey{status: r.status, body: hashBody(r.body)}]++
+		keys[i] = bodyKey{status: r.status, body: hashBody(r.body)}
+		counts[keys[i]]++
 	}
 
 	// Pick the largest agreeing group, walking results in participant order so
 	// ties break deterministically instead of by map iteration.
 	var best consensusResult
 	bestCount := 0
-	for _, r := range results {
+	for i, r := range results {
 		if r.err != nil {
 			continue
 		}
-		if n := counts[bodyKey{status: r.status, body: hashBody(r.body)}]; n > bestCount {
+		if n := counts[keys[i]]; n > bestCount {
 			best = r
 			bestCount = n
 		}

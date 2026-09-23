@@ -472,3 +472,44 @@ networks:
 		t.Fatal("foreign-network entry must not be purged by this network's head watcher")
 	}
 }
+
+func newGatingTestWatcher(t *testing.T) (*headWatcher, *Network) {
+	t.Helper()
+	id := netID(t)
+	cfg := mustCfgText(t, fmt.Sprintf(`
+logLevel: error
+server: { host: "127.0.0.1", port: 5555, maxTimeout: 30s }
+failsafe: { timeout: { duration: 10s } }
+health: { checkInterval: 1h, finalityInterval: 1h, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: %s
+    upstreams:
+      - id: u1
+        url: "http://127.0.0.1:1"
+      - id: u2
+        url: "http://127.0.0.1:1"
+    cache: { enabled: true, maxSize: 32 }
+`, id))
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &headWatcher{networkID: id, pool: n.pool, cache: n.cache, done: make(chan struct{})}, n
+}
+
+func TestHeadWatcher_HealthProbeBeforeEventStillPurges(t *testing.T) {
+	t.Parallel()
+	w, n := newGatingTestWatcher(t)
+	u := n.pool.All()[0]
+	key := w.networkID + ":GET:/eth/v1/beacon/headers/head"
+	n.cache.Set(key, http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, []byte(`{}`), time.Minute)
+
+	n.pool.BlockCache().AddBlock(u.ID, 100, "0xaa", "")
+	w.dispatchEvent(context.Background(), u, true, false, false, true, `{"slot":"100","block":"0xaa"}`)
+
+	if n.cache.Get(key) != nil {
+		t.Fatal("head event must purge even when a health probe recorded the block first")
+	}
+}

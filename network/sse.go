@@ -78,33 +78,26 @@ func newSSERelay(networkID string, pool *upstream.Pool) *SSERelay {
 	return &SSERelay{networkID: networkID, pool: pool}
 }
 
-func (r *SSERelay) pickUpstream(preferUpstream string, required requiredUpstreamSelector) (*upstream.Upstream, error) {
-	if !required.enabled() {
+func (r *SSERelay) pickUpstream(preferUpstream string, required upstream.Selector) (*upstream.Upstream, error) {
+	if !required.Enabled() {
 		return r.pool.Get(preferUpstream)
 	}
-	if required.upstreamID != "" {
-		u := r.pool.ByID(required.upstreamID)
+	if required.ID != "" {
+		u := r.pool.ByID(required.ID)
 		if u == nil {
-			return nil, &selectedUpstreamUnavailableError{selector: required.label()}
+			return nil, &selectedUpstreamUnavailableError{selector: required.String()}
 		}
 		return u, nil
 	}
-	if required.glob != "" {
-		ups := r.pool.SelectByGlob(required.glob, 1)
-		if len(ups) == 0 {
-			return nil, &selectedUpstreamUnavailableError{selector: required.label()}
-		}
-		return ups[0], nil
-	}
-	ups := r.pool.SelectByClientType(required.clientType, 1)
+	ups := r.pool.SelectMatching(required, "", 1)
 	if len(ups) == 0 {
-		return nil, &selectedUpstreamUnavailableError{selector: required.label()}
+		return nil, &selectedUpstreamUnavailableError{selector: required.String()}
 	}
 	return ups[0], nil
 }
 
 // Serve streams SSE events to the client, reconnecting upstream as needed.
-func (r *SSERelay) Serve(w http.ResponseWriter, req *http.Request, preferUpstream string, required requiredUpstreamSelector) {
+func (r *SSERelay) Serve(w http.ResponseWriter, req *http.Request, preferUpstream string, required upstream.Selector) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported by server", http.StatusInternalServerError)
@@ -126,7 +119,7 @@ func (r *SSERelay) Serve(w http.ResponseWriter, req *http.Request, preferUpstrea
 	for ctx.Err() == nil {
 		u, err := r.pickUpstream(stickyID, required)
 		if err != nil {
-			if required.enabled() && !headersSent {
+			if required.Enabled() && !headersSent {
 				http.Error(w, "selected upstream unavailable", http.StatusServiceUnavailable)
 				return
 			}
@@ -151,11 +144,11 @@ func (r *SSERelay) Serve(w http.ResponseWriter, req *http.Request, preferUpstrea
 			metricSSEReconnects.WithLabelValues(r.networkID).Inc()
 			slog.Info("sse: upstream disconnected, reconnecting",
 				"network", r.networkID, "upstream", u.ID)
-		} else if required.enabled() && !headersSent {
+		} else if required.Enabled() && !headersSent {
 			http.Error(w, "selected upstream unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		if !required.enabled() {
+		if !required.Enabled() {
 			stickyID = "" // don't prefer the failed upstream
 		}
 
@@ -171,35 +164,23 @@ func (r *SSERelay) Serve(w http.ResponseWriter, req *http.Request, preferUpstrea
 // until the upstream closes the stream or the client context is done.
 // Returns true if the upstream connection was successfully established.
 func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.Request, w http.ResponseWriter, flusher http.Flusher, seen *seenRing, headersSent *bool) bool {
-	upURL := u.URL + pathAndQueryForUpstream(req.URL)
-	upReq, err := http.NewRequestWithContext(ctx, http.MethodGet, upURL, nil)
+	upReq, err := newUpstreamRequest(ctx, u, http.MethodGet, req, nil)
 	if err != nil {
 		return false
 	}
 
-	copyRequestHeaders(upReq.Header, req.Header)
-	for k, v := range u.Headers {
-		upReq.Header.Set(k, v)
-	}
-
-	tok, ok := u.CBTryAcquire()
-	if !ok {
-		return false
-	}
+	resp, tok, err := u.Do(upReq)
 	defer tok.Release()
-	u.ConsumeRateToken()
-	u.IncrActive()
-	resp, err := u.Client.Do(upReq)
+	if errors.Is(err, upstream.ErrCircuitUnavailable) {
+		return false
+	}
 	if err != nil {
-		err = upstream.SanitizeError(err)
-		u.DecrActive()
 		if ctx.Err() == nil {
 			slog.Warn("sse: upstream connection failed", "network", r.networkID, "upstream", u.ID, "err", err)
 			tok.Failure()
 		}
 		return false
 	}
-	resp = u.TrackResponse(resp)
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
@@ -209,7 +190,7 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 	}
 
 	if !*headersSent {
-		copyResponseHeaders(w.Header(), resp.Header)
+		copyEndToEndHeaders(w.Header(), resp.Header)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Accel-Buffering", "no")
@@ -238,28 +219,10 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 	// include large payloads for some topics. Lines are capped so a stream
 	// that never sends a newline can't grow memory unbounded before the
 	// per-event size check downstream ever runs.
-	reader := bufio.NewReader(resp.Body)
 	var event strings.Builder
-	type readResult struct {
-		line string
-		err  error
-	}
-	readCh := make(chan readResult, 1)
 	done := make(chan struct{})
 	defer close(done)
-	go func() {
-		for {
-			line, readErr := readCappedLine(reader, sseMaxEventBytes)
-			select {
-			case readCh <- readResult{line: line, err: readErr}:
-			case <-done:
-				return
-			}
-			if readErr != nil {
-				return
-			}
-		}
-	}()
+	readCh := readSSELines(resp.Body, done, 1)
 
 	pingTicker := time.NewTicker(ssePingInterval)
 	defer pingTicker.Stop()
@@ -285,12 +248,6 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 			}
 			flusher.Flush()
 		case rr := <-readCh:
-			if !idle.Stop() {
-				select {
-				case <-idle.C:
-				default:
-				}
-			}
 			idle.Reset(sseIdleTimeout)
 
 			if rr.line != "" {
@@ -355,6 +312,33 @@ func (r *SSERelay) stream(ctx context.Context, u *upstream.Upstream, req *http.R
 			return true
 		}
 	}
+}
+
+type sseLine struct {
+	line string
+	err  error
+}
+
+// readSSELines reads capped lines from body on a goroutine so callers can
+// select on them alongside timers and ctx. The goroutine stops after the first
+// read error or when done is closed.
+func readSSELines(body io.Reader, done <-chan struct{}, buffer int) <-chan sseLine {
+	lines := make(chan sseLine, buffer)
+	go func() {
+		r := bufio.NewReader(body)
+		for {
+			line, err := readCappedLine(r, sseMaxEventBytes)
+			select {
+			case lines <- sseLine{line, err}:
+			case <-done:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return lines
 }
 
 // errSSELineTooLong signals that a single line exceeded the cap without a

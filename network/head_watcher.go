@@ -1,7 +1,6 @@
 package network
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -174,27 +173,7 @@ func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error
 
 	slog.Debug("head watcher: connected", "network", w.networkID, "upstream", u.ID)
 
-	// Spawn a goroutine to do blocking line reads so the outer loop can also
-	// select on ctx.Done() and a stale-connection timeout.
-	type lineResult struct {
-		line string
-		err  error
-	}
-	lines := make(chan lineResult, 4)
-	go func() {
-		r := bufio.NewReader(resp.Body)
-		for {
-			line, err := readCappedLine(r, sseMaxEventBytes)
-			select {
-			case lines <- lineResult{line, err}:
-			case <-readerDone:
-				return
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
+	lines := readSSELines(resp.Body, readerDone, 4)
 
 	// Beacon nodes emit a head event roughly every slot (12 s). If we receive
 	// nothing for 90 s the connection is likely stalled.
@@ -218,12 +197,6 @@ func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error
 			return fmt.Errorf("upstream %s: no data for %s", u.ID, staleTimeout)
 
 		case rr := <-lines:
-			if !idle.Stop() {
-				select {
-				case <-idle.C:
-				default:
-				}
-			}
 			idle.Reset(staleTimeout)
 
 			if rr.line != "" {
@@ -315,7 +288,7 @@ func (w *headWatcher) recordHeadSeen(u *upstream.Upstream, data string) {
 	if err != nil || slot == 0 || payload.Block == "" {
 		return
 	}
-	u.UpdateHeadBlock(slot, payload.Block, "")
+	u.UpdateHeadBlock(slot, payload.Block)
 	w.pool.BlockCache().AddBlock(u.ID, slot, payload.Block, "")
 	w.pool.SyncCanonicalHead()
 }
@@ -397,25 +370,13 @@ func (w *headWatcher) handleFinalizedCheckpoint(data string) {
 		return
 	}
 
-	// A checkpoint at epoch E finalizes the chain only up to slot
-	// E*slotsPerEpoch. Epoch-keyed data (e.g. attestation rewards for epoch N)
-	// can depend on inclusions through epoch N+1, so require N+2 <= E.
-	finalizedSlot := epoch * w.pool.SlotsPerEpoch()
+	slotsPerEpoch := w.pool.SlotsPerEpoch()
 	n := w.cache.PromoteIf(func(key string) bool {
 		if !w.ownsKey(key) {
 			return false
 		}
 		path := cacheKeyPath(key)
-		if path == "" {
-			return false
-		}
-		if slot, ok := pathNumericSlot(path); ok && slot <= finalizedSlot {
-			return true
-		}
-		if ep, ok := pathNumericEpoch(path); ok && epoch >= 2 && ep <= epoch-2 {
-			return true
-		}
-		return false
+		return path != "" && isFinalizedPath(path, epoch, slotsPerEpoch)
 	})
 	if n > 0 {
 		metricFinalityPromotions.WithLabelValues(w.networkID).Add(float64(n))
@@ -446,7 +407,7 @@ func (w *headWatcher) handleChainReorg(data string) {
 
 	// Purge numeric-slot entries at or above the reorg slot, plus all
 	// named-head entries which may also reference the orphaned fork.
-	n := w.cache.PurgeIf(func(key string) bool {
+	n, _ := w.cache.PurgeCollect(func(key string) bool {
 		if !w.ownsKey(key) {
 			return false
 		}

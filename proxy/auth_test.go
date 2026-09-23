@@ -7,24 +7,24 @@ import (
 	"github.com/mysticryuujin/ebeacon/config"
 )
 
-func TestAuthSecretMatches(t *testing.T) {
+func TestExtractSecret(t *testing.T) {
 	t.Parallel()
 	secret := "abc123"
 	req, _ := http.NewRequest(http.MethodGet, "http://localhost/", nil)
-	if !AuthSecretMatches(req, "") {
-		t.Fatal("empty secret should allow")
+	if got := extractSecret(req); got != "" {
+		t.Fatalf("no credential: got %q", got)
 	}
 	req.Header.Set(headerEbeaconSecretToken, secret)
-	if !AuthSecretMatches(req, secret) {
+	if extractSecret(req) != secret {
 		t.Fatal("X-EBEACON-Secret-Token")
 	}
 	req2, _ := http.NewRequest(http.MethodGet, "http://localhost/", nil)
 	req2.Header.Set("Authorization", "Bearer "+secret)
-	if !AuthSecretMatches(req2, secret) {
+	if extractSecret(req2) != secret {
 		t.Fatal("Bearer")
 	}
 	req3, _ := http.NewRequest(http.MethodGet, "http://localhost/?secret="+secret, nil)
-	if !AuthSecretMatches(req3, secret) {
+	if extractSecret(req3) != secret {
 		t.Fatal("query secret")
 	}
 }

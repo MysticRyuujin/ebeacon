@@ -121,3 +121,19 @@ func TestRedisState_Password(t *testing.T) {
 	}
 	t.Cleanup(func() { rs.Close() }) //nolint:errcheck
 }
+
+func TestRedisState_DropsOwnHeadPublish(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+
+	rs := newTestRedisState(t, mr)
+	time.Sleep(50 * time.Millisecond)
+
+	rs.PublishHead("hoodi", 42, "0xdeadbeef")
+
+	select {
+	case up := <-rs.SubscribeHead():
+		t.Fatalf("instance received its own head update: %+v", up)
+	case <-time.After(200 * time.Millisecond):
+	}
+}

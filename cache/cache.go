@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -111,6 +112,9 @@ type Entry struct {
 	body    []byte
 	created time.Time
 	expires time.Time // zero = never expires
+
+	gzipOnce sync.Once
+	gzipBody []byte
 }
 
 // Snapshot is a serializable view of a cached response entry.
@@ -136,12 +140,11 @@ type Cache struct {
 	store    Store
 	policies []policy
 
-	hits   atomic.Int64
-	misses atomic.Int64
-
 	metricHits   prometheus.Counter
 	metricMisses prometheus.Counter
 	metricSize   prometheus.Gauge
+	// sizeRefreshedAt rate-limits the size refresh on the hit path.
+	sizeRefreshedAt atomic.Int64
 }
 
 // New creates a Cache from the given config. networkID is used for metric labels.
@@ -226,13 +229,16 @@ func (c *Cache) Policy(method, path string) *policy {
 func (c *Cache) Get(key string) *Entry {
 	e, ok := c.store.Get(key)
 	if !ok {
-		c.misses.Add(1)
 		c.metricMisses.Inc()
 		return nil
 	}
-	c.hits.Add(1)
 	c.metricHits.Inc()
-	c.metricSize.Set(float64(c.store.Len()))
+	// Hits do not change the size, but hit-only traffic (for example Redis
+	// entries left by another instance) would otherwise leave the gauge stale.
+	now := time.Now().UnixNano()
+	if last := c.sizeRefreshedAt.Load(); now-last >= int64(time.Second) && c.sizeRefreshedAt.CompareAndSwap(last, now) {
+		c.metricSize.Set(float64(c.store.Len()))
+	}
 	return e
 }
 
@@ -248,26 +254,10 @@ func (c *Cache) Set(key string, status int, headers http.Header, body []byte, tt
 	c.metricSize.Set(float64(c.store.Len()))
 }
 
-// Promote updates the TTL of an existing entry to "forever" (e.g. when its slot becomes finalized).
-func (c *Cache) Promote(key string) {
-	c.store.Promote(key)
-}
-
 // PromoteIf promotes all non-expired entries whose key satisfies fn to TTL=0
 // (cached forever) and returns the number of entries promoted.
 func (c *Cache) PromoteIf(fn func(key string) bool) int {
-	entries := c.Entries(0, false)
-	n := 0
-	for _, e := range entries {
-		if e.Expires.IsZero() {
-			continue // already permanent
-		}
-		if fn(e.Key) {
-			c.store.Promote(e.Key)
-			n++
-		}
-	}
-	return n
+	return c.store.PromoteIf(fn)
 }
 
 // Delete removes an entry from the cache.
@@ -276,23 +266,8 @@ func (c *Cache) Delete(key string) {
 	c.metricSize.Set(float64(c.store.Len()))
 }
 
-// PurgeIf removes all non-expired entries whose key satisfies fn and returns
-// the number of entries deleted. It is safe to call concurrently.
-func (c *Cache) PurgeIf(fn func(key string) bool) int {
-	n := 0
-	for _, key := range c.store.Keys() {
-		if fn(key) {
-			c.Delete(key)
-			n++
-		}
-	}
-	return n
-}
-
 // PurgeCollect removes all non-expired entries whose key satisfies fn, returns
-// the number of entries deleted and the keys that were purged. This performs a
-// single scan instead of the two scans required by separate matchingCacheKeys +
-// PurgeIf calls.
+// the number of entries deleted and the keys that were purged.
 func (c *Cache) PurgeCollect(fn func(key string) bool) (int, []string) {
 	var keys []string
 	for _, key := range c.store.Keys() {
@@ -334,19 +309,18 @@ func (c *Cache) Size() int {
 	return c.store.Len()
 }
 
-// WriteTo writes the cached entry to an http.ResponseWriter.
-func (e *Entry) WriteTo(w http.ResponseWriter) {
-	copyHeaders(w.Header(), e.headers)
-	w.Header().Set("X-Ebeacon-Cache", "HIT")
-	w.WriteHeader(e.status)
-	w.Write(e.body) //nolint:errcheck
-}
-
 // Status returns the cached HTTP status.
 func (e *Entry) Status() int { return e.status }
 
 // Body returns the cached body bytes.
 func (e *Entry) Body() []byte { return e.body }
+
+// GzipBody returns the body compressed by compress. A memory-store entry is
+// shared across hits, so it compresses once instead of on every hit.
+func (e *Entry) GzipBody(compress func([]byte) []byte) []byte {
+	e.gzipOnce.Do(func() { e.gzipBody = compress(e.body) })
+	return e.gzipBody
+}
 
 // Headers returns the cached response headers.
 func (e *Entry) Headers() http.Header { return e.headers }
@@ -371,11 +345,3 @@ func cloneEntry(e *Entry, includeBody bool) *Entry {
 
 // TTL returns how long this policy caches responses.
 func (p *policy) TTL() time.Duration { return p.ttl }
-
-func copyHeaders(dst, src http.Header) {
-	for k, vv := range src {
-		for _, v := range vv {
-			dst.Add(k, v)
-		}
-	}
-}

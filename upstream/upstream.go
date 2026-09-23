@@ -179,6 +179,11 @@ type Upstream struct {
 	// Concurrency tracking
 	activeConns atomic.Int64
 
+	// Metric children resolved once; these are updated on every attempt.
+	activeConnsGauge prometheus.Gauge
+	requestsCounter  prometheus.Counter
+	errorsCounter    prometheus.Counter
+
 	// Score tracking
 	scorer       *ScoreTracker
 	routeScoreMu sync.RWMutex
@@ -232,30 +237,18 @@ func New(networkID string, cfg config.UpstreamConfig, defaultCB *config.CircuitB
 		)
 	}
 
-	u.cbCfg = config.CircuitBreakerConfig{
-		FailureThreshold: 5,
-		SuccessThreshold: 2,
-		HalfOpenAfter:    30 * time.Second,
+	var cbOverride *config.CircuitBreakerConfig
+	if cfg.Failsafe != nil {
+		cbOverride = cfg.Failsafe.CircuitBreaker
 	}
-	if defaultCB != nil {
-		u.cbCfg = *defaultCB
-	}
-	if cfg.Failsafe != nil && cfg.Failsafe.CircuitBreaker != nil {
-		override := cfg.Failsafe.CircuitBreaker
-		if override.FailureThreshold != 0 {
-			u.cbCfg.FailureThreshold = override.FailureThreshold
-		}
-		if override.SuccessThreshold != 0 {
-			u.cbCfg.SuccessThreshold = override.SuccessThreshold
-		}
-		if override.HalfOpenAfter != 0 {
-			u.cbCfg.HalfOpenAfter = override.HalfOpenAfter
-		}
-	}
+	u.cbCfg = config.UpstreamCircuitBreaker(defaultCB, cbOverride)
 
 	metricHealth.WithLabelValues(networkID, u.ID).Set(float64(HealthUp))
 	metricCBState.WithLabelValues(networkID, u.ID).Set(0)
-	metricActiveConns.WithLabelValues(networkID, u.ID).Set(0)
+	u.activeConnsGauge = metricActiveConns.WithLabelValues(networkID, u.ID)
+	u.requestsCounter = metricTotalRequests.WithLabelValues(networkID, u.ID)
+	u.errorsCounter = metricTotalErrors.WithLabelValues(networkID, u.ID)
+	u.activeConnsGauge.Set(0)
 	metricHeadSlot.WithLabelValues(networkID, u.ID).Set(0)
 	metricSyncDistance.WithLabelValues(networkID, u.ID).Set(0)
 	metricRoutingScore.WithLabelValues(networkID, u.ID).Set(0)
@@ -396,7 +389,7 @@ func (u *Upstream) HeadRoot() string {
 }
 
 // UpdateHeadBlock records the latest head block information.
-func (u *Upstream) UpdateHeadBlock(slot uint64, root, parentRoot string) {
+func (u *Upstream) UpdateHeadBlock(slot uint64, root string) {
 	u.mu.Lock()
 	u.headSlot = slot
 	u.headRoot = root
@@ -428,16 +421,6 @@ func (u *Upstream) SyncDistance() uint64 {
 	u.mu.RLock()
 	defer u.mu.RUnlock()
 	return u.syncDistance
-}
-
-// Score computes a composite quality score with the given weights and head lag.
-func (u *Upstream) Score(errorW, latencyW, headLagW, syncDistW float64, canonicalSlot uint64) float64 {
-	headSlot := u.HeadSlot()
-	var headLag uint64
-	if canonicalSlot > headSlot {
-		headLag = canonicalSlot - headSlot
-	}
-	return u.scorer.Score(errorW, latencyW, headLagW, syncDistW, headLag, u.SyncDistance())
 }
 
 // ScoreSnapshot returns the rolling score inputs for this upstream.
@@ -530,14 +513,14 @@ func (u *Upstream) ActiveConns() int64 { return u.activeConns.Load() }
 // IncrActive increments the active connection counter.
 func (u *Upstream) IncrActive() {
 	v := u.activeConns.Add(1)
-	metricActiveConns.WithLabelValues(u.NetworkID, u.ID).Set(float64(v))
-	metricTotalRequests.WithLabelValues(u.NetworkID, u.ID).Inc()
+	u.activeConnsGauge.Set(float64(v))
+	u.requestsCounter.Inc()
 }
 
 // DecrActive decrements the active connection counter.
 func (u *Upstream) DecrActive() {
 	v := u.activeConns.Add(-1)
-	metricActiveConns.WithLabelValues(u.NetworkID, u.ID).Set(float64(v))
+	u.activeConnsGauge.Set(float64(v))
 }
 
 // TrackResponse keeps active connection accounting accurate until the response
@@ -554,9 +537,28 @@ func (u *Upstream) TrackResponse(resp *http.Response) *http.Response {
 	return resp
 }
 
+// Do sends req under circuit-breaker admission, the upstream rate limit, and
+// active-request accounting. A returned response keeps the request counted as
+// active until its body is closed. The caller must settle the token exactly
+// once; ErrCircuitUnavailable returns a zero token.
+func (u *Upstream) Do(req *http.Request) (*http.Response, CBToken, error) {
+	tok, ok := u.CBTryAcquire()
+	if !ok {
+		return nil, CBToken{}, ErrCircuitUnavailable
+	}
+	u.ConsumeRateToken()
+	u.IncrActive()
+	resp, err := u.Client.Do(req)
+	if err != nil {
+		u.DecrActive()
+		return nil, tok, SanitizeError(err)
+	}
+	return u.TrackResponse(resp), tok, nil
+}
+
 // RecordError increments the error counter.
 func (u *Upstream) RecordError() {
-	metricTotalErrors.WithLabelValues(u.NetworkID, u.ID).Inc()
+	u.errorsCounter.Inc()
 }
 
 func (u *Upstream) routeScorer(apiPath string, create bool) *ScoreTracker {

@@ -40,28 +40,16 @@ type RedisStore struct {
 	countAt time.Time
 }
 
-// lenCacheTTL bounds how often Len runs a full keyspace SCAN; Get/Set/Delete
+// lenCacheTTL bounds how often Len runs a full keyspace SCAN; Set and Delete
 // call Len on every operation and would otherwise hammer Redis. The window
 // also throttles retries while Redis is erroring.
 const lenCacheTTL = 10 * time.Second
 
 // NewRedisStore creates a RedisStore from the given config.
 func NewRedisStore(cfg *config.RedisCacheConfig) (*RedisStore, error) {
-	opts, err := redis.ParseURL(cfg.URL)
+	opts, err := cfg.Options()
 	if err != nil {
 		return nil, err
-	}
-	if cfg.Username != "" {
-		opts.Username = cfg.Username
-	}
-	if cfg.Password != "" {
-		opts.Password = cfg.Password
-	}
-	if cfg.DB != 0 {
-		opts.DB = cfg.DB
-	}
-	if cfg.MaxRetries > 0 {
-		opts.MaxRetries = cfg.MaxRetries
 	}
 	client := redis.NewClient(opts)
 
@@ -127,15 +115,37 @@ func (r *RedisStore) Delete(key string) {
 	}
 }
 
-func (r *RedisStore) Promote(key string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+func (r *RedisStore) PromoteIf(fn func(key string) bool) int {
+	var matched []string
+	for _, key := range r.Keys() {
+		if fn(key) {
+			matched = append(matched, key)
+		}
+	}
+	if len(matched) == 0 {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	// Extend to a long finite TTL rather than Persist (no expiry): a
 	// finalized entry stays cached effectively forever, but one orphaned by
 	// a keyPrefix change still expires instead of leaking permanently.
-	if err := r.client.Expire(ctx, r.prefixed(key), foreverTTL).Err(); err != nil {
-		slog.Warn("redis cache promote failed", "key", key, "err", err)
+	cmds := make([]*redis.BoolCmd, len(matched))
+	if _, err := r.client.Pipelined(ctx, func(p redis.Pipeliner) error {
+		for i, key := range matched {
+			cmds[i] = p.Expire(ctx, r.prefixed(key), foreverTTL)
+		}
+		return nil
+	}); err != nil {
+		slog.Warn("redis cache promote failed", "keys", len(matched), "err", err)
 	}
+	n := 0
+	for _, cmd := range cmds {
+		if cmd.Val() {
+			n++
+		}
+	}
+	return n
 }
 
 func (r *RedisStore) Entries(limit int, includeBody bool) []*Entry {

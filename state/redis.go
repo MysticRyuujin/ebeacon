@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -32,6 +33,7 @@ return 0`)
 // RedisState uses Redis pub/sub for cross-instance coordination.
 type RedisState struct {
 	client      *redis.Client
+	instanceID  string
 	finalizedMu sync.Mutex
 	finalized   map[string]uint64
 	headCh      chan HeadUpdate
@@ -41,21 +43,9 @@ type RedisState struct {
 
 // NewRedisState connects to Redis and starts subscribing.
 func NewRedisState(cfg *config.RedisStateConfig) (*RedisState, error) {
-	opts, err := redis.ParseURL(cfg.URL)
+	opts, err := cfg.Options()
 	if err != nil {
 		return nil, fmt.Errorf("parse redis url: %w", err)
-	}
-	if cfg.Username != "" {
-		opts.Username = cfg.Username
-	}
-	if cfg.Password != "" {
-		opts.Password = cfg.Password
-	}
-	if cfg.DB != 0 {
-		opts.DB = cfg.DB
-	}
-	if cfg.MaxRetries > 0 {
-		opts.MaxRetries = cfg.MaxRetries
 	}
 	client := redis.NewClient(opts)
 
@@ -68,10 +58,11 @@ func NewRedisState(cfg *config.RedisStateConfig) (*RedisState, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	rs := &RedisState{
-		client:    client,
-		finalized: make(map[string]uint64),
-		headCh:    make(chan HeadUpdate, 64),
-		cancel:    cancel,
+		client:     client,
+		instanceID: rand.Text(),
+		finalized:  make(map[string]uint64),
+		headCh:     make(chan HeadUpdate, 64),
+		cancel:     cancel,
 	}
 
 	rs.wg.Add(1)
@@ -104,7 +95,7 @@ func (rs *RedisState) subscribe(ctx context.Context) {
 			if err := json.Unmarshal([]byte(msg.Payload), &update); err != nil {
 				continue
 			}
-			if update.Network == "" || update.Root == "" || update.Slot == 0 {
+			if update.Network == "" || update.Root == "" || update.Slot == 0 || update.Origin == rs.instanceID {
 				continue
 			}
 			select {
@@ -116,7 +107,7 @@ func (rs *RedisState) subscribe(ctx context.Context) {
 }
 
 func (rs *RedisState) PublishHead(network string, slot uint64, root string) {
-	payload, err := json.Marshal(HeadUpdate{Network: network, Slot: slot, Root: root})
+	payload, err := json.Marshal(HeadUpdate{Network: network, Slot: slot, Root: root, Origin: rs.instanceID})
 	if err != nil {
 		return
 	}

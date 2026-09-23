@@ -5,13 +5,7 @@ type HeadUpdate struct {
 	Network string
 	Slot    uint64
 	Root    string
-}
-
-// SharedState coordinates state across multiple eBeacon instances.
-type SharedState interface {
-	PublishHead(network string, slot uint64, root string)
-	SubscribeHead() <-chan HeadUpdate
-	PublishFinalized(network string, epoch uint64)
-	GetFinalized(network string) uint64
-	Close() error
+	// Origin identifies the publishing instance so it can drop its own
+	// messages, which Redis pub/sub delivers back to the publisher.
+	Origin string `json:",omitempty"`
 }
