@@ -17,7 +17,7 @@ jobs:
 
   # The deep scans PRs skip for speed. Nothing is published unless this passes.
   scan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -42,7 +42,7 @@ jobs:
           exit-code: "1"
 
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [ci, scan]
     steps:
       - name: Checkout
