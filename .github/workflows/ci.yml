@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   quality:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -42,7 +42,7 @@ jobs:
           version: v2.11.4
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: quality
     steps:
       - name: Checkout
@@ -60,7 +60,7 @@ jobs:
   # Deliberately cheap: PRs get a dependency scan and proof the image builds.
   # The full Trivy filesystem/image scan runs in the release workflow.
   vuln:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: quality
     steps:
       - name: Checkout
@@ -76,7 +76,7 @@ jobs:
         run: make vuln
 
   docker:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: quality
     steps:
       - name: Checkout
