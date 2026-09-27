@@ -160,6 +160,7 @@ const (
 	endpointRewardsAttestations  = "/eth/v1/beacon/rewards/attestations/{epoch}"
 	endpointBeaconBlobSidecars   = "/eth/v1/beacon/blob_sidecars/{block_id}"
 	endpointNodeHealth           = "/eth/v1/node/health"
+	endpointPayloadEnvelopes     = "/eth/v1/beacon/execution_payload_envelopes/{block_id}"
 	endpointPostStateValidators  = "POST /eth/v1/beacon/states/{state_id}/validators"
 	endpointPostAttesterDuties   = "POST /eth/v1/validator/duties/attester/{epoch}"
 )
@@ -185,6 +186,7 @@ type chainState struct {
 	headSlot       uint64
 	finalizedEpoch uint64
 	finalizedSlot  uint64
+	slotsPerEpoch  uint64
 	// prevEpoch is finalizedEpoch-1, used for duties endpoints so the epoch is
 	// guaranteed to be in the past and fully computed by the node.
 	prevEpoch uint64
@@ -256,6 +258,27 @@ func fetchChainState(ctx context.Context, baseURL string, auth string, apiKey st
 		return chainState{}, fmt.Errorf("parse head_slot %q: %w", syncResp.Data.HeadSlot, err)
 	}
 
+	// /eth/v1/config/spec gives us SLOTS_PER_EPOCH (8 on minimal-preset devnets).
+	body, err = doGet("/eth/v1/config/spec")
+	if err != nil {
+		return chainState{}, fmt.Errorf("config/spec: %w", err)
+	}
+	var specResp struct {
+		Data struct {
+			SlotsPerEpoch string `json:"SLOTS_PER_EPOCH"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &specResp); err != nil {
+		return chainState{}, fmt.Errorf("parse config/spec: %w", err)
+	}
+	slotsPerEpoch, err := strconv.ParseUint(specResp.Data.SlotsPerEpoch, 10, 64)
+	if err != nil {
+		return chainState{}, fmt.Errorf("parse SLOTS_PER_EPOCH %q: %w", specResp.Data.SlotsPerEpoch, err)
+	}
+	if slotsPerEpoch == 0 {
+		return chainState{}, fmt.Errorf("SLOTS_PER_EPOCH is 0")
+	}
+
 	prev := finalizedEpoch
 	if prev > 1 {
 		prev--
@@ -263,7 +286,8 @@ func fetchChainState(ctx context.Context, baseURL string, auth string, apiKey st
 	return chainState{
 		headSlot:       headSlot,
 		finalizedEpoch: finalizedEpoch,
-		finalizedSlot:  finalizedEpoch * 32,
+		finalizedSlot:  finalizedEpoch * slotsPerEpoch,
+		slotsPerEpoch:  slotsPerEpoch,
 		prevEpoch:      prev,
 	}, nil
 }
@@ -274,6 +298,10 @@ func fetchChainState(ctx context.Context, baseURL string, auth string, apiKey st
 func buildEndpoints(cs chainState) []endpoint {
 	finalizedSlot := strconv.FormatUint(cs.finalizedSlot, 10)
 	prevEpoch := strconv.FormatUint(cs.prevEpoch, 10)
+	slotsPerEpoch := cs.slotsPerEpoch
+	if slotsPerEpoch == 0 {
+		slotsPerEpoch = 32
+	}
 
 	return []endpoint{
 		{name: endpointHeadersByBlockID, method: methodGET, path: "/eth/v1/beacon/headers/head", weight: 20},
@@ -310,6 +338,12 @@ func buildEndpoints(cs chainState) []endpoint {
 		{name: endpointBeaconBlobSidecars, method: methodGET, path: "/eth/v1/beacon/blob_sidecars/" + finalizedSlot, weight: 1},
 		{name: endpointNodeHealth, method: methodGET, path: "/eth/v1/node/health", weight: 1},
 
+		// Slots with a withheld (EMPTY) payload and pre-Gloas slots have no
+		// envelope, so 404 is a normal answer here.
+		{name: endpointPayloadEnvelopes, method: methodGET, path: "/eth/v1/beacon/execution_payload_envelopes/head", weight: 2, expect4xx: true},
+		{name: endpointPayloadEnvelopes, method: methodGET, path: "/eth/v1/beacon/execution_payload_envelopes/finalized", weight: 1, expect4xx: true},
+		{name: endpointPayloadEnvelopes, method: methodGET, path: "/eth/v1/beacon/execution_payload_envelopes/" + finalizedSlot, weight: 1, expect4xx: true},
+
 		{
 			name:     endpointPostStateValidators,
 			method:   methodPOST,
@@ -321,7 +355,7 @@ func buildEndpoints(cs chainState) []endpoint {
 		{
 			name:     endpointPostAttesterDuties,
 			method:   methodPOST,
-			path:     "/eth/v1/validator/duties/attester/" + strconv.FormatUint(cs.headSlot/32, 10),
+			path:     "/eth/v1/validator/duties/attester/" + strconv.FormatUint(cs.headSlot/slotsPerEpoch, 10),
 			body:     []string{"1", "2"},
 			weight:   1,
 			validate: validateDataArrayLen(2),

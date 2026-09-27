@@ -141,25 +141,26 @@ func (w *headWatcher) watchUpstream(ctx context.Context, u *upstream.Upstream) {
 	}
 }
 
-// subscribe opens a streaming GET to /eth/v1/events on u for head,
+const (
+	headWatcherTopics = "head,head_v2,finalized_checkpoint,chain_reorg"
+	// Pre-Gloas clients reject the whole subscription for an unknown topic.
+	headWatcherLegacyTopics = "head,finalized_checkpoint,chain_reorg"
+)
+
+// subscribe opens a streaming GET to /eth/v1/events on u for head, head_v2,
 // finalized_checkpoint, and chain_reorg topics, and processes lines until the
 // connection closes, ctx is cancelled, or no data arrives for 90 seconds
 // (indicating a silent upstream or network stall).
 func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		u.URL+"/eth/v1/events?topics=head,finalized_checkpoint,chain_reorg", nil)
+	defer u.ClearHeadPayloadStatus()
+
+	resp, err := openHeadEvents(ctx, u, headWatcherTopics)
+	if err == nil && resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		resp.Body.Close() //nolint:errcheck
+		resp, err = openHeadEvents(ctx, u, headWatcherLegacyTopics)
+	}
 	if err != nil {
 		return err
-	}
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Cache-Control", "no-cache")
-	for k, v := range u.Headers {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := u.Client.Do(req)
-	if err != nil {
-		return upstream.SanitizeError(err)
 	}
 	// readerDone is closed first (LIFO defer order) so the reader goroutine can
 	// exit via its select before resp.Body.Close() interrupts the read.
@@ -182,6 +183,7 @@ func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error
 	defer idle.Stop()
 
 	inHeadEvent := false
+	inHeadV2Event := false
 	inFinalizedEvent := false
 	inReorgEvent := false
 	sawEventName := false
@@ -207,10 +209,11 @@ func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error
 					sawEventName = true
 					eventName := strings.TrimSpace(strings.TrimPrefix(line, "event:"))
 					inHeadEvent = strings.EqualFold(eventName, "head")
+					inHeadV2Event = strings.EqualFold(eventName, "head_v2")
 					inFinalizedEvent = strings.EqualFold(eventName, "finalized_checkpoint")
 					inReorgEvent = strings.EqualFold(eventName, "chain_reorg")
 				case strings.HasPrefix(line, "data:"):
-					if inHeadEvent || inFinalizedEvent || inReorgEvent || !sawEventName {
+					if inHeadEvent || inHeadV2Event || inFinalizedEvent || inReorgEvent || !sawEventName {
 						sawData = true
 						payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 						if dataPayload.Len()+len(payload) <= sseMaxEventBytes {
@@ -219,9 +222,10 @@ func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error
 					}
 				case line == "":
 					if sawData {
-						w.dispatchEvent(ctx, u, inHeadEvent, inFinalizedEvent, inReorgEvent, sawEventName, dataPayload.String())
+						w.dispatchEvent(ctx, u, inHeadEvent, inHeadV2Event, inFinalizedEvent, inReorgEvent, sawEventName, dataPayload.String())
 					}
 					inHeadEvent = false
+					inHeadV2Event = false
 					inFinalizedEvent = false
 					inReorgEvent = false
 					sawEventName = false
@@ -232,7 +236,7 @@ func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error
 
 			if rr.err != nil {
 				if sawData {
-					w.dispatchEvent(ctx, u, inHeadEvent, inFinalizedEvent, inReorgEvent, sawEventName, dataPayload.String())
+					w.dispatchEvent(ctx, u, inHeadEvent, inHeadV2Event, inFinalizedEvent, inReorgEvent, sawEventName, dataPayload.String())
 				}
 				if rr.err == io.EOF || ctx.Err() != nil {
 					return nil
@@ -243,9 +247,28 @@ func (w *headWatcher) subscribe(ctx context.Context, u *upstream.Upstream) error
 	}
 }
 
+func openHeadEvents(ctx context.Context, u *upstream.Upstream, topics string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.URL+"/eth/v1/events?topics="+topics, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+	for k, v := range u.Headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := u.Client.Do(req)
+	if err != nil {
+		return nil, upstream.SanitizeError(err)
+	}
+	return resp, nil
+}
+
 // dispatchEvent routes a completed SSE event to the appropriate handler.
-func (w *headWatcher) dispatchEvent(ctx context.Context, u *upstream.Upstream, isHead, isFinalized, isReorg, sawEventName bool, data string) {
+func (w *headWatcher) dispatchEvent(ctx context.Context, u *upstream.Upstream, isHead, isHeadV2, isFinalized, isReorg, sawEventName bool, data string) {
 	switch {
+	case isHeadV2:
+		w.recordHeadPayloadStatus(u, data)
 	case isHead || !sawEventName:
 		// Record the block in the BlockCache first so routing decisions
 		// made inside the pre-warm request can already see this upstream
@@ -291,6 +314,54 @@ func (w *headWatcher) recordHeadSeen(u *upstream.Upstream, data string) {
 	u.UpdateHeadBlock(slot, payload.Block)
 	w.pool.BlockCache().AddBlock(u.ID, slot, payload.Block, "")
 	w.pool.SyncCanonicalHead()
+}
+
+var preGloasForks = map[string]bool{
+	"phase0": true, "altair": true, "bellatrix": true, "capella": true,
+	"deneb": true, "electra": true, "fulu": true,
+}
+
+// recordHeadPayloadStatus records whether the head block's execution payload
+// has arrived. head_v2 fires again for the same block when the status turns
+// full, so it deliberately skips BlockCache updates and cache purges, which
+// the head event already drives.
+//
+// Payload shape (Beacon API spec):
+//
+//	{"version":"gloas","data":{"slot":"123","block":"0xabc...","payload_status":"full",...}}
+func (w *headWatcher) recordHeadPayloadStatus(u *upstream.Upstream, data string) {
+	type headV2 struct {
+		Block         string `json:"block"`
+		PayloadStatus string `json:"payload_status"`
+	}
+	var payload struct {
+		Version string  `json:"version"`
+		Data    *headV2 `json:"data"`
+		headV2
+	}
+	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		slog.Debug("head watcher: failed to parse head_v2 data",
+			"network", w.networkID, "upstream", u.ID, "err", err)
+		return
+	}
+	// Pre-Gloas blocks always carry their payload, yet clients disagree on
+	// the status they report for them (Lighthouse sends "empty").
+	if preGloasForks[payload.Version] {
+		return
+	}
+	ev := payload.headV2
+	if payload.Data != nil {
+		ev = *payload.Data
+	}
+	if ev.Block == "" {
+		return
+	}
+	switch ev.PayloadStatus {
+	case "full":
+		u.SetHeadPayloadStatus(ev.Block, true)
+	case "empty":
+		u.SetHeadPayloadStatus(ev.Block, false)
+	}
 }
 
 func (w *headWatcher) invalidateHeadCache(ctx context.Context, u *upstream.Upstream) {

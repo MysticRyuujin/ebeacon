@@ -27,6 +27,8 @@ func TestIsPruningError(t *testing.T) {
 		{"404 + historical root", 404, nil, historicalByRoot, true},
 		{"404 + historical blob", 404, nil, blobHistorical, true},
 		{"404 + historical duties", 404, nil, dutiesHistorical, true},
+		{"404 + payload envelope slot", 404, nil, HistoricalTarget{Kind: HistoricalKindPayloadEnvelope, Slot: uint64Ptr(1)}, false},
+		{"404 + payload envelope root", 404, nil, HistoricalTarget{Kind: HistoricalKindPayloadEnvelope, Root: "0xabc"}, false},
 		{"404 + named head", 404, nil, namedHead, false},
 		{"404 + named finalized", 404, nil, namedFinalized, false},
 		{"404 + non-historical", 404, nil, nonHistorical, false},

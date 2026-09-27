@@ -288,6 +288,12 @@ networks:
         - "^/eth/v[0-9]+/beacon/pool/sync_committees"
         - "^/eth/v[0-9]+/beacon/pool/voluntary_exits"
         - "^/eth/v[0-9]+/beacon/pool/bls_to_execution_changes"
+        - "^/eth/v[0-9]+/beacon/pool/payload_attestations"
+        - "^/eth/v[0-9]+/beacon/execution_payload_bids"
+        # Anchored so GET .../execution_payload_envelopes/{block_id} stays open.
+        - "^/eth/v[0-9]+/beacon/execution_payload_envelopes/?$"
+        - "^/eth/v[0-9]+/validator/proposer_preferences"
+        - "^/eth/v[0-9]+/validator/builder_preferences"
 
     # Per-network failsafe override: replaces global failsafe defaults for this network only.
     # failsafe:

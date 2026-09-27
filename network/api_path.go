@@ -96,6 +96,19 @@ func normalizeAPIPath(path string) string {
 				}
 			}
 			return prefix + "/beacon/rewards/other"
+		case "execution_payload_envelopes":
+			switch len(segments) {
+			case 4:
+				return prefix + "/beacon/execution_payload_envelopes"
+			case 5:
+				return prefix + "/beacon/execution_payload_envelopes/{block_id}"
+			}
+			return prefix + "/beacon/execution_payload_envelopes/other"
+		case "execution_payload_bids":
+			if len(segments) == 4 {
+				return prefix + "/beacon/execution_payload_bids"
+			}
+			return prefix + "/beacon/other"
 		case "pool":
 			if len(segments) == 5 {
 				switch segments[4] {
@@ -104,7 +117,8 @@ func normalizeAPIPath(path string) string {
 					"proposer_slashings",
 					"sync_committees",
 					"voluntary_exits",
-					"bls_to_execution_changes":
+					"bls_to_execution_changes",
+					"payload_attestations":
 					return prefix + "/beacon/pool/" + segments[4]
 				}
 			}
@@ -133,7 +147,7 @@ func normalizeAPIPath(path string) string {
 	case "validator":
 		if len(segments) == 6 && segments[3] == "duties" {
 			switch segments[4] {
-			case "attester", "proposer", "sync":
+			case "attester", "proposer", "sync", "ptc":
 				return prefix + "/validator/duties/" + segments[4] + "/{epoch}"
 			}
 		}
@@ -144,6 +158,9 @@ func normalizeAPIPath(path string) string {
 			// /eth/v3/validator/blocks/{slot}
 			return prefix + "/validator/blocks/{slot}"
 		}
+		if len(segments) == 6 && segments[3] == "execution_payload_envelopes" {
+			return prefix + "/validator/execution_payload_envelopes/{slot}/{beacon_block_root}"
+		}
 		if len(segments) == 4 {
 			switch segments[3] {
 			case "attestation_data",
@@ -151,8 +168,11 @@ func normalizeAPIPath(path string) string {
 				"aggregate_attestation",
 				"beacon_committee_selections",
 				"beacon_committee_subscriptions",
+				"builder_preferences",
 				"contribution_and_proofs",
+				"payload_attestation_data",
 				"prepare_beacon_proposer",
+				"proposer_preferences",
 				"register_validator",
 				"sync_committee_contribution",
 				"sync_committee_selections",

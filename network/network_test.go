@@ -110,6 +110,39 @@ func TestNetwork_BlockedPath_403(t *testing.T) {
 	}
 }
 
+func TestNetwork_BlockedPath_EnvelopeSubmission(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, []string{`^/eth/v[0-9]+/beacon/execution_payload_envelopes/?$`})
+
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		method string
+		path   string
+		want   int
+	}{
+		{http.MethodPost, "/eth/v1/beacon/execution_payload_envelopes", http.StatusForbidden},
+		{http.MethodPost, "/eth/v1/beacon/execution_payload_envelopes/", http.StatusForbidden},
+		{http.MethodGet, "/eth/v1/beacon/execution_payload_envelopes/head", http.StatusOK},
+	}
+	for _, tt := range tests {
+		req := httptest.NewRequest(tt.method, tt.path, strings.NewReader("{}"))
+		rec := httptest.NewRecorder()
+		n.ServeHTTP(rec, req)
+		if rec.Code != tt.want {
+			t.Errorf("%s %s: got %d want %d", tt.method, tt.path, rec.Code, tt.want)
+		}
+	}
+}
+
 func TestNetwork_Forward_OK(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/eth/v1/node/version" {

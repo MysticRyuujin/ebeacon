@@ -52,6 +52,9 @@ func TestCache_Policy_DefaultHotPaths(t *testing.T) {
 		// Numeric slot IDs keep the 12 s TTL and are finality-promoted.
 		{path: "/eth/v1/beacon/blobs/12345", ttl: 12 * time.Second},
 		{path: "/eth/v1/beacon/blob_sidecars/12345", ttl: 12 * time.Second},
+		{path: "/eth/v1/beacon/execution_payload_envelopes/head", ttl: 4 * time.Second},
+		{path: "/eth/v1/beacon/execution_payload_envelopes/12345", ttl: 12 * time.Second},
+		{path: "/eth/v1/beacon/execution_payload_envelopes/0xabc", ttl: 12 * time.Second},
 		{path: "/eth/v1/beacon/rewards/blocks/12345", ttl: 12 * time.Second},
 		{path: "/eth/v1/beacon/rewards/sync_committee/12345", ttl: 12 * time.Second},
 		{path: "/eth/v1/beacon/rewards/attestations/123", ttl: 30 * time.Second},
@@ -76,7 +79,14 @@ func TestCache_Policy_DefaultIntentionalMisses(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, path := range []string{"/eth/v1/config/spec", "/eth/v1/node/health"} {
+	for _, path := range []string{
+		"/eth/v1/config/spec",
+		"/eth/v1/node/health",
+		"/eth/v1/validator/execution_payload_envelopes/100/0xabc",
+		"/eth/v1/validator/payload_attestation_data",
+		"/eth/v1/beacon/pool/payload_attestations",
+		"/eth/v1/validator/duties/ptc/3",
+	} {
 		if p := c.Policy(http.MethodGet, path); p != nil {
 			t.Fatalf("expected no default policy for %s", path)
 		}

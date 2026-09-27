@@ -68,6 +68,7 @@ const upstreamColumns = [
 	{key:'health',label:'Health',type:'health'},
 	{key:'score',label:'Score',type:'number'},
 	{key:'headSlot',label:'Head Slot',type:'number'},
+	{key:'headPayloadStatus',label:'Payload',type:'string'},
 	{key:'activeConnections',label:'Active',type:'number'},
 	{key:'priority',label:'Priority',type:'number'},
 	{key:'archive',label:'Archive',type:'string'},
@@ -179,6 +180,7 @@ function renderUpstreamRow(upstream){
 		'<td><span class="badge '+escapeHTML(upstream.health)+'">'+escapeHTML(upstream.health)+'</span></td>'+
 		'<td title="'+escapeHTML(scoreSummary)+'">'+escapeHTML(formatFixed(upstream.score,3))+'<span class="cell-meta">'+escapeHTML('p90 '+formatLatencyMs(upstream.scoreP90LatencyMs)+' | err '+formatPercent(upstream.scoreErrorRate))+'</span></td>'+
 		'<td>'+escapeHTML(upstream.headSlot)+'</td>'+
+		'<td title="Execution payload status of the head block (Gloas head_v2)">'+escapeHTML(upstream.headPayloadStatus)+'</td>'+
 		'<td>'+escapeHTML(upstream.activeConnections)+'</td>'+
 		'<td>'+escapeHTML(upstream.priority)+'</td>'+
 		'<td>'+(upstream.archive ? '<span class="badge up" title="Archive-capable: serves historical data pruned nodes may not have">archive</span>' : '<span class="cell-meta">pruned</span>')+'</td>'+

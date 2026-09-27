@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -507,9 +509,98 @@ func TestHeadWatcher_HealthProbeBeforeEventStillPurges(t *testing.T) {
 	n.cache.Set(key, http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, []byte(`{}`), time.Minute)
 
 	n.pool.BlockCache().AddBlock(u.ID, 100, "0xaa", "")
-	w.dispatchEvent(context.Background(), u, true, false, false, true, `{"slot":"100","block":"0xaa"}`)
+	w.dispatchEvent(context.Background(), u, true, false, false, false, true, `{"slot":"100","block":"0xaa"}`)
 
 	if n.cache.Get(key) != nil {
 		t.Fatal("head event must purge even when a health probe recorded the block first")
+	}
+}
+
+func TestHeadWatcher_HeadV2RecordsPayloadStatusWithoutPurge(t *testing.T) {
+	t.Parallel()
+	w, n := newGatingTestWatcher(t)
+	u := n.pool.All()[0]
+	u.UpdateHeadBlock(100, "0xaa")
+	key := w.networkID + ":GET:/eth/v1/beacon/headers/head"
+	n.cache.Set(key, http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, []byte(`{}`), time.Minute)
+
+	w.dispatchEvent(context.Background(), u, false, true, false, false, true,
+		`{"version":"gloas","data":{"slot":"100","block":"0xaa","payload_status":"empty"}}`)
+	if got := u.HeadPayloadStatus(); got != "empty" {
+		t.Fatalf("status = %q, want empty", got)
+	}
+	w.dispatchEvent(context.Background(), u, false, true, false, false, true,
+		`{"version":"gloas","data":{"slot":"100","block":"0xaa","payload_status":"full"}}`)
+	if got := u.HeadPayloadStatus(); got != "full" {
+		t.Fatalf("status = %q, want full", got)
+	}
+	if n.cache.Get(key) == nil {
+		t.Fatal("head_v2 must not purge the head cache")
+	}
+
+	u.UpdateHeadBlock(101, "0xbb")
+	w.dispatchEvent(context.Background(), u, false, true, false, false, true,
+		`{"version":"fulu","data":{"slot":"101","block":"0xbb","payload_status":"empty"}}`)
+	if got := u.HeadPayloadStatus(); got != "unknown" {
+		t.Fatalf("pre-Gloas status = %q, want unknown", got)
+	}
+}
+
+func TestHeadWatcher_FallsBackWithoutHeadV2AndClearsStatusOnClose(t *testing.T) {
+	t.Parallel()
+	var topics []string
+	var mu sync.Mutex
+	sse := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("topics")
+		mu.Lock()
+		topics = append(topics, q)
+		mu.Unlock()
+		if strings.Contains(q, "head_v2") {
+			http.Error(w, `{"code":400,"message":"invalid topic"}`, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: head\ndata: {\"slot\":\"100\",\"block\":\"0xaa\"}\n\n") //nolint:errcheck
+	}))
+	defer sse.Close()
+
+	id := netID(t)
+	cfg := mustCfgText(t, fmt.Sprintf(`
+logLevel: error
+server: { host: "127.0.0.1", port: 5555, maxTimeout: 30s }
+failsafe: { timeout: { duration: 10s } }
+health: { checkInterval: 1h, finalityInterval: 1h, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: %s
+    upstreams:
+      - id: u1
+        url: %q
+    cache: { enabled: true, maxSize: 32 }
+`, id, sse.URL))
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &headWatcher{networkID: id, pool: n.pool, cache: n.cache, done: make(chan struct{})}
+	u := n.pool.All()[0]
+	u.SetHeadPayloadStatus("0xaa", true)
+
+	if err := w.subscribe(context.Background(), u); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(topics) != 2 || topics[0] != headWatcherTopics || topics[1] != headWatcherLegacyTopics {
+		t.Fatalf("topics = %q, want head_v2 attempt then legacy fallback", topics)
+	}
+	if got := u.HeadRoot(); got != "0xaa" {
+		t.Fatalf("head root = %q, want 0xaa from the legacy stream", got)
+	}
+	if got := u.HeadPayloadStatus(); got != "unknown" {
+		t.Fatalf("status after stream close = %q, want unknown", got)
 	}
 }

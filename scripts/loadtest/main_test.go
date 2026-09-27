@@ -6,7 +6,7 @@ import (
 )
 
 func TestBuildEndpoints_RealWorldHTTPWeights(t *testing.T) {
-	cs := chainState{headSlot: 12_345, finalizedEpoch: 384, finalizedSlot: 12_319, prevEpoch: 383}
+	cs := chainState{headSlot: 12_345, finalizedEpoch: 384, finalizedSlot: 12_319, prevEpoch: 383, slotsPerEpoch: 32}
 	eps := buildEndpoints(cs)
 
 	got := make(map[string]int)
@@ -30,6 +30,7 @@ func TestBuildEndpoints_RealWorldHTTPWeights(t *testing.T) {
 		endpointRewardsAttestations:  1,
 		endpointBeaconBlobSidecars:   1,
 		endpointNodeHealth:           1,
+		endpointPayloadEnvelopes:     4,
 		endpointPostStateValidators:  2,
 		endpointPostAttesterDuties:   1,
 	}
@@ -45,7 +46,7 @@ func TestBuildEndpoints_RealWorldHTTPWeights(t *testing.T) {
 }
 
 func TestBuildEndpoints_POSTsCarryBodyAndValidator(t *testing.T) {
-	cs := chainState{headSlot: 12_345, finalizedEpoch: 384, finalizedSlot: 12_288, prevEpoch: 383}
+	cs := chainState{headSlot: 12_345, finalizedEpoch: 384, finalizedSlot: 12_288, prevEpoch: 383, slotsPerEpoch: 32}
 	for _, ep := range buildEndpoints(cs) {
 		if ep.method != methodPOST {
 			continue
@@ -76,7 +77,7 @@ func TestValidateDataArrayLen(t *testing.T) {
 }
 
 func TestBuildEndpoints_UsesFinalizedSlotVariants(t *testing.T) {
-	cs := chainState{headSlot: 20_000, finalizedEpoch: 620, finalizedSlot: 19_871, prevEpoch: 619}
+	cs := chainState{headSlot: 20_000, finalizedEpoch: 620, finalizedSlot: 19_871, prevEpoch: 619, slotsPerEpoch: 32}
 	eps := buildEndpoints(cs)
 
 	var foundNumericBlock bool
@@ -91,5 +92,11 @@ func TestBuildEndpoints_UsesFinalizedSlotVariants(t *testing.T) {
 
 	if !foundNumericBlock {
 		t.Fatal("expected finalized numeric block variant")
+	}
+}
+
+func TestBuildEndpoints_ZeroChainStateDoesNotPanic(t *testing.T) {
+	if len(buildEndpoints(chainState{})) == 0 {
+		t.Fatal("expected endpoints")
 	}
 }
