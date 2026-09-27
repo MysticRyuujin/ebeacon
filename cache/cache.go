@@ -61,6 +61,8 @@ var defaultPolicies = []config.CachePolicy{
 	{Pattern: `^/eth/v\d+/beacon/blobs/`, TTL: 12 * time.Second},
 	{Pattern: `^/eth/v\d+/beacon/blob_sidecars/(head|finalized|justified)(/.*)?$`, TTL: 4 * time.Second}, // named
 	{Pattern: `^/eth/v\d+/beacon/blob_sidecars/`, TTL: 12 * time.Second},
+	{Pattern: `^/eth/v\d+/beacon/execution_payload_envelopes/(head|finalized|justified)$`, TTL: 4 * time.Second}, // named
+	{Pattern: `^/eth/v\d+/beacon/execution_payload_envelopes/[^/]+$`, TTL: 12 * time.Second},
 
 	// ── beacon rewards ───────────────────────────────────────────────────────
 	// Block-scoped rewards become immutable once the referenced slot finalizes.

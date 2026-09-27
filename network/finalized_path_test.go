@@ -17,6 +17,11 @@ func TestIsFinalizedPath(t *testing.T) {
 		{"/eth/v1/beacon/rewards/attestations/9", fe, false},
 		{"/eth/v1/validator/duties/proposer/0", 1, false},
 		{"/eth/v2/beacon/blocks/head", fe, false},
+		{"/eth/v1/beacon/execution_payload_envelopes/287", fe, true},
+		{"/eth/v1/beacon/execution_payload_envelopes/288", fe, false},
+		{"/eth/v1/beacon/execution_payload_envelopes/320", fe, false},
+		{"/eth/v1/beacon/execution_payload_envelopes/1", 1, false},
+		{"/eth/v1/beacon/execution_payload_envelopes/head", fe, false},
 	}
 	for _, tt := range tests {
 		if got := isFinalizedPath(tt.path, tt.finalizedEpoch, spe); got != tt.want {

@@ -30,6 +30,26 @@ func TestClassifyHistoricalTarget(t *testing.T) {
 			path: "/eth/v1/beacon/blocks/genesis",
 			want: HistoricalTarget{Kind: HistoricalKindBlockByID, Named: "genesis"},
 		},
+		{
+			name: "payload envelope by numeric slot",
+			path: "/eth/v1/beacon/execution_payload_envelopes/12345",
+			want: HistoricalTarget{Kind: HistoricalKindPayloadEnvelope, Slot: uint64Ptr(12345)},
+		},
+		{
+			name: "payload envelope by named head",
+			path: "/eth/v1/beacon/execution_payload_envelopes/head",
+			want: HistoricalTarget{Kind: HistoricalKindPayloadEnvelope, Named: "head"},
+		},
+		{
+			name: "payload envelope submission is not classified",
+			path: "/eth/v1/beacon/execution_payload_envelopes",
+			want: HistoricalTarget{},
+		},
+		{
+			name: "ptc duties by epoch",
+			path: "/eth/v1/validator/duties/ptc/42",
+			want: HistoricalTarget{Kind: HistoricalKindPTCDuties, Epoch: uint64Ptr(42)},
+		},
 		// Numeric slot block ID
 		{
 			name: "block by numeric slot",
@@ -245,6 +265,24 @@ func TestHistoricalTargetRequiresArchive(t *testing.T) {
 			target: HistoricalTarget{Kind: HistoricalKindBlockByID, Named: "finalized"},
 			head:   headSlot,
 			want:   false,
+		},
+		{
+			name:   "payload envelope older than block retention",
+			target: HistoricalTarget{Kind: HistoricalKindPayloadEnvelope, Slot: uint64Ptr(headSlot - blocksRetentionSlots - 1)},
+			head:   headSlot,
+			want:   true,
+		},
+		{
+			name:   "payload envelope older than blob retention but inside block retention",
+			target: HistoricalTarget{Kind: HistoricalKindPayloadEnvelope, Slot: uint64Ptr(headSlot - blobSidecarsRetentionSlots - 1)},
+			head:   headSlot,
+			want:   false,
+		},
+		{
+			name:   "ptc duties two epochs old",
+			target: HistoricalTarget{Kind: HistoricalKindPTCDuties, Epoch: uint64Ptr(headEpoch - 2)},
+			head:   headSlot,
+			want:   true,
 		},
 		// Root never requires archive (slot unknown)
 		{

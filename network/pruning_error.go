@@ -29,7 +29,9 @@ func isPruningError(statusCode int, body []byte, target HistoricalTarget) bool {
 	if !target.IsHistorical() {
 		return false
 	}
-	if target.Named != "" {
+	// An envelope 404 inside retention is normal: the slot's payload was
+	// withheld or never revealed (EMPTY), so it says nothing about pruning.
+	if target.Named != "" || target.Kind == HistoricalKindPayloadEnvelope {
 		return false
 	}
 	if statusCode == 404 {

@@ -76,7 +76,7 @@ func pathNumericSlot(path string) (uint64, bool) {
 	}
 
 	switch segments[3] {
-	case "headers", "blocks", "blinded_blocks", "blobs", "blob_sidecars", "states":
+	case "headers", "blocks", "blinded_blocks", "blobs", "blob_sidecars", "states", "execution_payload_envelopes":
 		return parse(segments[4])
 	case "rewards":
 		if len(segments) < 6 {
@@ -113,11 +113,23 @@ func isFinalizedPath(path string, finalizedEpoch, slotsPerEpoch uint64) bool {
 	if finalizedEpoch == 0 {
 		return false
 	}
-	if slot, ok := pathNumericSlot(path); ok && slot <= finalizedEpoch*slotsPerEpoch {
-		return true
+	if slot, ok := pathNumericSlot(path); ok {
+		if isPayloadEnvelopePath(path) {
+			// Only a finalized descendant fixes a payload, and the checkpoint
+			// block precedes E*slotsPerEpoch when that slot is skipped.
+			return finalizedEpoch >= 2 && slot < (finalizedEpoch-1)*slotsPerEpoch
+		}
+		if slot <= finalizedEpoch*slotsPerEpoch {
+			return true
+		}
 	}
 	epoch, ok := pathNumericEpoch(path)
 	return ok && finalizedEpoch >= 2 && epoch <= finalizedEpoch-2
+}
+
+func isPayloadEnvelopePath(path string) bool {
+	segments := strings.Split(strings.Trim(path, "/"), "/")
+	return len(segments) >= 4 && segments[2] == "beacon" && segments[3] == "execution_payload_envelopes"
 }
 
 func pathHasNamedSlotID(path string) bool {
@@ -132,7 +144,7 @@ func pathHasNamedSlotID(path string) bool {
 			return true // bare /headers implies head
 		}
 		return namedSlotIDs[segments[4]]
-	case "blocks", "blinded_blocks", "blobs", "blob_sidecars", "states":
+	case "blocks", "blinded_blocks", "blobs", "blob_sidecars", "states", "execution_payload_envelopes":
 		if len(segments) < 5 {
 			return false
 		}

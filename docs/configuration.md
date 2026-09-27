@@ -289,12 +289,13 @@ Two routing behaviors are driven by the flag:
    | `/eth/v1/beacon/blob_sidecars/{block_id}` | 4096 epochs (~18 days on mainnet) | `MIN_EPOCHS_FOR_BLOB_SIDECARS_REQUESTS` (EIP-4844) |
    | `/eth/v1/beacon/states/{state_id}/...` | 8192 slots (~27 hours on mainnet) | conservative; real Lighthouse/Prysm retention varies |
    | `/eth/v{1,2}/beacon/blocks/{block_id}` and related | 33024 epochs (~5 months on mainnet) | `MIN_EPOCHS_FOR_BLOCK_REQUESTS` (spec) |
-   | `/eth/v1/validator/duties/{attester,proposer,sync}/{epoch}` | current epoch + 1 | Beacon API spec |
+   | `/eth/v1/beacon/execution_payload_envelopes/{block_id}` | 33024 epochs (~5 months on mainnet) | Gloas envelope retention matches blocks |
+   | `/eth/v1/validator/duties/{attester,proposer,sync,ptc}/{epoch}` | current epoch + 1 | Beacon API spec |
    | `/eth/v1/beacon/rewards/attestations/{epoch}` | current epoch + 1 | Beacon API spec |
 
    Epoch thresholds use the network's configured `slotsPerEpoch`. When the target is demonstrably older than the threshold, eBeacon routes directly to `archive: true` upstreams on the first attempt and skips the pruned tier entirely. Named identifiers (`head`, `finalized`, `justified`, `genesis`) and root-based lookups are not classified proactively because their slot is unknown; they use normal routing.
 
-2. **Error-driven fallthrough.** For cases proactive classification cannot cover (by-root lookups where the slot is unknown, or requests that sat just inside the conservative threshold but outside the client's actual retention), eBeacon watches for pruning-shaped responses. A 404 on a historical-id path triggers promotion. Recognized PeerDAS custody-related 400 responses on blob endpoints do the same. The remaining retry budget is filled with archive-capable candidates and the request continues; the client sees the original response only if the archive tier also fails.
+2. **Error-driven fallthrough.** For cases proactive classification cannot cover (by-root lookups where the slot is unknown, or requests that sat just inside the conservative threshold but outside the client's actual retention), eBeacon watches for pruning-shaped responses. A 404 on a historical-id path triggers promotion. Recognized PeerDAS custody-related 400 responses on blob endpoints do the same. The remaining retry budget is filled with archive-capable candidates and the request continues; the client sees the original response only if the archive tier also fails. Execution payload envelope 404s never trigger promotion: a Gloas slot whose payload was withheld has no envelope, so a 404 is a normal answer.
 
 Priority continues to apply inside the archive subset. A `priority: 0` local archive node beats a `priority: 10` cloud archive provider. The same `weight` and load-balancing rules apply between equal-priority archive upstreams.
 

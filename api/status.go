@@ -103,6 +103,7 @@ type upstreamStatus struct {
 	Health            string  `json:"health"`
 	HeadSlot          uint64  `json:"headSlot"`
 	HeadRoot          string  `json:"headRoot"`
+	HeadPayloadStatus string  `json:"headPayloadStatus"`
 	SyncDistance      uint64  `json:"syncDistance"`
 	ClientType        string  `json:"clientType"`
 	ActiveConn        int64   `json:"activeConnections"`
@@ -225,6 +226,7 @@ func (s *StatusAPI) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 				Health:            health,
 				HeadSlot:          u.HeadSlot(),
 				HeadRoot:          u.HeadRoot(),
+				HeadPayloadStatus: u.HeadPayloadStatus(),
 				SyncDistance:      u.SyncDistance(),
 				ClientType:        u.ClientType(),
 				ActiveConn:        u.ActiveConns(),

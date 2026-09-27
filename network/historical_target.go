@@ -13,15 +13,17 @@ import (
 type HistoricalKind int
 
 const (
-	HistoricalKindNone           HistoricalKind = iota
-	HistoricalKindBlockByID                     // /beacon/blocks/{block_id}, /blinded_blocks/{id}, /headers/{id}, /rewards/blocks/{id}, /rewards/sync_committee/{id}, /light_client/bootstrap/{block_root}
-	HistoricalKindBlobSidecars                  // /beacon/blob_sidecars/{block_id}, /beacon/blobs/{block_id}, /debug/beacon/data_column_sidecars/{block_id}
-	HistoricalKindStateByID                     // /beacon/states/{state_id}/..., /debug/beacon/states/{state_id}
-	HistoricalKindAttesterDuties                // /validator/duties/attester/{epoch}
-	HistoricalKindProposerDuties                // /validator/duties/proposer/{epoch}
-	HistoricalKindSyncDuties                    // /validator/duties/sync/{epoch}
-	HistoricalKindRewardsEpoch                  // /beacon/rewards/attestations/{epoch}
-	HistoricalKindLiveness                      // /validator/liveness/{epoch}
+	HistoricalKindNone            HistoricalKind = iota
+	HistoricalKindBlockByID                      // /beacon/blocks/{block_id}, /blinded_blocks/{id}, /headers/{id}, /rewards/blocks/{id}, /rewards/sync_committee/{id}, /light_client/bootstrap/{block_root}
+	HistoricalKindBlobSidecars                   // /beacon/blob_sidecars/{block_id}, /beacon/blobs/{block_id}, /debug/beacon/data_column_sidecars/{block_id}
+	HistoricalKindStateByID                      // /beacon/states/{state_id}/..., /debug/beacon/states/{state_id}
+	HistoricalKindAttesterDuties                 // /validator/duties/attester/{epoch}
+	HistoricalKindProposerDuties                 // /validator/duties/proposer/{epoch}
+	HistoricalKindSyncDuties                     // /validator/duties/sync/{epoch}
+	HistoricalKindRewardsEpoch                   // /beacon/rewards/attestations/{epoch}
+	HistoricalKindLiveness                       // /validator/liveness/{epoch}
+	HistoricalKindPayloadEnvelope                // /beacon/execution_payload_envelopes/{block_id}
+	HistoricalKindPTCDuties                      // /validator/duties/ptc/{epoch}
 )
 
 // Per-endpoint retention thresholds. Epoch-based protocol minimums are
@@ -85,7 +87,7 @@ func (t HistoricalTarget) RequiresArchive(headSlot, slotsPerEpoch uint64) bool {
 	headEpoch := headSlot / slotsPerEpoch
 
 	switch t.Kind {
-	case HistoricalKindBlockByID:
+	case HistoricalKindBlockByID, HistoricalKindPayloadEnvelope:
 		if t.Slot == nil {
 			return false
 		}
@@ -103,7 +105,7 @@ func (t HistoricalTarget) RequiresArchive(headSlot, slotsPerEpoch uint64) bool {
 		}
 		return olderThan(*t.Slot, headSlot, statesRetentionSlots)
 
-	case HistoricalKindAttesterDuties, HistoricalKindProposerDuties, HistoricalKindSyncDuties, HistoricalKindRewardsEpoch, HistoricalKindLiveness:
+	case HistoricalKindAttesterDuties, HistoricalKindProposerDuties, HistoricalKindSyncDuties, HistoricalKindPTCDuties, HistoricalKindRewardsEpoch, HistoricalKindLiveness:
 		// Beacon API guarantees duties (and closely-related epoch endpoints
 		// like liveness and attestation rewards) for current and next epoch
 		// only. Anything earlier than (current - 1) is historical.
@@ -183,6 +185,14 @@ func classifyBeaconPath(segments []string) HistoricalTarget {
 		t.Kind = HistoricalKindStateByID
 		return t
 
+	case "execution_payload_envelopes":
+		if len(segments) < 5 {
+			return HistoricalTarget{}
+		}
+		t := parseBlockIdentifier(segments[4])
+		t.Kind = HistoricalKindPayloadEnvelope
+		return t
+
 	case "rewards":
 		if len(segments) < 6 {
 			return HistoricalTarget{}
@@ -249,6 +259,8 @@ func classifyValidatorPath(segments []string) HistoricalTarget {
 		return HistoricalTarget{Kind: HistoricalKindProposerDuties, Epoch: &epoch}
 	case "sync":
 		return HistoricalTarget{Kind: HistoricalKindSyncDuties, Epoch: &epoch}
+	case "ptc":
+		return HistoricalTarget{Kind: HistoricalKindPTCDuties, Epoch: &epoch}
 	}
 	return HistoricalTarget{}
 }

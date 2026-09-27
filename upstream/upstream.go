@@ -69,6 +69,11 @@ var (
 		Help: "Latest observed head slot for each upstream",
 	}, []string{"network", "upstream"})
 
+	metricHeadPayloadFull = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ebeacon_upstream_head_payload_full",
+		Help: "Whether the upstream's head block has its execution payload (1=full, 0=empty); absent when unknown",
+	}, []string{"network", "upstream"})
+
 	metricSyncDistance = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ebeacon_upstream_sync_distance",
 		Help: "Latest observed sync distance for each upstream",
@@ -160,6 +165,8 @@ type Upstream struct {
 	syncVerdict    HealthStatus
 	headSlot       uint64
 	headRoot       string
+	payloadRoot    string
+	payloadFull    bool
 	syncDistance   uint64
 	isSyncing      bool
 	finalizedEpoch uint64
@@ -393,8 +400,55 @@ func (u *Upstream) UpdateHeadBlock(slot uint64, root string) {
 	u.mu.Lock()
 	u.headSlot = slot
 	u.headRoot = root
+	u.syncPayloadGaugeLocked()
 	u.mu.Unlock()
 	metricHeadSlot.WithLabelValues(u.NetworkID, u.ID).Set(float64(slot))
+}
+
+// SetHeadPayloadStatus records whether the execution payload of block root
+// has arrived, as reported by a head_v2 event.
+func (u *Upstream) SetHeadPayloadStatus(root string, full bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.payloadRoot = root
+	u.payloadFull = full
+	u.syncPayloadGaugeLocked()
+}
+
+// ClearHeadPayloadStatus forgets the payload status, e.g. when the event
+// stream that reported it is lost.
+func (u *Upstream) ClearHeadPayloadStatus() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.payloadRoot = ""
+	u.syncPayloadGaugeLocked()
+}
+
+// HeadPayloadStatus returns "full" or "empty" for the current head block, or
+// "unknown" when no payload status was reported for it.
+func (u *Upstream) HeadPayloadStatus() string {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	switch {
+	case u.payloadRoot == "" || u.payloadRoot != u.headRoot:
+		return "unknown"
+	case u.payloadFull:
+		return "full"
+	default:
+		return "empty"
+	}
+}
+
+func (u *Upstream) syncPayloadGaugeLocked() {
+	if u.payloadRoot == "" || u.payloadRoot != u.headRoot {
+		metricHeadPayloadFull.DeleteLabelValues(u.NetworkID, u.ID)
+		return
+	}
+	v := 0.0
+	if u.payloadFull {
+		v = 1
+	}
+	metricHeadPayloadFull.WithLabelValues(u.NetworkID, u.ID).Set(v)
 }
 
 // ClientType returns the auto-detected consensus client type.
