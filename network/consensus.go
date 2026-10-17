@@ -3,9 +3,9 @@ package network
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"net/http"
 	"sync"
@@ -110,18 +110,12 @@ func (cp *ConsensusPolicy) Execute(
 	wg.Wait()
 
 	// Count matching responses by body content.
-	// Use a FNV-64a hash as the map key to avoid copying potentially large
+	// Use a hash as the map key to avoid copying potentially large
 	// beacon state response bodies (e.g. /eth/v2/beacon/states) into strings.
-	// Cryptographic strength is not needed here — we only need equality comparison
-	// across a handful of trusted upstream responses.
+	// It must be collision-resistant so one upstream cannot forge agreement.
 	type bodyKey struct {
 		status int
-		body   uint64
-	}
-	hashBody := func(b []byte) uint64 {
-		h := fnv.New64a()
-		h.Write(b) //nolint:errcheck
-		return h.Sum64()
+		body   [sha256.Size]byte
 	}
 	keys := make([]bodyKey, len(results))
 	counts := make(map[bodyKey]int)
@@ -129,7 +123,7 @@ func (cp *ConsensusPolicy) Execute(
 		if r.err != nil {
 			continue
 		}
-		keys[i] = bodyKey{status: r.status, body: hashBody(r.body)}
+		keys[i] = bodyKey{status: r.status, body: sha256.Sum256(r.body)}
 		counts[keys[i]]++
 	}
 
