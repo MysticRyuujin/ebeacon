@@ -1858,9 +1858,11 @@ func forwardableQuery(u *url.URL) url.Values {
 	return q
 }
 
+// GET only: the SSE relay always subscribes upstream with GET.
 func isEventStream(r *http.Request) bool {
-	return strings.Contains(r.Header.Get("Accept"), "text/event-stream") ||
-		strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/events")
+	return r.Method == http.MethodGet &&
+		(strings.Contains(r.Header.Get("Accept"), "text/event-stream") ||
+			strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/events"))
 }
 
 // copyEndToEndHeaders copies src into dst without hop-by-hop headers. It is
