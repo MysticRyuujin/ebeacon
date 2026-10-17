@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mysticryuujin/ebeacon/config"
 )
@@ -265,6 +267,66 @@ networks:
 	rec := httptest.NewRecorder()
 	n.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status %d", rec.Code)
+	}
+}
+
+func TestNetwork_RouteRuleDenyGETNotBypassedByEventStreamAccept(t *testing.T) {
+	var debugGETs atomic.Int64
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/eth/v1/debug/foo" && r.Method == http.MethodGet {
+			debugGETs.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ebeacon.yaml")
+	yaml := fmt.Sprintf(`logLevel: error
+server: { host: "127.0.0.1", port: 5555, maxTimeout: 30s }
+failsafe: { timeout: { duration: 10s } }
+health: { checkInterval: 1h, finalityInterval: 1h, maxSyncDistance: 10 }
+rateLimiting: {}
+metrics: { enabled: false }
+networks:
+  - id: %s
+    upstreams:
+      - id: u1
+        url: %q
+    routing:
+      loadBalancing: round-robin
+      stickySession: false
+      routeRules:
+        - pathPattern: "^/eth/v1/debug/.*"
+          methods: ["GET"]
+          deny: true
+    cache:
+      enabled: false
+`, id, up.URL)
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/eth/v1/debug/foo", nil).WithContext(ctx)
+	req.Header.Set("Accept", "text/event-stream")
+	rec := httptest.NewRecorder()
+	n.ServeHTTP(rec, req)
+	if got := debugGETs.Load(); got != 0 {
+		t.Fatalf("upstream received %d GETs for a GET-denied path", got)
+	}
+	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d", rec.Code)
 	}
 }

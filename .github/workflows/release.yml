@@ -6,8 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write   # required to create the GitHub Release
-  packages: write
+  contents: read
 
 jobs:
   # A tag can point at a commit that never went through a pull request, so run
@@ -21,6 +20,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Trivy filesystem scan
         uses: aquasecurity/trivy-action@v0.36.0
@@ -44,9 +45,14 @@ jobs:
   release:
     runs-on: ubuntu-24.04
     needs: [ci, scan]
+    permissions:
+      contents: write   # required to create the GitHub Release
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # QEMU is no longer needed: the Dockerfile cross-compiles Go from
       # BUILDPLATFORM (amd64) to TARGETARCH, and the runtime stage is

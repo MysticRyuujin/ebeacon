@@ -4,6 +4,8 @@ import "strings"
 
 // normalizeAPIPath reduces Beacon API paths to stable route templates so
 // metrics and score tracking can be filtered without exploding cardinality.
+// Every client segment copied into a template must come from a fixed set:
+// each distinct result becomes a permanent score tracker and metric series.
 func normalizeAPIPath(path string) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -20,7 +22,7 @@ func normalizeAPIPath(path string) string {
 	}
 
 	segments := strings.Split(strings.Trim(path, "/"), "/")
-	if len(segments) < 2 || segments[0] != "eth" || len(segments[1]) < 2 || segments[1][0] != 'v' {
+	if len(segments) < 2 || segments[0] != "eth" || len(segments[1]) != 2 || segments[1][0] != 'v' || segments[1][1] < '0' || segments[1][1] > '9' {
 		return "/other"
 	}
 
@@ -78,12 +80,27 @@ func normalizeAPIPath(path string) string {
 			if len(segments) < 6 {
 				return prefix + "/beacon/states/other"
 			}
-			base := prefix + "/beacon/states/{state_id}/" + segments[5]
-			if len(segments) == 6 {
-				return base
-			}
-			if len(segments) == 7 && segments[5] == "validators" {
-				return base + "/{validator_id}"
+			switch segments[5] {
+			case "committees",
+				"finality_checkpoints",
+				"fork",
+				"pending_consolidations",
+				"pending_deposits",
+				"pending_partial_withdrawals",
+				"proposer_lookahead",
+				"randao",
+				"root",
+				"sync_committees",
+				"validator_balances",
+				"validator_identities",
+				"validators":
+				base := prefix + "/beacon/states/{state_id}/" + segments[5]
+				if len(segments) == 6 {
+					return base
+				}
+				if len(segments) == 7 && segments[5] == "validators" {
+					return base + "/{validator_id}"
+				}
 			}
 			return prefix + "/beacon/states/other"
 		case "rewards":

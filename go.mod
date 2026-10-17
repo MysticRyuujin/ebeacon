@@ -1,6 +1,6 @@
 module github.com/mysticryuujin/ebeacon
 
-go 1.26.6
+go 1.26.9
 
 require (
 	github.com/alicebob/miniredis/v2 v2.39.0

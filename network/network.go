@@ -14,6 +14,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -125,6 +126,15 @@ func isFinalizedPath(path string, finalizedEpoch, slotsPerEpoch uint64) bool {
 	}
 	epoch, ok := pathNumericEpoch(path)
 	return ok && finalizedEpoch >= 2 && epoch <= finalizedEpoch-2
+}
+
+// Servers such as Tomcat strip ';' path parameters before routing, which
+// turns "..;" into a dot segment that path.Clean does not see.
+func isCleanPath(p string) bool {
+	if strings.Contains(p, ";") {
+		return false
+	}
+	return p == "" || p == "/" || path.Clean(p) == strings.TrimSuffix(p, "/")
 }
 
 func isPayloadEnvelopePath(path string) bool {
@@ -467,6 +477,11 @@ func (n *Network) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// scoped to the client upstream when a client prefix was present.
 	if r.URL.Path == "/healthz" {
 		n.serveHealthz(w, clientUpstream)
+		return
+	}
+
+	if !isCleanPath(r.URL.Path) {
+		reject(http.StatusBadRequest, "invalid path")
 		return
 	}
 
@@ -1843,9 +1858,11 @@ func forwardableQuery(u *url.URL) url.Values {
 	return q
 }
 
+// GET only: the SSE relay always subscribes upstream with GET.
 func isEventStream(r *http.Request) bool {
-	return strings.Contains(r.Header.Get("Accept"), "text/event-stream") ||
-		strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/events")
+	return r.Method == http.MethodGet &&
+		(strings.Contains(r.Header.Get("Accept"), "text/event-stream") ||
+			strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/events"))
 }
 
 // copyEndToEndHeaders copies src into dst without hop-by-hop headers. It is

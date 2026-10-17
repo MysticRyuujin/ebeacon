@@ -143,6 +143,50 @@ func TestNetwork_BlockedPath_EnvelopeSubmission(t *testing.T) {
 	}
 }
 
+func TestNetwork_BlockedPath_UncleanPathRejected(t *testing.T) {
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+
+	id := netID(t)
+	cfg := mustCfg(t, id, up.URL, []string{`^/eth/v[0-9]+/debug/.*`})
+	n, err := New(&cfg.Networks[0], cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		target string
+		want   int
+	}{
+		{"/eth/v1/node/%2e%2e/%2e%2e/v2/debug/beacon/states/head", http.StatusBadRequest},
+		{"/eth/v1/node/%2e/version", http.StatusBadRequest},
+		{"/eth%2F%2Fv2/debug/beacon/states/head", http.StatusBadRequest},
+		{"/eth/v1/node/..;/..;/v2/debug/beacon/states/head", http.StatusBadRequest},
+		{"/eth/v1/node/.;x/version", http.StatusBadRequest},
+		{"/eth/v2/debug;x/beacon/states/head", http.StatusBadRequest},
+		{"/eth/v1/node/%3B/version", http.StatusBadRequest},
+		{"/u1/eth/v1/node/%2e%2e/%2e%2e/v2/debug/beacon/states/head", http.StatusBadRequest},
+		{"/eth/v1/node/version", http.StatusOK},
+		{"/eth/v1/node/version/", http.StatusOK},
+	}
+	for _, tt := range tests {
+		hits.Store(0)
+		req := httptest.NewRequest(http.MethodGet, tt.target, nil)
+		rec := httptest.NewRecorder()
+		n.ServeHTTP(rec, req)
+		if rec.Code != tt.want {
+			t.Errorf("%s: got %d want %d", tt.target, rec.Code, tt.want)
+		}
+		if tt.want == http.StatusBadRequest && hits.Load() != 0 {
+			t.Errorf("%s: forwarded to upstream", tt.target)
+		}
+	}
+}
+
 func TestNetwork_Forward_OK(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/eth/v1/node/version" {
