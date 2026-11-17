@@ -1,6 +1,6 @@
 .PHONY: help fmt fmt-check lint test vet vuln mod-check docker-build ci-local hooks-install loadtest reliability
 
-GO_FILES := $(shell rg --files -g '*.go')
+GO_FILES := $(shell git ls-files --cached --others --exclude-standard '*.go')
 
 help:
 	@echo "Available targets:"
